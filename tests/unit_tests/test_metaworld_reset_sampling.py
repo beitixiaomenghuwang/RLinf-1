@@ -17,6 +17,7 @@ def make_reset_matrix(*, shuffle: bool) -> tuple[np.ndarray, np.ndarray]:
         8,
         generator=np.random.default_rng(seed=0),
         shuffle=shuffle,
+        minimum_states_per_process=64,
     )
     return matrix, cumsum_trial_id_bins
 
@@ -51,3 +52,25 @@ def test_reset_id_conversion_round_trips_task_and_trial() -> None:
 
     np.testing.assert_array_equal(task_ids, np.array([0, 0, 1, 2, 49]))
     np.testing.assert_array_equal(trial_ids, np.array([0, 49, 0, 27, 49]))
+
+
+def test_reset_matrix_tiles_when_worker_batch_exceeds_unique_partition() -> None:
+    trial_id_bins = [50] * 50
+    cumsum_trial_id_bins = np.cumsum(trial_id_bins)
+
+    matrix = build_balanced_reset_state_matrix(
+        trial_id_bins,
+        cumsum_trial_id_bins,
+        40,
+        generator=np.random.default_rng(seed=0),
+        shuffle=False,
+        minimum_states_per_process=64,
+    )
+    task_ids, _ = reset_ids_to_task_and_trial(
+        matrix[:, :64].reshape(-1), cumsum_trial_id_bins
+    )
+    counts = np.bincount(task_ids, minlength=50)
+
+    assert matrix.shape == (40, 64)
+    assert np.count_nonzero(counts) == 50
+    assert counts.max() - counts.min() <= 1

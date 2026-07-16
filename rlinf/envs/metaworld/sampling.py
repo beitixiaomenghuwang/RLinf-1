@@ -10,6 +10,7 @@ def build_balanced_reset_state_matrix(
     *,
     generator: np.random.Generator,
     shuffle: bool,
+    minimum_states_per_process: int = 0,
 ) -> np.ndarray:
     """Interleave tasks before distributing reset states across workers."""
     num_tasks = len(trial_id_bins)
@@ -29,9 +30,14 @@ def build_balanced_reset_state_matrix(
             reset_state_ids.append(task_start + trial_id)
 
     reset_state_ids = np.asarray(reset_state_ids, dtype=np.int64)
-    valid_size = len(reset_state_ids) - (
+    divisible_size = len(reset_state_ids) - (
         len(reset_state_ids) % total_num_processes
     )
+    required_size = minimum_states_per_process * total_num_processes
+    valid_size = max(divisible_size, required_size)
+    if valid_size > len(reset_state_ids):
+        repeats = (valid_size + len(reset_state_ids) - 1) // len(reset_state_ids)
+        reset_state_ids = np.tile(reset_state_ids, repeats)
     reset_state_ids = reset_state_ids[:valid_size]
     return reset_state_ids.reshape(-1, total_num_processes).T.copy()
 

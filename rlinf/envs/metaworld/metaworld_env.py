@@ -167,10 +167,16 @@ class MetaWorldEnv(gym.Env):
             self.total_num_processes,
             generator=self._generator_ordered,
             shuffle=not self.is_eval,
+            minimum_states_per_process=self.num_group,
         )
 
     def _get_ordered_reset_state_ids(self, num_reset_states):
         states_per_process = self.reset_state_ids_all.shape[1]
+        if num_reset_states > states_per_process:
+            raise ValueError(
+                "MetaWorld reset-state pool is smaller than one worker batch: "
+                f"requested {num_reset_states}, available {states_per_process}"
+            )
         if self.start_idx + num_reset_states > states_per_process:
             if not self.is_eval:
                 self.reset_state_ids_all = self.get_reset_state_ids_all()
