@@ -226,6 +226,7 @@ class MetaWorldEnv(gym.Env):
         episode_info = {}
         self.returns += step_reward
         self.success_once = self.success_once | terminations
+        episode_info["task_id"] = self.task_ids.copy()
         episode_info["success_once"] = self.success_once.copy()
         episode_info["return"] = self.returns.copy()
         episode_info["episode_len"] = self.elapsed_steps.copy()

@@ -215,7 +215,11 @@ def compute_evaluate_metrics(eval_metrics_list):
         if metric:
             all_eval_metrics[env_info_key] = metric
 
+    task_success_metrics = _compute_task_success_metrics(eval_metrics_list)
+
     for key in all_eval_metrics:
+        if key == "task_id":
+            continue
         shards = [_normalize_metric_shard(s) for s in all_eval_metrics[key]]
         stacked = torch.concat(shards).float()
         all_eval_metrics[key] = (
@@ -224,10 +228,64 @@ def compute_evaluate_metrics(eval_metrics_list):
             else np.asarray(0.0, dtype=np.float64)
         )
 
+    all_eval_metrics.pop("task_id", None)
+    all_eval_metrics.update(task_success_metrics)
+
     # Add total trajectory count to metrics
     all_eval_metrics["num_trajectories"] = sum(trajectory_counts)
 
     return all_eval_metrics
+
+
+def _compute_task_success_metrics(eval_metrics_list: Sequence[dict]) -> dict[str, float]:
+    """Compute macro and worst-task success without losing task pairing."""
+    task_shards: list[torch.Tensor] = []
+    success_shards: list[torch.Tensor] = []
+    for metrics in eval_metrics_list:
+        if "task_id" not in metrics or "success_once" not in metrics:
+            continue
+        task_ids = _normalize_metric_shard(metrics["task_id"]).to(torch.long)
+        successes = _normalize_metric_shard(metrics["success_once"])
+        if task_ids.numel() != successes.numel():
+            raise ValueError(
+                "task_id and success_once must contain the same number of episodes, "
+                f"got {task_ids.numel()} and {successes.numel()}"
+            )
+        task_shards.append(task_ids)
+        success_shards.append(successes)
+
+    if not task_shards:
+        return {}
+
+    task_ids = torch.cat(task_shards)
+    successes = torch.cat(success_shards).float()
+    per_task: dict[int, float] = {}
+    for task_id in torch.unique(task_ids, sorted=True).tolist():
+        task_successes = successes[task_ids == task_id]
+        per_task[int(task_id)] = float(task_successes.mean().item())
+
+    task_success_values = sorted(per_task.values())
+    metrics = {
+        f"task_success/task_{task_id:02d}": success
+        for task_id, success in per_task.items()
+    }
+    metrics.update(
+        {
+            "task_success/covered_tasks": float(len(per_task)),
+            "task_success/macro_mean": float(np.mean(task_success_values)),
+            "task_success/min": task_success_values[0],
+            "task_success/num_above_90": float(
+                sum(success >= 0.9 for success in task_success_values)
+            ),
+            "task_success/worst_5_mean": float(
+                np.mean(task_success_values[: min(5, len(task_success_values))])
+            ),
+            "task_success/worst_10_mean": float(
+                np.mean(task_success_values[: min(10, len(task_success_values))])
+            ),
+        }
+    )
+    return metrics
 
 
 def compute_rollout_metrics(data_buffer: dict) -> dict:
