@@ -35,6 +35,12 @@ gse:
   init_seed: 42
   require_pi05: True
   train_value_head: True
+  # PPO-side regularization and diagnostics. Coefficients default to zero so
+  # enabling GSE alone preserves the original PPO objective.
+  load_balancing_loss_coef: 0.0
+  orthogonality_loss_coef: 0.0
+  log_router_metrics: True
+  log_orthogonality: True
   target_modules:
     - "q_proj"
     - "k_proj"

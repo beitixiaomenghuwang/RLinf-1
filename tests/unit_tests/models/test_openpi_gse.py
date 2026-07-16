@@ -172,3 +172,17 @@ def test_actor_and_rollout_build_identical_trainable_state_structure() -> None:
 def test_openpi_gse_rejects_unknown_configuration_fields() -> None:
     with pytest.raises(ValueError, match="Unknown OpenPI GSE fields"):
         configure_openpi_gse(ToyOpenPi(), make_integration_config(unknown_option=True))
+
+
+def test_openpi_gse_accepts_ppo_auxiliary_configuration() -> None:
+    report = configure_openpi_gse(
+        ToyOpenPi(),
+        make_integration_config(
+            load_balancing_loss_coef=0.01,
+            orthogonality_loss_coef=0.1,
+            log_router_metrics=True,
+            log_orthogonality=True,
+        ),
+    )
+
+    assert len(report.injected_module_names) == 14

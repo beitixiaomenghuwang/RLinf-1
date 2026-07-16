@@ -10,8 +10,10 @@ from .injector import (
 )
 from .layer import GSEAdapter, GSEExpert, GSELinear
 from .losses import (
+    gse_auxiliary_loss,
     gse_load_balancing_loss,
     gse_orthogonality_loss,
+    gse_router_metrics,
     reset_gse_auxiliary_state,
 )
 from .state import gse_state_dict, load_gse_state_dict
@@ -22,8 +24,10 @@ __all__ = [
     "GSEExpert",
     "GSEInjectionReport",
     "GSELinear",
+    "gse_auxiliary_loss",
     "gse_load_balancing_loss",
     "gse_orthogonality_loss",
+    "gse_router_metrics",
     "gse_state_dict",
     "inject_gse",
     "iter_gse_layers",

@@ -42,6 +42,10 @@ from rlinf.hybrid_engines.fsdp.utils import (
 from rlinf.hybrid_engines.weight_syncer import WeightSyncer
 from rlinf.models import get_model
 from rlinf.models.embodiment.base_policy import ForwardType
+from rlinf.models.peft.gse import (
+    gse_auxiliary_loss,
+    reset_gse_auxiliary_state,
+)
 from rlinf.scheduler import Channel, Cluster, Worker
 from rlinf.utils.data_iter_utils import (
     get_iterator_k_split,
@@ -1028,6 +1032,10 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         self.stage_num = cfg.rollout.pipeline_stage_num
         self.enable_offload = self.cfg.actor.get("enable_offload", False)
         self.entropy_op_type = self.cfg.algorithm.get("entropy_op_type", "torch")
+        self.gse_cfg = OmegaConf.select(cfg, "actor.model.gse", default=None)
+        self.gse_enabled = bool(
+            self.gse_cfg is not None and self.gse_cfg.get("enabled", False)
+        )
 
         self.enable_sft_co_train = cfg.actor.get("enable_sft_co_train", False)
         self.version = 0
@@ -1464,6 +1472,8 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             kwargs["prev_logprobs"] = prev_logprobs
 
         compute_values = self.cfg.algorithm.adv_type == "gae"
+        if self.gse_enabled:
+            reset_gse_auxiliary_state(self.model)
         with self.amp_context:
             output_dict = self.model(
                 forward_inputs=forward_inputs,
@@ -1535,12 +1545,31 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         if self.enable_sft_co_train:
             loss = self._train_sft_epoch(metrics_data, loss)
 
+        if self.gse_enabled:
+            auxiliary_loss, gse_metrics = gse_auxiliary_loss(
+                self.model,
+                load_balancing_coefficient=float(
+                    self.gse_cfg.get("load_balancing_loss_coef", 0.0)
+                ),
+                orthogonality_coefficient=float(
+                    self.gse_cfg.get("orthogonality_loss_coef", 0.0)
+                ),
+                log_orthogonality=bool(
+                    self.gse_cfg.get("log_orthogonality", True)
+                ),
+            )
+            loss += auxiliary_loss
+            if bool(self.gse_cfg.get("log_router_metrics", True)):
+                metrics_data.update(gse_metrics)
+
         loss /= self.gradient_accumulation
         with backward_ctx:
             self.grad_scaler.scale(loss).backward()
 
         metrics_data["actor/total_loss"] = loss.detach().item()
         append_to_dict(metrics, metrics_data)
+        if self.gse_enabled:
+            reset_gse_auxiliary_state(self.model)
 
     def set_global_step(self, global_step: int) -> None:
         """

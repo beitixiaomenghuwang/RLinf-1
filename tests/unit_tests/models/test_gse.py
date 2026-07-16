@@ -9,8 +9,10 @@ from torch import nn
 from rlinf.models.peft.gse import (
     GSEConfig,
     GSELinear,
+    gse_auxiliary_loss,
     gse_load_balancing_loss,
     gse_orthogonality_loss,
+    gse_router_metrics,
     gse_state_dict,
     inject_gse,
     joint_lora_a,
@@ -179,6 +181,59 @@ def test_auxiliary_losses_are_finite_and_differentiable() -> None:
     assert torch.isfinite(orthogonality)
     assert load_balance.requires_grad
     assert orthogonality.requires_grad
+
+
+def test_router_metrics_aggregate_expert_utilization() -> None:
+    model = ToyModel()
+    inject_gse(
+        model,
+        make_config(),
+        target_modules=("action_expert.0", "action_expert.2"),
+    )
+    model(torch.randn(3, 5, 12))
+
+    metrics = gse_router_metrics(model)
+
+    assert metrics["gse/router/active_layers"].item() == 2
+    assert 0 <= metrics["gse/router/normalized_entropy"].item() <= 1
+    expert_selection = torch.stack(
+        [
+            metrics[f"gse/router/expert_{index}_selection"]
+            for index in range(make_config().num_specialized_experts)
+        ]
+    )
+    expert_probability = torch.stack(
+        [
+            metrics[f"gse/router/expert_{index}_probability"]
+            for index in range(make_config().num_specialized_experts)
+        ]
+    )
+    torch.testing.assert_close(expert_selection.sum(), torch.tensor(1.0))
+    torch.testing.assert_close(expert_probability.sum(), torch.tensor(1.0))
+
+
+def test_configurable_auxiliary_loss_preserves_zero_coefficient_objective() -> None:
+    model = ToyModel()
+    inject_gse(model, make_config(), target_modules=("action_expert.0",))
+    model(torch.randn(3, 5, 12))
+
+    disabled_loss, disabled_metrics = gse_auxiliary_loss(model)
+    enabled_loss, enabled_metrics = gse_auxiliary_loss(
+        model,
+        load_balancing_coefficient=0.01,
+        orthogonality_coefficient=0.1,
+    )
+
+    torch.testing.assert_close(disabled_loss, torch.tensor(0.0))
+    assert enabled_loss.requires_grad
+    assert enabled_loss.item() >= 0
+    assert disabled_metrics["gse/auxiliary_loss"].item() == 0
+    assert enabled_metrics["gse/weighted_load_balancing_loss"].item() > 0
+
+
+def test_auxiliary_loss_rejects_negative_coefficients() -> None:
+    with pytest.raises(ValueError, match="must be non-negative"):
+        gse_auxiliary_loss(ToyModel(), load_balancing_coefficient=-0.1)
 
 
 def test_injection_is_strict_when_no_linear_module_matches() -> None:

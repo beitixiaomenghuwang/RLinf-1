@@ -44,6 +44,10 @@ _INTEGRATION_FIELDS = {
     "exclude_modules",
     "train_value_head",
     "require_pi05",
+    "load_balancing_loss_coef",
+    "orthogonality_loss_coef",
+    "log_router_metrics",
+    "log_orthogonality",
 }
 _GSE_CONFIG_FIELDS = {field.name for field in fields(GSEConfig)}
 

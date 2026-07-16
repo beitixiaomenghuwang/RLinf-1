@@ -112,6 +112,11 @@ actor:
     is_lora: False
     gse:
       enabled: True
+      # Stage-B observability run: do not change the PPO objective yet.
+      load_balancing_loss_coef: 0.0
+      orthogonality_loss_coef: 0.0
+      log_router_metrics: True
+      log_orthogonality: True
     openpi:
       config_name: "pi05_metaworld"
       num_images_in_input: 1
