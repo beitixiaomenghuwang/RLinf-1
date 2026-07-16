@@ -25,6 +25,7 @@ import numpy as np
 import torch
 
 from rlinf.envs.metaworld import MetaWorldBenchmark
+from rlinf.envs.metaworld.sampling import build_balanced_reset_state_matrix
 from rlinf.envs.metaworld.venv import ReconfigureSubprocEnv
 from rlinf.envs.utils import list_of_dict_to_dict_of_list, to_tensor
 
@@ -49,12 +50,14 @@ class MetaWorldEnv(gym.Env):
         self.group_size = self.cfg.group_size
         self.num_group = self.num_envs // self.group_size
         self.use_fixed_reset_state_ids = cfg.use_fixed_reset_state_ids
+        self.is_eval = bool(cfg.get("is_eval", False))
 
         self.ignore_terminations = cfg.ignore_terminations
         self.auto_reset = cfg.auto_reset
 
         self._generator = np.random.default_rng(seed=self.seed)
         self._generator_ordered = np.random.default_rng(seed=0)
+        self.start_idx = 0
 
         self.RESET_STEP = 15
         self.task_suite: MetaWorldBenchmark = MetaWorldBenchmark(
@@ -140,7 +143,7 @@ class MetaWorldEnv(gym.Env):
         self.cumsum_trial_id_bins = np.cumsum(self.trial_id_bins)
 
     def update_reset_state_ids(self):
-        if self.cfg.is_eval or self.cfg.use_ordered_reset_state_ids:
+        if self.is_eval or self.cfg.use_ordered_reset_state_ids:
             reset_state_ids = self._get_ordered_reset_state_ids(self.num_group)
         else:
             reset_state_ids = self._get_random_reset_state_ids(self.num_group)
@@ -158,17 +161,37 @@ class MetaWorldEnv(gym.Env):
         return reset_state_ids
 
     def get_reset_state_ids_all(self):
-        reset_state_ids = np.arange(self.total_num_group_envs)
-        valid_size = len(reset_state_ids) - (
-            len(reset_state_ids) % self.total_num_processes
+        return build_balanced_reset_state_matrix(
+            self.trial_id_bins,
+            self.cumsum_trial_id_bins,
+            self.total_num_processes,
+            generator=self._generator_ordered,
+            shuffle=not self.is_eval,
         )
-        reset_state_ids = reset_state_ids[:valid_size]
-        reset_state_ids = reset_state_ids.reshape(self.total_num_processes, -1)
-        return reset_state_ids
 
     def _get_ordered_reset_state_ids(self, num_reset_states):
-        reset_state_ids = self.reset_state_ids_all[self.seed_offset]
+        states_per_process = self.reset_state_ids_all.shape[1]
+        if self.start_idx + num_reset_states > states_per_process:
+            if not self.is_eval:
+                self.reset_state_ids_all = self.get_reset_state_ids_all()
+            self.start_idx = 0
+        end_idx = self.start_idx + num_reset_states
+        reset_state_ids = self.reset_state_ids_all[
+            self.seed_offset, self.start_idx : end_idx
+        ]
+        self.start_idx = end_idx
         return reset_state_ids
+
+    def _resolve_reset_state_ids(self, env_idx, reset_state_ids):
+        if reset_state_ids is not None:
+            return np.asarray(reset_state_ids)
+        if (
+            self.is_eval
+            or self.use_fixed_reset_state_ids
+            or self.cfg.use_ordered_reset_state_ids
+        ):
+            return self.reset_state_ids[np.asarray(env_idx)]
+        return self._get_random_reset_state_ids(len(env_idx))
 
     def _get_task_and_trial_ids_from_reset_state_ids(self, reset_state_ids):
         task_ids = []
@@ -299,9 +322,7 @@ class MetaWorldEnv(gym.Env):
         if env_idx is None:
             env_idx = np.arange(self.num_envs)
 
-        if reset_state_ids is None:
-            num_reset_states = len(env_idx)
-            reset_state_ids = self._get_random_reset_state_ids(num_reset_states)
+        reset_state_ids = self._resolve_reset_state_ids(env_idx, reset_state_ids)
 
         self._reconfigure(reset_state_ids, env_idx)
 

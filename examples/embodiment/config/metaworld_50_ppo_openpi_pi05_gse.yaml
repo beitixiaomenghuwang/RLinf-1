@@ -73,6 +73,9 @@ env:
   train:
     rollout_epoch: 8
     total_num_envs: 64
+    # Stratify reset states across MT50 tasks to reduce task-gradient sampling
+    # variance. Use the same setting for full-parameter PPO comparisons.
+    use_ordered_reset_state_ids: True
     # Recording every MT50 rollout is very disk intensive. Enable explicitly
     # only for small qualitative runs.
     video_cfg:
@@ -85,6 +88,7 @@ env:
     max_episode_steps: 100
     max_steps_per_rollout_epoch: 100
     group_size: 1
+    is_eval: True
     use_fixed_reset_state_ids: True
     video_cfg:
       save_video: False
