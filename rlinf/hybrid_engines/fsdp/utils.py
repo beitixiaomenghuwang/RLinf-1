@@ -154,7 +154,7 @@ def get_fsdp_wrap_policy(module, config=None, is_lora=False, model_type=None):
     Args:
         module: The model to wrap
         config: Configuration dictionary for wrap policy
-        is_lora: Whether to enable LoRA-specific wrapping
+        is_lora: Whether to enable leaf-level PEFT wrapping for LoRA or GSE.
 
     Returns:
         FSDP auto wrap policy function
@@ -287,6 +287,17 @@ def get_fsdp_wrap_policy(module, config=None, is_lora=False, model_type=None):
             )
         policies.append(q_head_policy)
 
+    gse_adapter_classes = {
+        submodule.__class__
+        for submodule in module.modules()
+        if getattr(submodule, "_is_gse_adapter", False)
+    }
+    if gse_adapter_classes:
+        gse_adapter_policy = functools.partial(
+            _module_wrap_policy, module_classes=gse_adapter_classes
+        )
+        policies.append(gse_adapter_policy)
+
     if module_classes_to_wrap:
         module_classes_to_wrap = _resolve_module_classes_to_wrap(
             module, module_classes_to_wrap
@@ -331,7 +342,7 @@ def get_fsdp_wrap_policy(module, config=None, is_lora=False, model_type=None):
         )
         policies.append(lambda_policy)
 
-    # Add LoRA lambda policy if enabled
+    # Wrap trainable PEFT leaves separately from their frozen base layers.
     if is_lora:
         from torch.distributed.fsdp.wrap import lambda_auto_wrap_policy
 

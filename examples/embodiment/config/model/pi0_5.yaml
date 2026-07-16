@@ -13,6 +13,38 @@ action_dim: 7
 is_lora: False
 lora_rank: 32
 
+# GSE settings. GSE and LoRA are mutually exclusive.
+gse:
+  enabled: False
+  # The rank budget is shared across all experts in each wrapped linear layer.
+  total_rank: 64
+  lora_alpha: 64.0
+  num_experts: 8
+  num_generalized_experts: 2
+  top_k: 2
+  lora_dropout: 0.0
+  routing_granularity: "sequence"
+  sequence_pooling: "mean"
+  initialization: "orthogonal_zero"
+  scaling_mode: "total_rank"
+  normalize_topk: True
+  router_bias: False
+  router_init_std: 0.02
+  orthogonal_gain: 1.0
+  freeze_base: True
+  init_seed: 42
+  require_pi05: True
+  train_value_head: True
+  target_modules:
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "o_proj"
+    - "gate_proj"
+    - "up_proj"
+    - "down_proj"
+  exclude_modules: []
+
 # Training settings
 use_proprio: True
 num_steps: 5

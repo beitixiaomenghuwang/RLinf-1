@@ -29,6 +29,11 @@ def get_model(cfg: DictConfig, torch_dtype=None):
     from openpi.training import checkpoints as _checkpoints
 
     from rlinf.models.embodiment.openpi.dataconfig import get_openpi_config
+    from rlinf.models.embodiment.openpi.gse import (
+        configure_openpi_gse,
+        is_gse_enabled,
+        state_dict_contains_gse,
+    )
     from rlinf.models.embodiment.openpi.openpi_action_model import (
         OpenPi0Config,
         OpenPi0ForRLActionPrediction,
@@ -47,6 +52,11 @@ def get_model(cfg: DictConfig, torch_dtype=None):
     if override_model_config_kwargs is not None:
         for key, val in override_model_config_kwargs.items():
             actor_model_config.__dict__[key] = val
+
+    gse_config = cfg.get("gse", None)
+    gse_enabled = is_gse_enabled(gse_config)
+    if gse_enabled and cfg.get("is_lora", False):
+        raise ValueError("OpenPI GSE and LoRA cannot be enabled at the same time")
 
     # load model
     checkpoint_dir = download.maybe_download(str(cfg.model_path))
@@ -67,27 +77,39 @@ def get_model(cfg: DictConfig, torch_dtype=None):
     if actor_model_config.train_expert_only:
         model.freeze_vlm()
 
-    # Load weights from checkpoint if it's a checkpoint directory, otherwise load from safetensors
+    # Read weights first so a resumed GSE checkpoint can be identified before
+    # the model structure is changed. Original SFT checkpoints are loaded before
+    # injection, while GSE checkpoints require the wrapped structure first.
     if os.path.exists(full_weights_path):
         # Direct checkpoint directory
         model_state_dict = torch.load(full_weights_path, map_location="cpu")
-        model.load_state_dict(model_state_dict, strict=False)
     elif os.path.exists(actor_full_weights_path):
         # Checkpoint directory from runner
         model_state_dict = torch.load(actor_full_weights_path, map_location="cpu")
-        model.load_state_dict(model_state_dict, strict=False)
     else:
         # Original model directory with safetensors files
         weight_paths = sorted(glob.glob(os.path.join(checkpoint_dir, "*.safetensors")))
         if not weight_paths:
             weight_paths = [os.path.join(checkpoint_dir, "model.safetensors")]
-        all_state_dict = {}
+        model_state_dict = {}
         for weight_path in weight_paths:
             state_dict = safetensors.torch.load_file(weight_path, device="cpu")
-            all_state_dict.update(state_dict)
-        model.load_state_dict(all_state_dict, strict=False)
+            model_state_dict.update(state_dict)
+
+    checkpoint_has_gse = state_dict_contains_gse(model_state_dict)
+    if checkpoint_has_gse and not gse_enabled:
+        raise ValueError(
+            "The checkpoint contains GSE parameters, but model.gse.enabled is false"
+        )
+    if checkpoint_has_gse:
+        configure_openpi_gse(model, gse_config)
+
+    model.load_state_dict(model_state_dict, strict=False)
+    del model_state_dict
 
     model.paligemma_with_expert.to_bfloat16_for_selected_params("bfloat16")
+    if gse_enabled and not checkpoint_has_gse:
+        configure_openpi_gse(model, gse_config)
     # fsdp replace
     # model.paligemma_with_expert.replace_gemma_decoder_layers()
     # load data stats
