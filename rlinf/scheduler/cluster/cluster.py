@@ -99,6 +99,12 @@ class ClusterEnvVar(str, Enum):
     Set explicitly when workers do not share a filesystem with the launch node.
     """
 
+    RAY_TEMP_DIR = "RAY_TEMP_DIR"
+    """Host-backed root for Ray sessions when RLinf starts a local Ray cluster."""
+
+    RAY_OBJECT_SPILL_DIR = "RAY_OBJECT_SPILL_DIR"
+    """Host-backed directory for Ray object spilling on a local Ray cluster."""
+
 
 class PathEnvMergeMode(str, Enum):
     """Merge mode for path-like worker env vars."""
@@ -125,6 +131,8 @@ class Cluster:
         ClusterEnvVar.EXT_MODULE: None,
         ClusterEnvVar.PATH_ENV_MERGE_MODE: PathEnvMergeMode.APPEND.value,
         ClusterEnvVar.CODE_WORKING_DIR: "0",
+        ClusterEnvVar.RAY_TEMP_DIR: None,
+        ClusterEnvVar.RAY_OBJECT_SPILL_DIR: None,
     }
     PATH_LIKE_ENV_VARS = {
         "PYTHONPATH",
@@ -335,6 +343,7 @@ class Cluster:
                 "logging_level": Cluster.LOGGING_LEVEL,
                 "namespace": Cluster.NAMESPACE,
             }
+            ray_init_kwargs.update(self._get_local_ray_storage_kwargs())
             if self._ray_code_sync_fragment is not None:
                 ray_init_kwargs["runtime_env"] = dict(self._ray_code_sync_fragment)
             ray.init(**ray_init_kwargs)
@@ -463,6 +472,27 @@ class Cluster:
     def get_full_env_var_name(var: ClusterEnvVar) -> str:
         """Get the full environment variable name with system prefix."""
         return f"{Cluster.SYS_NAME.upper()}_{var.value}"
+
+    @classmethod
+    def _get_local_ray_storage_kwargs(cls) -> dict[str, str]:
+        """Resolve optional host-backed Ray session and spilling directories."""
+        env_to_kwarg = (
+            (ClusterEnvVar.RAY_TEMP_DIR, "_temp_dir"),
+            (ClusterEnvVar.RAY_OBJECT_SPILL_DIR, "object_spilling_directory"),
+        )
+        kwargs: dict[str, str] = {}
+        for env_var, kwarg in env_to_kwarg:
+            configured_path = cls.get_sys_env_var(env_var)
+            if not configured_path:
+                continue
+            path = Path(configured_path).expanduser().resolve()
+            path.mkdir(parents=True, exist_ok=True)
+            if not os.access(path, os.W_OK):
+                raise PermissionError(
+                    f"{cls.get_full_env_var_name(env_var)} is not writable: {path}"
+                )
+            kwargs[kwarg] = str(path)
+        return kwargs
 
     def _set_scheduler_env_vars(self):
         """Set default environment variables for the system."""

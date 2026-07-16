@@ -71,6 +71,10 @@ env:
   train:
     rollout_epoch: 8
     total_num_envs: 64
+    # Recording every MT50 rollout is very disk intensive. Enable explicitly
+    # only for small qualitative runs.
+    video_cfg:
+      save_video: False
   eval:
     rollout_epoch: 1
     total_num_envs: 500
@@ -81,7 +85,7 @@ env:
     group_size: 1
     use_fixed_reset_state_ids: True
     video_cfg:
-      save_video: True
+      save_video: False
       video_base_dir: ${runner.logger.log_path}/video/eval
 
 rollout:
