@@ -33,6 +33,8 @@ runner:
   only_eval: False
   val_check_interval: -1
   save_interval: 50
+  # A checkpoint contains both DCP training state and full 3.6B model weights.
+  max_checkpoints_to_keep: 2
 
   resume_dir: null
   ckpt_path: null

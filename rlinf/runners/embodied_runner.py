@@ -15,9 +15,12 @@
 import logging
 import os
 import queue
+import re
+import shutil
 import threading
 import time
 from collections import defaultdict
+from pathlib import Path
 from typing import TYPE_CHECKING, Union
 
 from omegaconf.dictconfig import DictConfig
@@ -32,6 +35,36 @@ from rlinf.utils.runner_utils import check_progress
 from rlinf.utils.timers import Timer
 
 logger = logging.getLogger(__name__)
+
+_GLOBAL_STEP_CHECKPOINT = re.compile(r"^global_step_(\d+)$")
+
+
+def prune_old_checkpoints(
+    checkpoints_dir: str | os.PathLike,
+    max_checkpoints_to_keep: int | None,
+) -> tuple[Path, ...]:
+    """Remove oldest completed step directories under one experiment root."""
+    if max_checkpoints_to_keep is None:
+        return ()
+    if max_checkpoints_to_keep < 1:
+        raise ValueError("max_checkpoints_to_keep must be at least 1 or null")
+
+    root = Path(checkpoints_dir)
+    if not root.is_dir():
+        return ()
+    checkpoints: list[tuple[int, Path]] = []
+    for child in root.iterdir():
+        match = _GLOBAL_STEP_CHECKPOINT.fullmatch(child.name)
+        if match is not None and child.is_dir():
+            checkpoints.append((int(match.group(1)), child))
+    checkpoints.sort(key=lambda item: item[0])
+
+    stale = checkpoints[: max(0, len(checkpoints) - max_checkpoints_to_keep)]
+    removed: list[Path] = []
+    for _, path in stale:
+        shutil.rmtree(path)
+        removed.append(path)
+    return tuple(removed)
 
 if TYPE_CHECKING:
     from rlinf.workers.actor.async_fsdp_sac_policy_worker import (
@@ -650,6 +683,13 @@ class EmbodiedRunner:
         actor_save_path = os.path.join(base_output_dir, "actor")
         os.makedirs(actor_save_path, exist_ok=True)
         self.actor.save_checkpoint(actor_save_path, self.global_step).wait()
+        checkpoints_dir = os.path.dirname(base_output_dir)
+        removed = prune_old_checkpoints(
+            checkpoints_dir,
+            self.cfg.runner.get("max_checkpoints_to_keep", None),
+        )
+        for path in removed:
+            self.logger.info(f"Removed old checkpoint: {path}")
 
     def set_max_steps(self):
         self.num_steps_per_epoch = 1
