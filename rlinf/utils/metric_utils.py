@@ -380,6 +380,20 @@ def append_to_dict(data, new_data):
         data[key].append(val)
 
 
+def scalar_metrics_to_python(metrics: dict) -> dict:
+    """Detach scalar tensor metrics so NumPy aggregation is device-safe."""
+    converted = {}
+    for key, value in metrics.items():
+        if isinstance(value, torch.Tensor):
+            if value.numel() != 1:
+                raise ValueError(
+                    f"Metric {key!r} must be scalar, got shape {tuple(value.shape)}"
+                )
+            value = value.detach().item()
+        converted[key] = value
+    return converted
+
+
 def compute_loss_mask(dones):
     _, actual_bsz, num_action_chunks = dones.shape
     n_chunk_step = dones.shape[0] - 1

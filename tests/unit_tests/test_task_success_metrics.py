@@ -3,7 +3,10 @@
 import pytest
 import torch
 
-from rlinf.utils.metric_utils import compute_evaluate_metrics
+from rlinf.utils.metric_utils import (
+    compute_evaluate_metrics,
+    scalar_metrics_to_python,
+)
 
 
 def test_compute_evaluate_metrics_reports_per_task_and_worst_task_success() -> None:
@@ -54,3 +57,17 @@ def test_compute_evaluate_metrics_without_task_ids_is_unchanged() -> None:
 
     assert metrics["success_once"] == pytest.approx(2 / 3)
     assert not any(key.startswith("task_success/") for key in metrics)
+
+
+def test_scalar_metrics_to_python_detaches_tensor_scalars() -> None:
+    metric = torch.tensor(1.25, requires_grad=True)
+
+    converted = scalar_metrics_to_python({"tensor": metric, "float": 2.5})
+
+    assert converted == {"tensor": 1.25, "float": 2.5}
+    assert isinstance(converted["tensor"], float)
+
+
+def test_scalar_metrics_to_python_rejects_vector_metrics() -> None:
+    with pytest.raises(ValueError, match="must be scalar"):
+        scalar_metrics_to_python({"vector": torch.ones(2)})

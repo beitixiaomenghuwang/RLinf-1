@@ -67,6 +67,7 @@ from rlinf.utils.metric_utils import (
     compute_loss_mask,
     compute_rollout_metrics,
     compute_split_num,
+    scalar_metrics_to_python,
 )
 from rlinf.utils.nested_dict_process import (
     put_tensor_device,
@@ -1560,7 +1561,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             )
             loss += auxiliary_loss
             if bool(self.gse_cfg.get("log_router_metrics", True)):
-                metrics_data.update(gse_metrics)
+                metrics_data.update(scalar_metrics_to_python(gse_metrics))
 
         loss /= self.gradient_accumulation
         with backward_ctx:
