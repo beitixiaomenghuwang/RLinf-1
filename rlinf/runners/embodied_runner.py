@@ -509,6 +509,8 @@ class EmbodiedRunner:
         self.logger.info(f"Closed profiling window at step {step_idx}")
 
     def run(self):
+        if self.cfg.runner.get("only_eval", False):
+            return self.run_evaluation()
         if self.cfg.runner.get("use_training_pipeline", False):
             return self.run_pipeline()
 
@@ -593,6 +595,34 @@ class EmbodiedRunner:
             )
 
         self._finish_run()
+
+    def run_evaluation(self) -> dict:
+        """Synchronize actor weights and run one evaluation without training."""
+        start_time = time.time()
+        self.actor.set_global_step(self.global_step)
+        self.rollout.set_global_step(self.global_step)
+
+        with self.timer("sync_weights"):
+            self.update_rollout_weights()
+        with self.timer("eval"):
+            eval_metrics = self.evaluate()
+
+        eval_metrics = {f"eval/{key}": value for key, value in eval_metrics.items()}
+        time_metrics = {
+            f"time/{key}": value for key, value in self.timer.consume_durations().items()
+        }
+        self.metric_logger.log(data=eval_metrics, step=self.global_step)
+        self.metric_logger.log(data=time_metrics, step=self.global_step)
+        logging_metrics = {**time_metrics, **eval_metrics}
+        self.print_metrics_table_async(
+            self.global_step,
+            max(self.global_step + 1, 1),
+            start_time,
+            logging_metrics,
+            self.global_step,
+        )
+        self._finish_run()
+        return eval_metrics
 
     def run_pipeline(self):
         start_step = self.global_step
