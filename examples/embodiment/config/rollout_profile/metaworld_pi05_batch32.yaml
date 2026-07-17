@@ -1,0 +1,18 @@
+# @package _global_
+
+# High-throughput profile for 8 x A100 80 GB. Eight rollout replicas each process
+# batch size 32. Two rollout epochs collect 512 trajectories per global step.
+# Five global steps match the 2,560-trajectory budget of the validated batch16
+# profile's ten steps while halving optimizer-step count through a 2x global batch.
+# Actor micro batch stays at the proven 128 so rollout capacity can be tested first.
+env:
+  train:
+    total_num_envs: 256
+    rollout_epoch: 2
+
+rollout:
+  pipeline_stage_num: 1
+
+actor:
+  micro_batch_size: 128
+  global_batch_size: 2048

@@ -1,0 +1,16 @@
+# @package _global_
+
+# Capacity-probe profile for 8 x A100 80 GB. Eight rollout replicas each process
+# batch size 64. This starts 512 MetaWorld environments, so CPU/RAM/process limits
+# may become the bottleneck even when GPU memory is sufficient.
+env:
+  train:
+    total_num_envs: 512
+    rollout_epoch: 1
+
+rollout:
+  pipeline_stage_num: 1
+
+actor:
+  micro_batch_size: 128
+  global_batch_size: 2048

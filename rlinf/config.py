@@ -39,6 +39,24 @@ if TYPE_CHECKING:
 logging.getLogger().setLevel(logging.INFO)
 
 
+def compute_embodied_ppo_samples_per_step(
+    total_num_envs: int,
+    rollout_epoch: int,
+    max_steps_per_rollout_epoch: int,
+    num_action_chunks: int,
+) -> int:
+    """Compute the number of PPO chunk samples collected per global step."""
+    if max_steps_per_rollout_epoch % num_action_chunks != 0:
+        raise ValueError(
+            "max_steps_per_rollout_epoch must be divisible by num_action_chunks"
+        )
+    return (
+        total_num_envs
+        * rollout_epoch
+        * (max_steps_per_rollout_epoch // num_action_chunks)
+    )
+
+
 @dataclasses.dataclass(frozen=True)
 class SupportedModel:
     value: str
@@ -1015,6 +1033,18 @@ def validate_embodied_cfg(cfg):
         ), (
             "env.train.max_steps_per_rollout_epoch must be divisible by actor.model.num_action_chunks"
         )
+        if cfg.algorithm.loss_type in {"actor_critic", "decoupled_actor_critic"}:
+            ppo_samples_per_step = compute_embodied_ppo_samples_per_step(
+                total_num_envs=cfg.env.train.total_num_envs,
+                rollout_epoch=cfg.env.train.rollout_epoch,
+                max_steps_per_rollout_epoch=cfg.env.train.max_steps_per_rollout_epoch,
+                num_action_chunks=model_cfg.num_action_chunks,
+            )
+            assert ppo_samples_per_step % cfg.actor.global_batch_size == 0, (
+                "PPO samples per global step must be divisible by "
+                f"actor.global_batch_size, got {ppo_samples_per_step} and "
+                f"{cfg.actor.global_batch_size}"
+            )
 
     with open_dict(cfg):
         weight_sync_interval = cfg.runner.get("weight_sync_interval", 1)

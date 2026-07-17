@@ -1,0 +1,8 @@
+# @package _global_
+
+# Actor activation-memory probe for 8 GPUs. Compose after a rollout profile whose
+# global batch is 2048. This removes gradient accumulation while retaining one
+# 256-sample local micro batch per actor rank.
+actor:
+  micro_batch_size: 256
+  global_batch_size: 2048
