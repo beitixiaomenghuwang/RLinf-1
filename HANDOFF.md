@@ -139,6 +139,8 @@ Implemented:
 
 - router entropy and normalized entropy;
 - expert selection/probability metrics;
+- count-weighted task-conditioned expert selection/probability metrics, including
+  normalized task/expert mutual information and Jensen-Shannon divergence;
 - load-balance and orthogonality diagnostics;
 - optional load-balance and orthogonality auxiliary actor losses;
 - MT50 per-task success, macro success, worst-5/worst-10 summaries, and threshold
@@ -153,8 +155,8 @@ The first balanced pilot used monitoring-only auxiliary losses. Keep
 task-conditioned router measurements justify changing the objective.
 
 Uniform aggregate expert usage is evidence against global router collapse, but it
-does not prove task specialization. Task-conditioned expert utilization is still
-missing and is the most important observability feature to add next.
+does not prove task specialization. Task-conditioned expert utilization is now
+logged during PPO recomputation and should be used for that judgment.
 
 ## 4. Important commits
 
@@ -172,6 +174,8 @@ b4ef12cb  balanced multi-task reset sampling
 45f532b6  balanced reset-pool padding per worker
 a6144d37  functional eval-only runner
 dcac37c1  skip actor-to-rollout weight sync in eval-only mode
+18f0c0e4  task-conditioned GSE router utilization
+7cac562f  retain per-sample routing assignments only when requested
 ```
 
 `dcac37c1` is required for eval-only runs. In eval-only mode the rollout worker
@@ -179,6 +183,16 @@ does not construct a weight syncer; it loads directly from
 `rollout.model.model_path`. Calling actor-to-rollout synchronization would crash,
 and guarding only the rollout receiver would instead leave the actor sender
 waiting forever.
+
+`18f0c0e4` propagates MetaWorld task IDs as training metadata and aggregates
+router sufficient statistics by task across micro-batches, update epochs, and
+distributed ranks. It intentionally removes task IDs before calling OpenPI, so
+they do not alter the policy input or routing function.
+
+`7cac562f` keeps the detailed per-sample router tensors only on models configured
+with task-conditioned logging. Default GSE and rollout workers retain only the
+original aggregate diagnostics, avoiding unnecessary memory growth, especially
+for token routing.
 
 ## 5. Validation completed
 
@@ -501,12 +515,42 @@ python -m pytest -q \
   tests/unit_tests/test_checkpoint_retention.py \
   tests/unit_tests/test_ray_storage_config.py \
   tests/unit_tests/test_task_success_metrics.py \
+  tests/unit_tests/test_comm_mapper.py \
   tests/unit_tests/models/test_gse.py \
   tests/unit_tests/models/test_openpi_gse.py
 ```
 
-This focused suite passed on 2026-07-17: `36 passed`. The GSE eval-only Hydra
-overrides in Section 6.3 were also resolved successfully in the same Docker image.
+This focused suite passed on 2026-07-17: `45 passed`. Ruff passed on all changed
+Python files. Both the training config with task-conditioned router metrics and
+the GSE eval-only overrides in Section 6.3 resolved successfully in the same
+Docker image.
+
+### Task-conditioned router metrics
+
+The MetaWorld GSE config enables:
+
+```yaml
+actor:
+  model:
+    gse:
+      log_task_router_metrics: true
+      task_router_num_tasks: 50
+```
+
+The terminal table suppresses the detailed per-task/per-expert values to remain
+readable, while TensorBoard receives them. Summary metrics remain visible under
+`train/gse/task_router/`:
+
+- `covered_tasks`: tasks present in PPO recomputation;
+- `normalized_mutual_information`: dependence between task and selected expert;
+- `mean_js_divergence`: average task distribution distance from global routing;
+- `mean_selection_std_across_tasks`: variability of hard selection by task;
+- `mean_probability_std_across_tasks`: variability of soft probabilities by task.
+
+Near-zero values mean the router behaves similarly across tasks. Larger values
+show task dependence, but not necessarily useful specialization; correlate them
+with per-task success deltas. Detailed keys have the form
+`train/gse/task_router/task_XX/expert_Y_selection` and `_probability`.
 
 Also resolve the Hydra config before expensive jobs:
 
@@ -522,19 +566,85 @@ python examples/embodiment/train_embodied_agent.py \
 
 ## 9. Next work, in order
 
-1. Add task-conditioned router/expert utilization. Aggregate selection and
-   probability by MT50 task ID using count-weighted sufficient statistics, not
-   unweighted micro-batch means.
-2. Repeat matched SFT and step-10 GSE evaluation with multiple rollout seeds to
+1. Pull `18f0c0e4` and run a new 10-step balanced GSE pilot from the SFT
+   checkpoint. Existing checkpoints do not contain historical per-task router
+   activations, so the new metrics cannot be reconstructed from them.
+2. Inspect task-router NMI/JS/std together with the per-task success delta. Verify
+   that all 50 tasks are covered before interpreting specialization.
+3. Repeat matched SFT and step-10 GSE evaluation with multiple rollout seeds to
    quantify stochastic-policy and per-task uncertainty.
-3. If task imbalance remains in PPO batches, add task-wise advantage
+4. If task imbalance remains in PPO batches, add task-wise advantage
    normalization or controlled worst-task weighting. Do not add it before
    measuring task frequencies and per-task gradient/advantage scales.
-4. Run matched short pilots for GSE PPO, full-parameter PPO, and parameter-matched
+5. Run matched short pilots for GSE PPO, full-parameter PPO, and parameter-matched
    plain LoRA PPO. Match environment steps, reset states, seeds, and evaluation
    frequency.
-5. Only after these checks, run multi-seed longer training and tune auxiliary
+6. Only after these checks, run multi-seed longer training and tune auxiliary
    losses.
+
+After pulling the latest commits, first run a two-step metadata smoke test:
+
+```bash
+export RUN_DIR=/workspace/output/gse-task-router-smoke-seed42
+mkdir -p "$RUN_DIR"
+
+python examples/embodiment/train_embodied_agent.py \
+  --config-path /workspace/RLinf/examples/embodiment/config \
+  --config-name metaworld_50_ppo_openpi_pi05_gse \
+  actor.model.model_path=/workspace/models/RLinf-Pi05-MetaWorld-SFT \
+  rollout.model.model_path=/workspace/models/RLinf-Pi05-MetaWorld-SFT \
+  runner.resume_dir=null \
+  runner.logger.log_path="$RUN_DIR" \
+  runner.logger.experiment_name=gse_task_router_smoke_seed42 \
+  runner.max_epochs=2 \
+  runner.save_interval=-1 \
+  runner.val_check_interval=-1 \
+  env.train.total_num_envs=64 \
+  env.train.rollout_epoch=8 \
+  actor.micro_batch_size=128 \
+  actor.global_batch_size=2048 \
+  actor.optim.lr=5e-5 \
+  actor.optim.total_training_steps=1000 \
+  actor.seed=42 \
+  2>&1 | tee "$RUN_DIR/console.log"
+```
+
+Acceptance criteria:
+
+- the run completes without an OpenPI transform error involving `task_ids`;
+- `train/gse/task_router/covered_tasks` is present and equals 50;
+- NMI, JS divergence, and both across-task standard deviations are finite;
+- no existing PPO/router metric changes type or becomes NaN.
+
+Then repeat the matched 10-step pilot in a fresh directory:
+
+```bash
+export RUN_DIR=/workspace/output/gse-task-router-10step-seed42
+mkdir -p "$RUN_DIR"
+
+python examples/embodiment/train_embodied_agent.py \
+  --config-path /workspace/RLinf/examples/embodiment/config \
+  --config-name metaworld_50_ppo_openpi_pi05_gse \
+  actor.model.model_path=/workspace/models/RLinf-Pi05-MetaWorld-SFT \
+  rollout.model.model_path=/workspace/models/RLinf-Pi05-MetaWorld-SFT \
+  runner.resume_dir=null \
+  runner.logger.log_path="$RUN_DIR" \
+  runner.logger.experiment_name=gse_task_router_10step_seed42 \
+  runner.max_epochs=10 \
+  runner.save_interval=10 \
+  runner.val_check_interval=10 \
+  env.train.total_num_envs=64 \
+  env.train.rollout_epoch=8 \
+  env.eval.total_num_envs=512 \
+  env.eval.use_fixed_reset_state_ids=True \
+  env.eval.is_eval=True \
+  actor.micro_batch_size=128 \
+  actor.global_batch_size=2048 \
+  actor.optim.lr=5e-5 \
+  actor.optim.total_training_steps=1000 \
+  actor.seed=42 \
+  2>&1 | tee "$RUN_DIR/console.log"
+```
 
 For paper results, report mean, median, worst-5/worst-10, tasks above 90%, negative
 transfer relative to SFT, environment steps, trainable parameters, optimizer
