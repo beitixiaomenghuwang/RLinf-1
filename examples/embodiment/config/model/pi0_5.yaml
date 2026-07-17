@@ -1,5 +1,8 @@
 model_type: "openpi"
 
+# Optional per-rollout-worker RNG base seed. The rollout config can override it.
+seed: null
+
 # Model path - should be set in specific config files
 model_path: "/path/to/model/openpi"
 

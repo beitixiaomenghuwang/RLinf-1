@@ -320,6 +320,22 @@ def gse_task_router_metrics(
             ),
         }
     )
+    metrics.update(
+        {
+            "gse/task_router/nmi": metrics[
+                "gse/task_router/normalized_mutual_information"
+            ],
+            "gse/task_router/js": metrics[
+                "gse/task_router/mean_js_divergence"
+            ],
+            "gse/task_router/prob_std": metrics[
+                "gse/task_router/mean_probability_std_across_tasks"
+            ],
+            "gse/task_router/select_std": metrics[
+                "gse/task_router/mean_selection_std_across_tasks"
+            ],
+        }
+    )
     return metrics
 
 

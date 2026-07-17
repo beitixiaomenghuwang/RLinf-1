@@ -22,7 +22,10 @@ from rlinf.scheduler import (
     merge_batches,
     split_batch,
 )
-from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
+from rlinf.workers.rollout.hf.huggingface_worker import (
+    MultiStepRolloutWorker,
+    resolve_rollout_seed,
+)
 
 
 def _make_obs(start: int, batch_size: int) -> dict:
@@ -38,6 +41,14 @@ def _make_obs(start: int, batch_size: int) -> dict:
         ],
         "task_ids": torch.arange(start, start + batch_size, dtype=torch.long),
     }
+
+
+def test_rollout_seed_uses_rollout_override_and_rank_offset() -> None:
+    assert resolve_rollout_seed(
+        {"seed": 100}, {"seed": 40}, rank=3
+    ) == 103
+    assert resolve_rollout_seed({}, {"seed": 40}, rank=3) == 43
+    assert resolve_rollout_seed({}, {}, rank=3) is None
 
 
 def test_build_send_plan_load_balance_env_to_rollout():

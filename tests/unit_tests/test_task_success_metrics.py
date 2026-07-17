@@ -1,10 +1,15 @@
 """Tests for task-conditioned embodied evaluation metrics."""
 
+import json
+
+import numpy as np
 import pytest
 import torch
 
 from rlinf.utils.metric_utils import (
     compute_evaluate_metrics,
+    print_metrics_table,
+    scalar_metrics_for_json,
     scalar_metrics_to_python,
 )
 
@@ -71,3 +76,34 @@ def test_scalar_metrics_to_python_detaches_tensor_scalars() -> None:
 def test_scalar_metrics_to_python_rejects_vector_metrics() -> None:
     with pytest.raises(ValueError, match="must be scalar"):
         scalar_metrics_to_python({"vector": torch.ones(2)})
+
+
+def test_scalar_metrics_for_json_keeps_numpy_and_tensor_scalars() -> None:
+    metrics = scalar_metrics_for_json(
+        {
+            "python": 1.5,
+            "numpy": np.asarray(2.5),
+            "tensor": torch.tensor(3.5),
+            "vector": torch.ones(2),
+        }
+    )
+
+    assert metrics == {"python": 1.5, "numpy": 2.5, "tensor": 3.5}
+
+
+def test_print_metrics_table_writes_exact_jsonl(tmp_path) -> None:
+    print_metrics_table(
+        step=2,
+        total_steps=4,
+        start_time=0.0,
+        metrics={
+            "eval/success_once": np.asarray(0.625),
+            "train/gse/task_router/nmi": 0.0123456789,
+        },
+        log_path=str(tmp_path),
+    )
+
+    record = json.loads((tmp_path / "metrics.jsonl").read_text().splitlines()[-1])
+    assert record["step"] == 2
+    assert record["metrics"]["eval/success_once"] == 0.625
+    assert record["metrics"]["train/gse/task_router/nmi"] == 0.0123456789

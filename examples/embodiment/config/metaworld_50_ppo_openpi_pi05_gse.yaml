@@ -97,6 +97,8 @@ env:
 
 rollout:
   group_name: "RolloutGroup"
+  # Each rollout worker uses seed + rank for reproducible Flow-SDE sampling.
+  seed: 42
   generation_backend: "huggingface"
   recompute_logprobs: False
   unnorm_key: libero_10

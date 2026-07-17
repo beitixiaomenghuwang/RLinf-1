@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import math
 import os
 import time
@@ -394,6 +395,23 @@ def scalar_metrics_to_python(metrics: dict) -> dict:
     return converted
 
 
+def scalar_metrics_for_json(metrics: dict) -> dict[str, float]:
+    """Convert scalar numeric metrics while ignoring structured values."""
+    converted: dict[str, float] = {}
+    for key, value in metrics.items():
+        if isinstance(value, torch.Tensor):
+            if value.numel() != 1:
+                continue
+            value = value.detach().item()
+        elif isinstance(value, np.ndarray):
+            if value.size != 1:
+                continue
+            value = value.item()
+        if isinstance(value, (int, float, np.integer, np.floating)):
+            converted[key] = float(value)
+    return converted
+
+
 def compute_loss_mask(dones):
     _, actual_bsz, num_action_chunks = dones.shape
     n_chunk_step = dones.shape[0] - 1
@@ -608,3 +626,12 @@ def print_metrics_table(
         os.makedirs(log_path, exist_ok=True)
         with open(os.path.join(log_path, "metrics.log"), "a") as metrics_file:
             metrics_file.write(table + "\n")
+        json_metrics = scalar_metrics_for_json(metrics)
+        with open(os.path.join(log_path, "metrics.jsonl"), "a") as metrics_file:
+            metrics_file.write(
+                json.dumps(
+                    {"step": int(step), "metrics": json_metrics},
+                    sort_keys=True,
+                )
+                + "\n"
+            )

@@ -286,6 +286,18 @@ def test_task_router_metrics_detect_complete_task_specialization() -> None:
         1.0
     )
     assert metrics["gse/task_router/mean_js_divergence"] > 0
+    assert metrics["gse/task_router/nmi"] == metrics[
+        "gse/task_router/normalized_mutual_information"
+    ]
+    assert metrics["gse/task_router/js"] == metrics[
+        "gse/task_router/mean_js_divergence"
+    ]
+    assert metrics["gse/task_router/prob_std"] == metrics[
+        "gse/task_router/mean_probability_std_across_tasks"
+    ]
+    assert metrics["gse/task_router/select_std"] == metrics[
+        "gse/task_router/mean_selection_std_across_tasks"
+    ]
     assert metrics["gse/task_router/task_00/dominant_expert"] == 0
     assert metrics["gse/task_router/task_01/dominant_expert"] == 1
 
