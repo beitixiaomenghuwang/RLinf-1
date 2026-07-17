@@ -1,0 +1,17 @@
+# @package _global_
+
+# Equal-interaction profile for 8 x A100 80 GB. Keep the validated efficient
+# batch size of 16 on each of eight rollout replicas, but collect four epochs of
+# 128 environments. This yields 512 trajectories and 10,240 PPO chunk samples
+# per global step without the concurrent-environment overhead of batch32.
+env:
+  train:
+    total_num_envs: 128
+    rollout_epoch: 4
+
+rollout:
+  pipeline_stage_num: 1
+
+actor:
+  micro_batch_size: 128
+  global_batch_size: 2048

@@ -356,6 +356,26 @@ supersede the need for matched seeds. Per-task estimates still have high samplin
 variance, and the exact task-router NMI/JS values were truncated in the terminal.
 Future runs persist those values in `metrics.jsonl`.
 
+### 5.6 High-memory capacity result
+
+The 8 x A100 80 GB capacity probe established:
+
+- `metaworld_pi05_batch32 + pi05_micro256` runs without OOM;
+- `metaworld_pi05_batch64` exceeds available memory;
+- the first batch32/micro256 global step took `497.8 s`, including `261.0 s`
+  rollout generation and `231.5 s` actor training.
+
+This is a memory-capacity success but not a throughput success. Compared with
+the validated batch16 run's approximately `207.1 s` non-eval step, five batch32
+steps project to about 41.5 minutes, versus about 34.5 minutes for ten batch16
+steps at the same 2,560-trajectory budget. The comparison uses a batch32 first
+step and a mature batch16 step, so record the batch32 second step as well, but do
+not select the configuration merely because it occupies more GPU memory.
+
+The likely bottlenecks are 256 concurrent MetaWorld environments and the actor
+micro batch of 256. Per collected sample, both rollout and actor time degraded;
+the larger actor micro batch did not improve kernel throughput.
+
 ## 6. Eval-only behavior and reproducible evaluation
 
 ### 6.1 Critical loading rule
@@ -572,8 +592,8 @@ router metrics and the GSE eval-only overrides in Section 6.3 resolved
 successfully in the same Docker image.
 
 The 2026-07-17 high-memory and reproducibility changes passed `53` focused tests
-plus Ruff. Hydra resolved the batch32, batch32-plus-micro256, and batch64
-compositions in the OpenPI image.
+plus Ruff. Hydra resolved the batch16-epoch4, batch32,
+batch32-plus-micro256, and batch64 compositions in the OpenPI image.
 
 ### Task-conditioned router metrics
 
@@ -634,8 +654,10 @@ actor global batch 1,024, update_epoch 4 = 20 optimizer updates/global step
 ```
 
 The measured peak of about 53 GB on an 80 GB A100 leaves capacity on both the
-rollout and actor paths. Two independent profile dimensions now use that space:
+rollout and actor paths. Available profiles are:
 
+- `metaworld_pi05_batch16_epoch4`: 128 environments, four rollout epochs,
+  batch 16 per rollout replica, and actor global batch 2,048;
 - `metaworld_pi05_batch32`: 256 environments, two rollout epochs, batch 32 per
   rollout replica, and actor global batch 2,048;
 - `metaworld_pi05_batch64`: 512 environments, one rollout epoch, batch 64 per
@@ -643,19 +665,21 @@ rollout and actor paths. Two independent profile dimensions now use that space:
 - `pi05_micro256`: actor micro batch 256 and global batch 2,048, eliminating
   actor gradient accumulation on eight GPUs.
 
-The batch32 and batch64 profiles both collect 512 trajectories and 10,240 PPO
-samples per global step. Five steps therefore match the validated run's 2,560
-trajectory interaction budget. With actor global batch 2,048 and
-`update_epoch=4`, they perform 100 optimizer updates rather than 200. This is an
-equal-interaction, larger-minibatch experiment, not an identical optimization
-schedule. Keep the learning rate at `5e-5` for the first comparison; do not scale
-batch, learning rate, and auxiliary losses simultaneously.
+All three profiles collect 512 trajectories and 10,240 PPO samples per global
+step. Five steps therefore match the validated run's 2,560-trajectory interaction
+budget. With actor global batch 2,048 and `update_epoch=4`, they perform 100
+optimizer updates rather than 200. This is an equal-interaction, larger-minibatch
+experiment, not an identical optimization schedule. Keep the learning rate at
+`5e-5` for the first comparison; do not scale batch, learning rate, and auxiliary
+losses simultaneously.
 
 ### 9.2 Capacity ramp
 
-Run the following in order. Stop after any OOM or if peak memory exceeds 72 GiB
-(`73728 MiB`) on any card. Keep 8 GiB headroom for synchronization and allocator
-spikes; using 99% of VRAM is less useful than completing a distributed run.
+The batch32/micro256 and batch64 capacity tests are complete: the former runs but
+is slow, and the latter OOMs. Do not repeat batch64. Finish the current second
+batch32 step for a warm-state timing, then test the batch16-epoch4 profile. It
+retains the efficient batch16 model inference and 128 concurrent environments,
+while aggregating four rollout epochs before each actor update.
 
 In a second server terminal, monitor all GPUs:
 
@@ -667,21 +691,21 @@ nvidia-smi \
   | tee /workspace/output/gse-capacity/nvidia-smi.csv
 ```
 
-First probe rollout batch32 with the already validated actor micro batch:
+Run a two-step batch16-epoch4 throughput check:
 
 ```bash
-export RUN_DIR=/workspace/output/gse-capacity-batch32-micro128
+export RUN_DIR=/workspace/output/gse-capacity-batch16-epoch4
 mkdir -p "$RUN_DIR"
 
 python examples/embodiment/train_embodied_agent.py \
   --config-path /workspace/RLinf/examples/embodiment/config \
   --config-name metaworld_50_ppo_openpi_pi05_gse \
-  +rollout_profile=metaworld_pi05_batch32 \
+  +rollout_profile=metaworld_pi05_batch16_epoch4 \
   actor.model.model_path=/workspace/models/RLinf-Pi05-MetaWorld-SFT \
   rollout.model.model_path=/workspace/models/RLinf-Pi05-MetaWorld-SFT \
   runner.resume_dir=null \
   runner.logger.log_path="$RUN_DIR" \
-  runner.logger.experiment_name=gse_capacity_batch32_micro128 \
+  runner.logger.experiment_name=gse_capacity_batch16_epoch4 \
   runner.max_epochs=2 \
   runner.save_interval=-1 \
   runner.val_check_interval=-1 \
@@ -692,56 +716,30 @@ python examples/embodiment/train_embodied_agent.py \
   2>&1 | tee "$RUN_DIR/console.log"
 ```
 
-If it is stable, compose actor micro256:
-
-```bash
-export RUN_DIR=/workspace/output/gse-capacity-batch32-micro256
-mkdir -p "$RUN_DIR"
-
-python examples/embodiment/train_embodied_agent.py \
-  --config-path /workspace/RLinf/examples/embodiment/config \
-  --config-name metaworld_50_ppo_openpi_pi05_gse \
-  +rollout_profile=metaworld_pi05_batch32 \
-  +actor_profile=pi05_micro256 \
-  actor.model.model_path=/workspace/models/RLinf-Pi05-MetaWorld-SFT \
-  rollout.model.model_path=/workspace/models/RLinf-Pi05-MetaWorld-SFT \
-  runner.resume_dir=null \
-  runner.logger.log_path="$RUN_DIR" \
-  runner.logger.experiment_name=gse_capacity_batch32_micro256 \
-  runner.max_epochs=2 \
-  runner.save_interval=-1 \
-  runner.val_check_interval=-1 \
-  actor.optim.lr=5e-5 \
-  actor.optim.total_training_steps=1000 \
-  actor.seed=42 \
-  rollout.seed=42 \
-  2>&1 | tee "$RUN_DIR/console.log"
-```
-
-Only if batch32 remains below 72 GiB and the CPU is not saturated, repeat the
-same command with `metaworld_pi05_batch64`. Select batch64 only when its second
-step reduces `generate_rollouts` and total `step` time; extra VRAM use alone is
-not a throughput win. If micro256 OOMs, keep the winning rollout profile and omit
-the actor profile. If batch32 OOMs, fall back to the committed batch16 profile.
+Use the second step, not the first, for selection. Proceed when it completes
+without OOM, covers all 50 tasks across the collected trajectories, and takes
+less than `400 s`. The strict wall-time break-even against ten `207.1 s` batch16
+steps is about `414 s` per step; `400 s` retains a safety margin. If it is slower,
+use the already validated batch16 ten-step profile instead.
 
 ### 9.3 Recommended five-step equal-interaction run
 
-After the capacity probe, the default recommendation is batch32 plus micro256:
+After the throughput check passes, use batch16-epoch4 without the micro256 actor
+profile:
 
 ```bash
-export RUN_DIR=/workspace/output/gse-batch32-micro256-5step-seed42
+export RUN_DIR=/workspace/output/gse-batch16-epoch4-5step-seed42
 mkdir -p "$RUN_DIR"
 
 python examples/embodiment/train_embodied_agent.py \
   --config-path /workspace/RLinf/examples/embodiment/config \
   --config-name metaworld_50_ppo_openpi_pi05_gse \
-  +rollout_profile=metaworld_pi05_batch32 \
-  +actor_profile=pi05_micro256 \
+  +rollout_profile=metaworld_pi05_batch16_epoch4 \
   actor.model.model_path=/workspace/models/RLinf-Pi05-MetaWorld-SFT \
   rollout.model.model_path=/workspace/models/RLinf-Pi05-MetaWorld-SFT \
   runner.resume_dir=null \
   runner.logger.log_path="$RUN_DIR" \
-  runner.logger.experiment_name=gse_batch32_micro256_5step_seed42 \
+  runner.logger.experiment_name=gse_batch16_epoch4_5step_seed42 \
   runner.max_epochs=5 \
   runner.save_interval=5 \
   runner.val_check_interval=5 \
@@ -784,8 +782,8 @@ intervals, per-task mean deltas, and improved/regressed/unchanged task counts.
 
 ### 9.5 Research sequence
 
-1. Pull `8646d1a0` and `c798a718`, then run the capacity ramp in Section 9.2.
-2. Run the five-step equal-interaction pilot with the fastest safe composition.
+1. Pull the latest commits and run the batch16-epoch4 check in Section 9.2.
+2. Run the five-step equal-interaction pilot if its second step is below `400 s`.
 3. Compare it against the validated 10-step result using 2,560 trajectories.
 4. Repeat matched SFT and GSE evaluations with at least three rollout seeds.
 5. Inspect exact task-router NMI/JS/std together with per-task success deltas.
@@ -813,7 +811,7 @@ tests if making a generalization claim.
 - Do not terminate unrelated GPU jobs or delete shared Docker/Ray data.
 - Put checkpoints, TensorBoard data, videos, and large logs outside the repository.
 
-The immediate milestone is the batch32/micro256 capacity probe followed by the
+The immediate milestone is the batch16-epoch4 throughput check followed by the
 five-step equal-interaction run and matched multi-seed evaluation. Do not enable
 auxiliary losses until those measurements show whether gains and regressions
 correspond to useful expert specialization.
