@@ -70,6 +70,47 @@ def test_build_send_plan_load_balance_env_to_rollout():
     ]
 
 
+def test_build_plans_for_two_rollout_replicas_per_gpu() -> None:
+    env_to_rollout = build_send_plan(
+        src_group_name="env",
+        dst_group_name="rollout",
+        src_rank=3,
+        src_world_size=8,
+        dst_world_size=16,
+        tag="train_obs",
+        batch_size=128,
+    )
+    rollout_from_env = build_recv_plan(
+        src_group_name="env",
+        dst_group_name="rollout",
+        dst_rank=7,
+        src_world_size=8,
+        dst_world_size=16,
+        tag="train_obs",
+        batch_size=128,
+    )
+    rollout_to_env = build_send_plan(
+        src_group_name="rollout",
+        dst_group_name="env",
+        src_rank=7,
+        src_world_size=16,
+        dst_world_size=8,
+        tag="train_actions",
+        batch_size=128,
+    )
+
+    assert [(entry.peer_rank, entry.batch_size) for entry in env_to_rollout.entries] == [
+        (6, 8),
+        (7, 8),
+    ]
+    assert [
+        (entry.peer_rank, entry.batch_size) for entry in rollout_from_env.entries
+    ] == [(3, 8)]
+    assert [(entry.peer_rank, entry.batch_size) for entry in rollout_to_env.entries] == [
+        (3, 8)
+    ]
+
+
 def test_build_send_plan_load_balance_rollout_to_env():
     plan = build_send_plan(
         src_group_name="rollout",

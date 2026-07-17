@@ -1,0 +1,16 @@
+# @package _global_
+
+# Sixteen rollout replicas on 8 GPUs (two processes share each GPU). Each replica
+# keeps batch size 8, and the trajectory budget remains 128 * 4 = 512 per step.
+# This profile is intentionally hardware-specific; use only on one 8-GPU node.
+cluster:
+  component_placement:
+    rollout: "0-7:0-15"
+
+env:
+  train:
+    total_num_envs: 128
+    rollout_epoch: 4
+
+rollout:
+  pipeline_stage_num: 1

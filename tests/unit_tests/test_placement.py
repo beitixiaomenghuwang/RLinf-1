@@ -380,6 +380,37 @@ class TestHybridComponentPlacement:
         assert len(placements) == 4
         assert sorted(p.local_accelerator_rank for p in placements) == [0, 1, 2, 3]
 
+    def test_multiple_rollout_processes_share_each_gpu(self):
+        config = DictConfig(
+            {
+                "cluster": {
+                    "num_nodes": 1,
+                    "component_placement": {
+                        "actor,env": "all",
+                        "rollout": "0-3:0-7",
+                    },
+                },
+            }
+        )
+
+        cluster = create_fake_cluster(num_nodes=1, accelerators_per_node=4)
+        placement = HybridComponentPlacement(config, cluster)
+
+        assert placement.get_world_size("actor") == 4
+        assert placement.get_world_size("env") == 4
+        assert placement.get_world_size("rollout") == 8
+        rollout_placements = placement.get_strategy("rollout").get_placement(cluster)
+        assert [item.local_accelerator_rank for item in rollout_placements] == [
+            0,
+            0,
+            1,
+            1,
+            2,
+            2,
+            3,
+            3,
+        ]
+
     def test_gpu_ranges_are_respected(self):
         config = DictConfig(
             {

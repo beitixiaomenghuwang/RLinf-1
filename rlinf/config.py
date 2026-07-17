@@ -930,6 +930,7 @@ def validate_embodied_cfg(cfg):
     component_placement = HybridComponentPlacement(cfg, Cluster())
     stage_num = cfg.rollout.pipeline_stage_num
     env_world_size = component_placement.get_world_size("env")
+    rollout_world_size = component_placement.get_world_size("rollout")
 
     use_reward_model = cfg.get("reward", {}).get("use_reward_model", False)
     standalone_realworld = cfg.get("reward", {}).get("standalone_realworld", False)
@@ -956,6 +957,12 @@ def validate_embodied_cfg(cfg):
         )
         assert cfg.env.eval.total_num_envs % env_world_size % stage_num == 0, (
             "Total number of parallel environments for evaluation must be divisible by the number of environment processes and the number of pipeline stages"
+        )
+        assert (
+            cfg.env.eval.total_num_envs // stage_num % rollout_world_size == 0
+        ), (
+            "env.eval.total_num_envs // rollout.pipeline_stage_num must be "
+            "divisible by the number of rollout processes"
         )
         assert cfg.env.eval.total_num_envs // env_world_size // stage_num > 0, (
             "env.eval.total_num_envs // env_world_size // rollout.pipeline_stage_num must be greater than 0"
@@ -984,6 +991,12 @@ def validate_embodied_cfg(cfg):
         )
         assert cfg.env.train.total_num_envs % env_world_size % stage_num == 0, (
             "Total number of parallel environments for training must be divisible by the number of environment processes and the number of pipeline stages"
+        )
+        assert (
+            cfg.env.train.total_num_envs // stage_num % rollout_world_size == 0
+        ), (
+            "env.train.total_num_envs // rollout.pipeline_stage_num must be "
+            "divisible by the number of rollout processes"
         )
         assert cfg.env.train.total_num_envs // env_world_size // stage_num > 0, (
             "env.train.total_num_envs // env_world_size // rollout.pipeline_stage_num must be greater than 0"
