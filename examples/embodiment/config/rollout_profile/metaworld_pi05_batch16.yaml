@@ -1,11 +1,15 @@
 # @package _global_
 
 # Eight rollout replicas (one per GPU on an 8-GPU node), each processing batch
-# size 16. The trajectory budget remains 128 * 4 = 512 per PPO step.
+# size 16. The validated fast profile collects 128 * 2 = 256 trajectories per
+# PPO step and uses a matching 1024-sample actor global batch.
 env:
   train:
     total_num_envs: 128
-    rollout_epoch: 4
+    rollout_epoch: 2
 
 rollout:
   pipeline_stage_num: 1
+
+actor:
+  global_batch_size: 1024
