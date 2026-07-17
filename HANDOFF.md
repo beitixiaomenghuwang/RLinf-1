@@ -363,7 +363,9 @@ The 8 x A100 80 GB capacity probe established:
 - `metaworld_pi05_batch32 + pi05_micro256` runs without OOM;
 - `metaworld_pi05_batch64` exceeds available memory;
 - the first batch32/micro256 global step took `497.8 s`, including `261.0 s`
-  rollout generation and `231.5 s` actor training.
+  rollout generation and `231.5 s` actor training;
+- the first batch16/epoch4 global step was even slower at `546.3 s`, including
+  `311.1 s` rollout generation and `229.9 s` actor training.
 
 This is a memory-capacity success but not a throughput success. Compared with
 the validated batch16 run's approximately `207.1 s` non-eval step, five batch32
@@ -372,9 +374,11 @@ steps at the same 2,560-trajectory budget. The comparison uses a batch32 first
 step and a mature batch16 step, so record the batch32 second step as well, but do
 not select the configuration merely because it occupies more GPU memory.
 
-The likely bottlenecks are 256 concurrent MetaWorld environments and the actor
-micro batch of 256. Per collected sample, both rollout and actor time degraded;
-the larger actor micro batch did not improve kernel throughput.
+The likely bottlenecks are increased concurrent environments, repeated bootstrap
+overhead, and the actor micro batch of 256. Per collected sample, both rollout
+and actor time degraded; the larger actor micro batch did not improve kernel
+throughput. The formal run therefore returns to the validated batch16 settings
+using command-line overrides. Do not add more throughput YAML profiles.
 
 ## 6. Eval-only behavior and reproducible evaluation
 
@@ -592,8 +596,9 @@ router metrics and the GSE eval-only overrides in Section 6.3 resolved
 successfully in the same Docker image.
 
 The 2026-07-17 high-memory and reproducibility changes passed `53` focused tests
-plus Ruff. Hydra resolved the batch16-epoch4, batch32,
-batch32-plus-micro256, and batch64 compositions in the OpenPI image.
+plus Ruff. Hydra resolved the batch32, batch32-plus-micro256, and batch64
+compositions in the OpenPI image. The final formal command-line overrides were
+also resolved after the unsuccessful batch16-epoch4 profile was removed.
 
 ### Task-conditioned router metrics
 
@@ -638,128 +643,195 @@ python examples/embodiment/train_embodied_agent.py \
   > /tmp/pi05_gse_resolved.yaml
 ```
 
-## 9. High-memory rollout and next work
+## 9. Formal one-day training
 
-### 9.1 Validated throughput decision
+### 9.1 Final throughput decision
 
-The one-model-per-GPU Profile A is faster than the two-model-per-GPU profile.
-Keep eight rollout workers and increase the batch handled by each model instead
-of adding competing CUDA processes. The validated batch16 profile is:
+The fastest validated setting remains eight rollout replicas with batch 16 each:
 
 ```text
 128 environments x rollout_epoch 2 = 256 trajectories/global step
 256 trajectories x (100 / 5) = 5,120 PPO chunk samples/global step
 actor global batch 1,024, update_epoch 4 = 20 optimizer updates/global step
-10 global steps = 2,560 trajectories and 200 optimizer updates
 ```
 
-The measured peak of about 53 GB on an 80 GB A100 leaves capacity on both the
-rollout and actor paths. Available profiles are:
+Increasing memory occupancy did not improve end-to-end throughput. Batch32 with
+micro256 took `497.8 s`, batch16 with four rollout epochs took `546.3 s`, and
+batch64 OOMed. Use the validated batch16 values directly on the command line; do
+not compose `pi05_micro256` and do not add another throughput YAML profile.
 
-- `metaworld_pi05_batch16_epoch4`: 128 environments, four rollout epochs,
-  batch 16 per rollout replica, and actor global batch 2,048;
-- `metaworld_pi05_batch32`: 256 environments, two rollout epochs, batch 32 per
-  rollout replica, and actor global batch 2,048;
-- `metaworld_pi05_batch64`: 512 environments, one rollout epoch, batch 64 per
-  rollout replica; this can become CPU/RAM/process-bound and is an extreme probe;
-- `pi05_micro256`: actor micro batch 256 and global batch 2,048, eliminating
-  actor gradient accumulation on eight GPUs.
+A 320-step run collects 81,920 trajectories, approximately 8.19 million
+environment steps, and performs 6,400 optimizer updates. At the measured steady
+step time, plus eighteen 512-trajectory evaluations, it should fit in roughly
+19-23 hours. The cosine scheduler advances per optimizer update, not per global
+step, so every launch and resume must retain
+`actor.optim.total_training_steps=6400`.
 
-All three profiles collect 512 trajectories and 10,240 PPO samples per global
-step. Five steps therefore match the validated run's 2,560-trajectory interaction
-budget. With actor global batch 2,048 and `update_epoch=4`, they perform 100
-optimizer updates rather than 200. This is an equal-interaction, larger-minibatch
-experiment, not an identical optimization schedule. Keep the learning rate at
-`5e-5` for the first comparison; do not scale batch, learning rate, and auxiliary
-losses simultaneously.
+### 9.2 Stage 1: train to step 40
 
-### 9.2 Capacity ramp
-
-The batch32/micro256 and batch64 capacity tests are complete: the former runs but
-is slow, and the latter OOMs. Do not repeat batch64. Finish the current second
-batch32 step for a warm-state timing, then test the batch16-epoch4 profile. It
-retains the efficient batch16 model inference and 128 concurrent environments,
-while aggregating four rollout epochs before each actor update.
-
-In a second server terminal, monitor all GPUs:
+Use command-line overrides for all run-specific values:
 
 ```bash
-mkdir -p /workspace/output/gse-capacity
-nvidia-smi \
-  --query-gpu=timestamp,index,memory.used,utilization.gpu \
-  --format=csv -l 1 \
-  | tee /workspace/output/gse-capacity/nvidia-smi.csv
-```
-
-Run a two-step batch16-epoch4 throughput check:
-
-```bash
-export RUN_DIR=/workspace/output/gse-capacity-batch16-epoch4
+export RUN_DIR=/workspace/output/gse-formal-seed42
+export EXP_NAME=gse_formal_seed42
 mkdir -p "$RUN_DIR"
 
 python examples/embodiment/train_embodied_agent.py \
   --config-path /workspace/RLinf/examples/embodiment/config \
   --config-name metaworld_50_ppo_openpi_pi05_gse \
-  +rollout_profile=metaworld_pi05_batch16_epoch4 \
+  env.train.total_num_envs=128 \
+  env.train.rollout_epoch=2 \
+  rollout.pipeline_stage_num=1 \
+  actor.micro_batch_size=128 \
+  actor.global_batch_size=1024 \
   actor.model.model_path=/workspace/models/RLinf-Pi05-MetaWorld-SFT \
   rollout.model.model_path=/workspace/models/RLinf-Pi05-MetaWorld-SFT \
   runner.resume_dir=null \
   runner.logger.log_path="$RUN_DIR" \
-  runner.logger.experiment_name=gse_capacity_batch16_epoch4 \
-  runner.max_epochs=2 \
-  runner.save_interval=-1 \
-  runner.val_check_interval=-1 \
-  actor.optim.lr=5e-5 \
-  actor.optim.total_training_steps=1000 \
-  actor.seed=42 \
-  rollout.seed=42 \
-  2>&1 | tee "$RUN_DIR/console.log"
-```
-
-Use the second step, not the first, for selection. Proceed when it completes
-without OOM, covers all 50 tasks across the collected trajectories, and takes
-less than `400 s`. The strict wall-time break-even against ten `207.1 s` batch16
-steps is about `414 s` per step; `400 s` retains a safety margin. If it is slower,
-use the already validated batch16 ten-step profile instead.
-
-### 9.3 Recommended five-step equal-interaction run
-
-After the throughput check passes, use batch16-epoch4 without the micro256 actor
-profile:
-
-```bash
-export RUN_DIR=/workspace/output/gse-batch16-epoch4-5step-seed42
-mkdir -p "$RUN_DIR"
-
-python examples/embodiment/train_embodied_agent.py \
-  --config-path /workspace/RLinf/examples/embodiment/config \
-  --config-name metaworld_50_ppo_openpi_pi05_gse \
-  +rollout_profile=metaworld_pi05_batch16_epoch4 \
-  actor.model.model_path=/workspace/models/RLinf-Pi05-MetaWorld-SFT \
-  rollout.model.model_path=/workspace/models/RLinf-Pi05-MetaWorld-SFT \
-  runner.resume_dir=null \
-  runner.logger.log_path="$RUN_DIR" \
-  runner.logger.experiment_name=gse_batch16_epoch4_5step_seed42 \
-  runner.max_epochs=5 \
-  runner.save_interval=5 \
-  runner.val_check_interval=5 \
+  runner.logger.experiment_name="$EXP_NAME" \
+  runner.max_epochs=40 \
+  runner.save_interval=20 \
+  runner.val_check_interval=10 \
+  runner.max_checkpoints_to_keep=4 \
   env.eval.total_num_envs=512 \
   env.eval.use_fixed_reset_state_ids=True \
   env.eval.is_eval=True \
   actor.optim.lr=5e-5 \
-  actor.optim.total_training_steps=1000 \
+  actor.optim.total_training_steps=6400 \
   actor.seed=42 \
   rollout.seed=42 \
-  2>&1 | tee "$RUN_DIR/console.log"
+  2>&1 | tee "$RUN_DIR/console-stage1.log"
 ```
 
-Compare this checkpoint with the validated 10-step run using equal trajectories,
-not equal global steps. If five-step success is lower, first preserve the old
-optimization budget by setting `algorithm.update_epoch=8`; do not immediately
-raise the learning rate. This retains five rollout/global steps and 200 optimizer
-updates, at the cost of more actor compute.
+This evaluates at steps 10, 20, 30, and 40, and saves at steps 20 and 40. Proceed
+to Stage 2 only when step 40 has no hard failure signal from Section 9.5. A
+temporarily flat success curve is not sufficient reason to stop because
+sparse-reward MT50 evaluations are noisy.
 
-### 9.4 Multi-seed evaluation
+### 9.3 Stage 2 and Stage 3 resume
+
+Resume to step 120 from the step-40 checkpoint:
+
+```bash
+export CKPT="$RUN_DIR/$EXP_NAME/checkpoints/global_step_40"
+test -d "$CKPT/actor"
+
+python examples/embodiment/train_embodied_agent.py \
+  --config-path /workspace/RLinf/examples/embodiment/config \
+  --config-name metaworld_50_ppo_openpi_pi05_gse \
+  env.train.total_num_envs=128 \
+  env.train.rollout_epoch=2 \
+  rollout.pipeline_stage_num=1 \
+  actor.micro_batch_size=128 \
+  actor.global_batch_size=1024 \
+  actor.model.model_path=/workspace/models/RLinf-Pi05-MetaWorld-SFT \
+  rollout.model.model_path=/workspace/models/RLinf-Pi05-MetaWorld-SFT \
+  runner.resume_dir="$CKPT" \
+  runner.logger.log_path="$RUN_DIR" \
+  runner.logger.experiment_name="$EXP_NAME" \
+  runner.max_epochs=120 \
+  runner.save_interval=20 \
+  runner.val_check_interval=20 \
+  runner.max_checkpoints_to_keep=4 \
+  env.eval.total_num_envs=512 \
+  env.eval.use_fixed_reset_state_ids=True \
+  env.eval.is_eval=True \
+  actor.optim.lr=5e-5 \
+  actor.optim.total_training_steps=6400 \
+  actor.seed=42 \
+  rollout.seed=42 \
+  2>&1 | tee "$RUN_DIR/console-stage2.log"
+```
+
+If the step-120 checkpoint remains healthy, run the same command to step 320 by
+changing only:
+
+```bash
+export CKPT="$RUN_DIR/$EXP_NAME/checkpoints/global_step_120"
+# In the Stage 2 command, use runner.resume_dir="$CKPT", runner.max_epochs=320,
+# and tee "$RUN_DIR/console-stage3.log". Keep every other override unchanged.
+```
+
+Checkpoint resume restores model, optimizer, and LR scheduler. Do not change
+`total_training_steps`, GSE architecture, optimizer, batch sizes, or seed between
+stages. With four retained checkpoints, archive any checkpoint selected as a
+candidate before later saves prune it.
+
+### 9.4 Live monitoring
+
+TensorBoard:
+
+```bash
+tensorboard --logdir "$RUN_DIR/tensorboard" --host 0.0.0.0 --port 6006
+```
+
+Compact exact metrics without relying on truncated terminal columns:
+
+```bash
+python - <<'PY'
+import json
+from pathlib import Path
+
+path = Path("/workspace/output/gse-formal-seed42/metrics.jsonl")
+keys = (
+    "eval/success_once",
+    "eval/success_at_end",
+    "eval/task_success/macro_mean",
+    "eval/task_success/worst_10_mean",
+    "eval/task_success/num_above_90",
+    "train/actor/approx_kl",
+    "train/actor/clip_fraction",
+    "train/actor/grad_norm",
+    "train/critic/explained_variance",
+    "train/gse/router/normalized_entropy",
+    "train/gse/task_router/nmi",
+    "train/gse/task_router/js",
+)
+for line in path.open():
+    record = json.loads(line)
+    metrics = record["metrics"]
+    if "eval/success_once" in metrics:
+        checkpoint_step = record["step"] + 1
+        print(checkpoint_step, {key: metrics.get(key) for key in keys})
+PY
+```
+
+Training records use a zero-based loop index, hence the `+1` above; standalone
+eval-only records do not need this conversion.
+
+Also monitor `time/step`, all eight GPU memories, host RAM, Ray scratch usage,
+and remaining disk space. Training success metrics (`env/success_once`) are useful
+for trend detection but are not a convergence criterion because policy and reset
+samples change continuously.
+
+### 9.5 Convergence and stopping rules
+
+Select checkpoints by fixed-reset evaluation, not actor loss. A practical
+convergence judgment requires all of the following:
+
+- `eval/success_once`, macro mean, and worst-10 improve or remain stable across
+  at least three evaluations (40 global steps); use a moving three-evaluation
+  average rather than one point;
+- `success_at_end` tracks `success_once`; a widening gap can indicate transient
+  task completion that the policy fails to maintain;
+- the number of tasks above 90% rises without a growing count of zero-success or
+  regressed tasks relative to the SFT baseline;
+- approximate KL and clip fraction remain finite and controlled, critic explained
+  variance does not persistently collapse below zero, and gradients remain finite;
+- router entropy does not collapse toward zero, all 50 tasks remain covered, and
+  task-router NMI/JS are interpreted together with per-task success rather than as
+  objectives by themselves.
+
+Stop and roll back to the best checkpoint if two consecutive evaluations drop
+macro success by more than 5 percentage points from the best checkpoint, worst-10
+degrades materially, approximate KL repeatedly exceeds `0.02`, clip fraction
+repeatedly exceeds `0.2`, gradients become non-finite, or router entropy collapses.
+Treat convergence as reached when the three-evaluation moving averages of macro
+success and worst-10 improve by less than 1 percentage point while no tail task
+regresses. Confirm the selected checkpoint with three matched rollout seeds; a
+single 512-trajectory evaluation is not a paper result.
+
+### 9.6 Multi-seed evaluation
 
 New runs append every scalar metric, including untruncated router NMI/JS/std, to
 `$RUN_DIR/metrics.jsonl`. For final comparisons, evaluate both SFT and GSE with
@@ -780,17 +852,42 @@ python -m toolkits.embodiment.summarize_multiseed_eval \
 The summary reports mean, sample standard deviation, approximate 95% confidence
 intervals, per-task mean deltas, and improved/regressed/unchanged task counts.
 
-### 9.5 Research sequence
+### 9.7 Improvements after the baseline
 
-1. Pull the latest commits and run the batch16-epoch4 check in Section 9.2.
-2. Run the five-step equal-interaction pilot if its second step is below `400 s`.
-3. Compare it against the validated 10-step result using 2,560 trajectories.
-4. Repeat matched SFT and GSE evaluations with at least three rollout seeds.
-5. Inspect exact task-router NMI/JS/std together with per-task success deltas.
-6. Only then add task-wise advantage normalization or controlled tail weighting
-   if imbalance remains; keep auxiliary GSE losses disabled until justified.
-7. Run matched GSE PPO, full-parameter PPO, and parameter-matched LoRA PPO pilots
-   with identical environment steps, reset states, seeds, and evaluations.
+Run the 320-step configuration unchanged first. Then test one change at a time:
+
+1. Add task-wise advantage normalization because global normalization can let
+   easy/high-variance tasks dominate multi-task PPO gradients.
+2. Use adaptive task sampling or capped tail-task weighting based on a smoothed
+   per-task success estimate; cap weights to avoid overfitting zero-success tasks.
+3. Add a small SFT behavior-cloning anchor or reference-policy KL only if long-run
+   evaluation shows forgetting. Both cost compute/memory and are not justified by
+   the current positive transfer result.
+4. Tune router temperature/top-k or a very small load-balance coefficient only
+   after NMI/JS plus per-task deltas show collapse or harmful specialization.
+   Orthogonality is already near zero and does not currently need a penalty.
+5. Compare GSE against full-parameter PPO and parameter-matched LoRA PPO using
+   identical trajectories, seeds, reset states, optimizer updates, and evaluation.
+6. After selecting the objective, run at least three training seeds and held-out
+   visual/state perturbations before claiming improved generalization.
+
+### 9.8 Current method summary
+
+The current policy starts from the fully trained Pi0.5 MetaWorld MT50 SFT
+checkpoint. The VLM and original action-expert parameters stay frozen. GSE wraps
+126 linear projections in the 18-layer action expert with two always-active
+generalized experts and six routed specialized experts (`top_k=2`, total rank
+64). Orthogonal A matrices and zero B matrices make the initial residual exactly
+zero, so the initial policy is identical to SFT.
+
+RLinf then uses Flow-SDE/Flow-Noise PPO to collect balanced MT50 trajectories.
+Only GSE/router parameters and the value head are optimized. Each global step
+collects 256 trajectories, computes GAE with a shared multi-task value head, and
+runs four PPO update epochs over five global minibatches. Load-balance and
+orthogonality losses remain disabled; router/task specialization is monitored
+rather than forced. The formal objective is therefore parameter-efficient
+residual multi-task RL post-training of a frozen SFT VLA, with fixed-reset
+per-task evaluation used to detect positive transfer, conflict, and forgetting.
 
 For paper results, report mean, median, worst-5/worst-10, tasks above 90%, negative
 transfer relative to SFT, environment steps, trainable parameters, optimizer
@@ -811,7 +908,7 @@ tests if making a generalization claim.
 - Do not terminate unrelated GPU jobs or delete shared Docker/Ray data.
 - Put checkpoints, TensorBoard data, videos, and large logs outside the repository.
 
-The immediate milestone is the batch16-epoch4 throughput check followed by the
-five-step equal-interaction run and matched multi-seed evaluation. Do not enable
-auxiliary losses until those measurements show whether gains and regressions
-correspond to useful expert specialization.
+The immediate milestone is Stage 1 of the formal batch16 run, followed by the
+step-40 convergence review. Do not enable auxiliary losses until the baseline
+run and matched evaluations show whether gains and regressions correspond to
+useful expert specialization.

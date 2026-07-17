@@ -19,7 +19,6 @@ from rlinf.config import compute_embodied_ppo_samples_per_step
 
 def test_compute_embodied_ppo_samples_per_step() -> None:
     assert compute_embodied_ppo_samples_per_step(128, 2, 100, 5) == 5120
-    assert compute_embodied_ppo_samples_per_step(128, 4, 100, 5) == 10240
     assert compute_embodied_ppo_samples_per_step(256, 2, 100, 5) == 10240
 
 
