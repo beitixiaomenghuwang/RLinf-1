@@ -176,6 +176,7 @@ a6144d37  functional eval-only runner
 dcac37c1  skip actor-to-rollout weight sync in eval-only mode
 18f0c0e4  task-conditioned GSE router utilization
 7cac562f  retain per-sample routing assignments only when requested
+d292f580  parallel Pi0.5 rollout profiles and routing validation
 ```
 
 `dcac37c1` is required for eval-only runs. In eval-only mode the rollout worker
@@ -193,6 +194,10 @@ they do not alter the policy input or routing function.
 with task-conditioned logging. Default GSE and rollout workers retain only the
 original aggregate diagnostics, avoiding unnecessary memory growth, especially
 for token routing.
+
+`d292f580` adds matched-throughput rollout profiles for one and two Pi0.5
+rollout processes per GPU. It also validates that environment batches are
+divisible by the rollout worker count before workers launch.
 
 ## 5. Validation completed
 
@@ -278,14 +283,14 @@ Both policies were evaluated through the corrected eval-only runner with 512
 trajectories, all 50 tasks, fixed reset-state IDs, and the same model/input
 settings:
 
-| Metric | SFT | GSE step 10 | Delta |
-| --- | ---: | ---: | ---: |
-| `success_once` | 46.875% | 56.83594% | +9.96094 pp |
-| `success_at_end` | 34.17969% | 39.25781% | +5.07812 pp |
-| task macro mean | 46.7% | 56.6% | +9.9 pp |
-| tasks above 90% | 13 | 17 | +4 |
-| worst-10 mean | 2.8% | 1.8% | -1.0 pp |
-| worst-5 mean | 0.0% | 0.0% | 0.0 pp |
+| Metric           |       SFT | GSE step 10 |       Delta |
+| ---------------- | --------: | ----------: | ----------: |
+| `success_once`   |   46.875% |   56.83594% | +9.96094 pp |
+| `success_at_end` | 34.17969% |   39.25781% | +5.07812 pp |
+| task macro mean  |     46.7% |       56.6% |     +9.9 pp |
+| tasks above 90%  |        13 |          17 |          +4 |
+| worst-10 mean    |      2.8% |        1.8% |     -1.0 pp |
+| worst-5 mean     |      0.0% |        0.0% |      0.0 pp |
 
 At the trajectory level, GSE adds 51 `success_once` successes (`240 -> 291`) and
 26 `success_at_end` successes (`175 -> 201`). At the per-task level, 21 tasks
@@ -419,7 +424,7 @@ The following real host paths have already been selected. Preserve them exactly:
 ```bash
 export RLINF_REPO=/home/xueyang/RLinf
 export PI05_SFT=/DATA/disk0/xueyang/model/RLinf-Pi05-MetaWorld-SFT
-export GSE_OUTPUT=/home/xueyang/RLinf/pi05-gse
+export GSE_OUTPUT=/DATA/disk0/model/pi05-gse
 export HF_CACHE=/home/xueyang/RLinf/cache/huggingface
 export RAY_SCRATCH=/DATA/disk0/xueyang/Data/rlinf-ray
 mkdir -p \
@@ -520,7 +525,8 @@ python -m pytest -q \
   tests/unit_tests/models/test_openpi_gse.py
 ```
 
-This focused suite passed on 2026-07-17: `45 passed`. Ruff passed on all changed
+This focused suite passed on 2026-07-17: `45 passed`. The placement and channel
+routing tests for parallel rollout separately passed: `47 passed`. Ruff passed on all changed
 Python files. Both the training config with task-conditioned router metrics and
 the GSE eval-only overrides in Section 6.3 resolved successfully in the same
 Docker image.
@@ -564,43 +570,55 @@ python examples/embodiment/train_embodied_agent.py \
   > /tmp/pi05_gse_resolved.yaml
 ```
 
-## 9. Next work, in order
+## 9. Parallel rollout and next work
 
-1. Pull `18f0c0e4` and run a new 10-step balanced GSE pilot from the SFT
-   checkpoint. Existing checkpoints do not contain historical per-task router
-   activations, so the new metrics cannot be reconstructed from them.
-2. Inspect task-router NMI/JS/std together with the per-task success delta. Verify
-   that all 50 tasks are covered before interpreting specialization.
-3. Repeat matched SFT and step-10 GSE evaluation with multiple rollout seeds to
-   quantify stochastic-policy and per-task uncertainty.
-4. If task imbalance remains in PPO batches, add task-wise advantage
-   normalization or controlled worst-task weighting. Do not add it before
-   measuring task frequencies and per-task gradient/advantage scales.
-5. Run matched short pilots for GSE PPO, full-parameter PPO, and parameter-matched
-   plain LoRA PPO. Match environment steps, reset states, seeds, and evaluation
-   frequency.
-6. Only after these checks, run multi-seed longer training and tune auxiliary
-   losses.
+### 9.1 What the original run was doing
 
-After pulling the latest commits, first run a two-step metadata smoke test:
+On the 8-GPU server, the original placement `actor,env,rollout: all` already
+created eight independent rollout workers: one full Pi0.5 model per A100. With 64
+environments, each rollout worker received batch size 8. The observed smoke timing
+(`rollout/predict` about 26.7 s versus `rollout/generate_one_epoch` about 31.3 s)
+shows that model inference, rather than MetaWorld stepping, dominated that run.
+
+The locally measured Pi0.5 rollout model allocation was about 7.0 GB. Pure model
+memory would allow many copies on an 80 GB GPU, but the measured full training
+peak was about 53 GB per GPU. Retaining at least 15 GB for temporary allocations,
+weight sync, and fragmentation leaves roughly 12 GB. Therefore:
+
+- two rollout models per GPU are the supported first experiment;
+- three per GPU may fit, but is not recommended before measuring the two-copy
+  training peak;
+- four or more per GPU is not a safe collocated training setting despite fitting
+  by static model-size arithmetic.
+
+Multiple CUDA processes on one GPU also compete for compute and may context
+switch rather than execute kernels concurrently. Do not infer throughput from
+memory capacity. Compare the following profiles with CUDA MPS disabled first;
+only investigate MPS after the ordinary two-process profile proves stable.
+
+### 9.2 Matched two-step A/B benchmark
+
+Both profiles collect the same `128 * 4 = 512` trajectories per PPO step and use
+the same optimizer settings. Stop any existing run before launching either test.
+
+Profile A uses eight rollout replicas, one per GPU, with batch size 16 per model:
 
 ```bash
-export RUN_DIR=/workspace/output/gse-task-router-smoke-seed42
+export RUN_DIR=/workspace/output/gse-rollout-batch16-smoke
 mkdir -p "$RUN_DIR"
 
 python examples/embodiment/train_embodied_agent.py \
   --config-path /workspace/RLinf/examples/embodiment/config \
   --config-name metaworld_50_ppo_openpi_pi05_gse \
+  +rollout_profile=metaworld_pi05_batch16 \
   actor.model.model_path=/workspace/models/RLinf-Pi05-MetaWorld-SFT \
   rollout.model.model_path=/workspace/models/RLinf-Pi05-MetaWorld-SFT \
   runner.resume_dir=null \
   runner.logger.log_path="$RUN_DIR" \
-  runner.logger.experiment_name=gse_task_router_smoke_seed42 \
+  runner.logger.experiment_name=gse_rollout_batch16_smoke \
   runner.max_epochs=2 \
   runner.save_interval=-1 \
   runner.val_check_interval=-1 \
-  env.train.total_num_envs=64 \
-  env.train.rollout_epoch=8 \
   actor.micro_batch_size=128 \
   actor.global_batch_size=2048 \
   actor.optim.lr=5e-5 \
@@ -609,22 +627,78 @@ python examples/embodiment/train_embodied_agent.py \
   2>&1 | tee "$RUN_DIR/console.log"
 ```
 
-Acceptance criteria:
-
-- the run completes without an OpenPI transform error involving `task_ids`;
-- `train/gse/task_router/covered_tasks` is present and equals 50;
-- NMI, JS divergence, and both across-task standard deviations are finite;
-- no existing PPO/router metric changes type or becomes NaN.
-
-Then repeat the matched 10-step pilot in a fresh directory:
+Profile B uses 16 rollout replicas, two processes sharing each GPU, with batch
+size 8 per model:
 
 ```bash
+export RUN_DIR=/workspace/output/gse-rollout-dual-smoke
+mkdir -p "$RUN_DIR"
+
+python examples/embodiment/train_embodied_agent.py \
+  --config-path /workspace/RLinf/examples/embodiment/config \
+  --config-name metaworld_50_ppo_openpi_pi05_gse \
+  +rollout_profile=metaworld_pi05_dual_per_gpu \
+  actor.model.model_path=/workspace/models/RLinf-Pi05-MetaWorld-SFT \
+  rollout.model.model_path=/workspace/models/RLinf-Pi05-MetaWorld-SFT \
+  runner.resume_dir=null \
+  runner.logger.log_path="$RUN_DIR" \
+  runner.logger.experiment_name=gse_rollout_dual_smoke \
+  runner.max_epochs=2 \
+  runner.save_interval=-1 \
+  runner.val_check_interval=-1 \
+  actor.micro_batch_size=128 \
+  actor.global_batch_size=2048 \
+  actor.optim.lr=5e-5 \
+  actor.optim.total_training_steps=1000 \
+  actor.seed=42 \
+  2>&1 | tee "$RUN_DIR/console.log"
+```
+
+Compare the second step, not model-loading time. Record:
+
+- `rollout/predict`, `rollout/generate_one_epoch`, `generate_rollouts`, and total
+  `step` time;
+- peak `nvidia-smi` memory on every GPU;
+- rollout world size in the startup logs: 8 for Profile A, 16 for Profile B;
+- task coverage and finite GSE router metrics.
+
+Select Profile B only if it reduces `generate_rollouts` by at least 10%, does not
+increase total step time, and stays below 72 GB peak on every GPU. Otherwise use
+Profile A; larger batch with one model per GPU is usually more compute-efficient
+than two small competing model processes.
+
+### 9.3 Research sequence
+
+1. Pull `d292f580` and run the matched two-step rollout A/B benchmark above.
+2. Use the winning profile to run a new 10-step balanced GSE pilot from the SFT
+   checkpoint. Existing checkpoints do not contain historical per-task router
+   activations, so the new metrics cannot be reconstructed from them.
+3. Inspect task-router NMI/JS/std together with the per-task success delta. Verify
+   that all 50 tasks are covered before interpreting specialization.
+4. Repeat matched SFT and step-10 GSE evaluation with multiple rollout seeds to
+   quantify stochastic-policy and per-task uncertainty.
+5. If task imbalance remains in PPO batches, add task-wise advantage
+   normalization or controlled worst-task weighting. Do not add it before
+   measuring task frequencies and per-task gradient/advantage scales.
+6. Run matched short pilots for GSE PPO, full-parameter PPO, and parameter-matched
+   plain LoRA PPO. Match environment steps, reset states, seeds, and evaluation
+   frequency.
+7. Only after these checks, run multi-seed longer training and tune auxiliary
+   losses.
+
+After selecting the faster smoke profile, repeat the matched 10-step pilot in a
+fresh directory. Set `ROLLOUT_PROFILE` to either `metaworld_pi05_batch16` or
+`metaworld_pi05_dual_per_gpu`:
+
+```bash
+export ROLLOUT_PROFILE=metaworld_pi05_batch16
 export RUN_DIR=/workspace/output/gse-task-router-10step-seed42
 mkdir -p "$RUN_DIR"
 
 python examples/embodiment/train_embodied_agent.py \
   --config-path /workspace/RLinf/examples/embodiment/config \
   --config-name metaworld_50_ppo_openpi_pi05_gse \
+  +rollout_profile="$ROLLOUT_PROFILE" \
   actor.model.model_path=/workspace/models/RLinf-Pi05-MetaWorld-SFT \
   rollout.model.model_path=/workspace/models/RLinf-Pi05-MetaWorld-SFT \
   runner.resume_dir=null \
@@ -633,8 +707,6 @@ python examples/embodiment/train_embodied_agent.py \
   runner.max_epochs=10 \
   runner.save_interval=10 \
   runner.val_check_interval=10 \
-  env.train.total_num_envs=64 \
-  env.train.rollout_epoch=8 \
   env.eval.total_num_envs=512 \
   env.eval.use_fixed_reset_state_ids=True \
   env.eval.is_eval=True \
@@ -665,6 +737,7 @@ tests if making a generalization claim.
 - Do not terminate unrelated GPU jobs or delete shared Docker/Ray data.
 - Put checkpoints, TensorBoard data, videos, and large logs outside the repository.
 
-The immediate milestone is task-conditioned router observability plus repeated
-matched evaluation. Do not enable auxiliary losses until those measurements show
-whether gains and regressions correspond to useful expert specialization.
+The immediate milestone is selecting the faster matched-budget rollout profile,
+then collecting task-conditioned router measurements. Do not enable auxiliary
+losses until those measurements show whether gains and regressions correspond to
+useful expert specialization.
