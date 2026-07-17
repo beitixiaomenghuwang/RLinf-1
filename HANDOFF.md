@@ -26,9 +26,10 @@ This is not a second GSE-SFT stage and does not decompose an SFT weight delta.
 Orthogonal A initialization plus zero B initialization makes the initial GSE
 policy exactly equal to the loaded SFT policy. RL learns only a residual.
 
-The main research claim is not established yet. The first balanced 10-step run is
-a positive signal, but its SFT comparison was not produced by the same eval-only
-pipeline. A paired evaluation is the next required experiment.
+The same-pipeline, fixed-reset SFT/GSE evaluation is now complete. The 10-step
+GSE checkpoint improves both aggregate success metrics, but its worst-task tail
+does not improve. This establishes a short-run average-success signal, not yet a
+multi-task balance or generalization claim.
 
 ## 2. Repositories, image, and assets
 
@@ -257,21 +258,46 @@ orthogonality diagnostic: 9.43e-7
 All 50 tasks appeared in training. The run took about 34 minutes 30 seconds for
 ten steps; the final step including evaluation took about 487 seconds.
 
-### 5.4 Interpretation of the reported 43.8% SFT score
+### 5.4 Paired SFT versus 10-step GSE evaluation
 
-Do not yet claim an improvement from `43.8%` to `55.1%`.
+Both policies were evaluated through the corrected eval-only runner with 512
+trajectories, all 50 tasks, fixed reset-state IDs, and the same model/input
+settings:
 
-That conclusion is valid only if 43.8% used the same checkpoint, observation and
-action settings, fixed reset states, number of trials per task, and specifically
-the same `success_once` metric. If 43.8% is `success_at_end`, the comparable GSE
-number is 39.26%, not 55.08%.
+| Metric | SFT | GSE step 10 | Delta |
+| --- | ---: | ---: | ---: |
+| `success_once` | 46.875% | 56.83594% | +9.96094 pp |
+| `success_at_end` | 34.17969% | 39.25781% | +5.07812 pp |
+| task macro mean | 46.7% | 56.6% | +9.9 pp |
+| tasks above 90% | 13 | 17 | +4 |
+| worst-10 mean | 2.8% | 1.8% | -1.0 pp |
+| worst-5 mean | 0.0% | 0.0% | 0.0 pp |
 
-The balanced pilot is therefore a promising signal, not causal evidence. Its low
-worst-10 score can primarily reflect the weak/uneven SFT initialization, sparse
-reward, and only ten PPO updates. The paired eval described below must be run
-before changing the method or starting a long experiment.
+At the trajectory level, GSE adds 51 `success_once` successes (`240 -> 291`) and
+26 `success_at_end` successes (`175 -> 201`). At the per-task level, 21 tasks
+improve, 10 regress, and 19 are unchanged at the available 10/11 trials per task.
 
-## 6. Eval-only behavior and paired evaluation
+GSE unlocks three SFT-zero tasks (`02`, `11`, and `22`), while four previously
+nonzero tasks become zero (`12`, `19`, `28`, and `47`). The largest gains include
+task `11` (+100 pp), `37` (+70 pp), `14` and `21` (+50 pp). The largest
+regressions include task `09` (-45.4 pp), `19` and `47` (-40 pp), `12` and `46`
+(-30 pp).
+
+Interpretation:
+
+- The aggregate short-run RL benefit is real under the matched evaluation
+  pipeline; the previous external 43.8% number is no longer needed for this
+  comparison.
+- The method has not yet balanced MT50: the worst-10 tail regresses slightly and
+  the number of zero-success tasks changes from seven to eight.
+- Per-task estimates have high variance with only 10/11 trials. Repeat both SFT
+  and GSE evaluation over multiple matched random seeds before treating individual
+  task deltas as stable.
+- Global router entropy remains evidence against collapse, but cannot explain
+  which tasks gained or regressed. Task-conditioned router statistics are the
+  next implementation milestone.
+
+## 6. Eval-only behavior and reproducible evaluation
 
 ### 6.1 Critical loading rule
 
@@ -326,8 +352,8 @@ file. Point the rollout model at the checkpoint's `actor` directory containing
 Example:
 
 ```bash
-export GSE_CKPT=/workspace/output/<run>/<global_step_checkpoint>
-export RUN_DIR=/workspace/output/gse-balanced-eval
+export GSE_CKPT=/workspace/output/gse-balanced-observe-seed42/gse_balanced_observe_seed42/checkpoints/global_step_10
+export RUN_DIR=/workspace/output/gse-balanced-observe-seed42
 mkdir -p "$RUN_DIR"
 
 python examples/embodiment/train_embodied_agent.py \
@@ -496,21 +522,18 @@ python examples/embodiment/train_embodied_agent.py \
 
 ## 9. Next work, in order
 
-1. Pull `dcac37c1` onto `/home/xueyang/RLinf` and run the eval-only unit test.
-2. Run the raw SFT balanced evaluation from Section 6.2.
-3. Run the selected balanced GSE checkpoint evaluation from Section 6.3 using
-   the identical reset states and 512 trials.
-4. Produce a per-task delta table. Decide whether the pilot improves average,
-   tails, or only a subset of already-easy tasks.
-5. Add task-conditioned router/expert utilization. Aggregate selection and
-   probability by MT50 task ID, not only globally.
-6. If task imbalance remains in PPO batches, add task-wise advantage
+1. Add task-conditioned router/expert utilization. Aggregate selection and
+   probability by MT50 task ID using count-weighted sufficient statistics, not
+   unweighted micro-batch means.
+2. Repeat matched SFT and step-10 GSE evaluation with multiple rollout seeds to
+   quantify stochastic-policy and per-task uncertainty.
+3. If task imbalance remains in PPO batches, add task-wise advantage
    normalization or controlled worst-task weighting. Do not add it before
    measuring task frequencies and per-task gradient/advantage scales.
-7. Run matched short pilots for GSE PPO, full-parameter PPO, and parameter-matched
+4. Run matched short pilots for GSE PPO, full-parameter PPO, and parameter-matched
    plain LoRA PPO. Match environment steps, reset states, seeds, and evaluation
    frequency.
-8. Only after these checks, run multi-seed longer training and tune auxiliary
+5. Only after these checks, run multi-seed longer training and tune auxiliary
    losses.
 
 For paper results, report mean, median, worst-5/worst-10, tasks above 90%, negative
@@ -532,6 +555,6 @@ tests if making a generalization claim.
 - Do not terminate unrelated GPU jobs or delete shared Docker/Ray data.
 - Put checkpoints, TensorBoard data, videos, and large logs outside the repository.
 
-The immediate milestone is a paired, fixed-reset SFT-versus-GSE evaluation. Do not
-start a long experiment or enable auxiliary losses until that comparison is
-available.
+The immediate milestone is task-conditioned router observability plus repeated
+matched evaluation. Do not enable auxiliary losses until those measurements show
+whether gains and regressions correspond to useful expert specialization.
