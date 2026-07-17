@@ -163,12 +163,17 @@ class GSEAdapter(nn.Module):
             "selection_fraction": fractions.detach(),
             "mean_probability": mean_probabilities.detach(),
             "entropy": entropy.detach(),
-            "probabilities": probabilities.detach(),
-            "selected_experts": selected_experts.detach(),
             "num_routing_items": torch.tensor(
                 probabilities.shape[0], device=probabilities.device
             ),
         }
+        if self.config.record_routing_assignments:
+            self._router_stats.update(
+                {
+                    "probabilities": probabilities.detach(),
+                    "selected_experts": selected_experts.detach(),
+                }
+            )
 
     def _token_routed_residual(self, inputs: torch.Tensor) -> torch.Tensor:
         flattened = inputs.reshape(-1, self.in_features)

@@ -33,6 +33,7 @@ class GSEConfig:
     orthogonal_gain: float = 1.0
     freeze_base: bool = True
     init_seed: int | None = None
+    record_routing_assignments: bool = False
 
     def __post_init__(self) -> None:
         """Validate model-independent configuration fields."""

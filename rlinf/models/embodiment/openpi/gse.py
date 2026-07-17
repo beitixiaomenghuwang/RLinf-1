@@ -74,6 +74,9 @@ def _build_core_config(config: Mapping[str, Any]) -> GSEConfig:
         for name in _GSE_CONFIG_FIELDS
         if name in config and config[name] is not None
     }
+    values["record_routing_assignments"] = bool(
+        config.get("log_task_router_metrics", False)
+    )
     return GSEConfig(**values)
 
 

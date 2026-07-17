@@ -216,7 +216,7 @@ def test_router_metrics_aggregate_expert_utilization() -> None:
 
 def test_task_router_statistics_preserve_task_counts() -> None:
     model = ToyModel()
-    config = make_config()
+    config = make_config(record_routing_assignments=True)
     inject_gse(
         model,
         config,
