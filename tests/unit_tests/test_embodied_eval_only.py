@@ -31,7 +31,7 @@ class FakeMetricLogger:
         self.records.append((data, step))
 
 
-def test_run_evaluation_syncs_weights_and_skips_training() -> None:
+def test_run_evaluation_skips_weight_sync_and_training() -> None:
     runner = EmbodiedRunner.__new__(EmbodiedRunner)
     runner.cfg = SimpleNamespace(runner={"only_eval": True})
     runner.global_step = 4
@@ -40,6 +40,8 @@ def test_run_evaluation_syncs_weights_and_skips_training() -> None:
     runner.timer = FakeTimer()
     runner.metric_logger = FakeMetricLogger()
     calls = []
+    # In eval-only mode the rollout worker has no weight syncer; syncing from
+    # the actor would crash, so run_evaluation must not attempt it.
     runner.update_rollout_weights = lambda: calls.append("sync")
     runner.evaluate = lambda: {"success_once": 0.5}
     runner.print_metrics_table_async = lambda *args: calls.append("print")
@@ -50,7 +52,7 @@ def test_run_evaluation_syncs_weights_and_skips_training() -> None:
     assert metrics == {"eval/success_once": 0.5}
     assert runner.actor.steps == [4]
     assert runner.rollout.steps == [4]
-    assert calls == ["sync", "print", "finish"]
+    assert calls == ["print", "finish"]
     assert runner.metric_logger.records == [
         ({"eval/success_once": 0.5}, 4),
         ({"time/eval": 1.5}, 4),

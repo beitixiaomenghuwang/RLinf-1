@@ -597,13 +597,16 @@ class EmbodiedRunner:
         self._finish_run()
 
     def run_evaluation(self) -> dict:
-        """Synchronize actor weights and run one evaluation without training."""
+        """Run one evaluation without training.
+
+        In eval-only mode the rollout worker loads weights directly from
+        ``rollout.model.model_path`` and creates no weight syncer, so syncing
+        from the actor is neither needed nor possible.
+        """
         start_time = time.time()
         self.actor.set_global_step(self.global_step)
         self.rollout.set_global_step(self.global_step)
 
-        with self.timer("sync_weights"):
-            self.update_rollout_weights()
         with self.timer("eval"):
             eval_metrics = self.evaluate()
 
