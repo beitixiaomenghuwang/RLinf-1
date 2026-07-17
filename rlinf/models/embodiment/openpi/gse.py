@@ -47,6 +47,8 @@ _INTEGRATION_FIELDS = {
     "load_balancing_loss_coef",
     "orthogonality_loss_coef",
     "log_router_metrics",
+    "log_task_router_metrics",
+    "task_router_num_tasks",
     "log_orthogonality",
 }
 _GSE_CONFIG_FIELDS = {field.name for field in fields(GSEConfig)}

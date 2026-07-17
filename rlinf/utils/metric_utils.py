@@ -526,6 +526,8 @@ def print_metrics_table(
             if category in category_map:
                 categories[category_map[category]][metric_name] = value
             elif category == "train":
+                if metric_name.startswith("gse/task_router/task_"):
+                    continue
                 if metric_name.startswith("actor/"):
                     categories["Training/Actor"][metric_name] = value
                 elif metric_name.startswith("critic/"):

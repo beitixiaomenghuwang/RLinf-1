@@ -36,6 +36,7 @@ def _make_obs(start: int, batch_size: int) -> dict:
         "task_descriptions": [
             f"task-{idx}" for idx in range(start, start + batch_size)
         ],
+        "task_ids": torch.arange(start, start + batch_size, dtype=torch.long),
     }
 
 
@@ -242,6 +243,9 @@ def test_merge_env_outputs_with_partial_optional_fields():
 
     assert merged["obs"]["states"].shape[0] == 5
     assert len(merged["obs"]["task_descriptions"]) == 5
+    torch.testing.assert_close(
+        merged["obs"]["task_ids"], torch.tensor([0, 1, 100, 101, 102])
+    )
     assert merged["rewards"].shape[0] == 5
     assert merged["final_obs"] is not None
     assert torch.equal(merged["final_obs"]["states"][:2], env_output_0["obs"]["states"])

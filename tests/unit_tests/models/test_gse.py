@@ -14,6 +14,8 @@ from rlinf.models.peft.gse import (
     gse_orthogonality_loss,
     gse_router_metrics,
     gse_state_dict,
+    gse_task_router_metrics,
+    gse_task_router_statistics,
     inject_gse,
     joint_lora_a,
     load_gse_state_dict,
@@ -210,6 +212,82 @@ def test_router_metrics_aggregate_expert_utilization() -> None:
     )
     torch.testing.assert_close(expert_selection.sum(), torch.tensor(1.0))
     torch.testing.assert_close(expert_probability.sum(), torch.tensor(1.0))
+
+
+def test_task_router_statistics_preserve_task_counts() -> None:
+    model = ToyModel()
+    config = make_config()
+    inject_gse(
+        model,
+        config,
+        target_modules=("action_expert.0", "action_expert.2"),
+    )
+    model(torch.randn(3, 5, 12))
+
+    statistics = gse_task_router_statistics(
+        model,
+        torch.tensor([0, 1, 1]),
+        num_tasks=3,
+    )
+
+    prefix = "gse/task_router_stats"
+    assert statistics[f"{prefix}/task_00/routing_count"].item() == 2
+    assert statistics[f"{prefix}/task_01/routing_count"].item() == 4
+    assert statistics[f"{prefix}/task_02/routing_count"].item() == 0
+    assert statistics[f"{prefix}/task_00/selection_total"].item() == 4
+    assert statistics[f"{prefix}/task_01/selection_total"].item() == 8
+    num_specialized = config.num_specialized_experts
+    for task_index in (0, 1):
+        probability_sum = sum(
+            statistics[
+                f"{prefix}/task_{task_index:02d}/"
+                f"expert_{expert_index}_probability_sum"
+            ]
+            for expert_index in range(num_specialized)
+        )
+        selection_count = sum(
+            statistics[
+                f"{prefix}/task_{task_index:02d}/"
+                f"expert_{expert_index}_selection_count"
+            ]
+            for expert_index in range(num_specialized)
+        )
+        torch.testing.assert_close(
+            probability_sum,
+            statistics[f"{prefix}/task_{task_index:02d}/routing_count"],
+        )
+        torch.testing.assert_close(
+            selection_count,
+            statistics[f"{prefix}/task_{task_index:02d}/selection_total"],
+        )
+
+
+def test_task_router_metrics_detect_complete_task_specialization() -> None:
+    prefix = "gse/task_router_stats"
+    statistics = {
+        f"{prefix}/task_00/routing_count": 10.0,
+        f"{prefix}/task_00/selection_total": 10.0,
+        f"{prefix}/task_00/expert_0_probability_sum": 10.0,
+        f"{prefix}/task_00/expert_1_probability_sum": 0.0,
+        f"{prefix}/task_00/expert_0_selection_count": 10.0,
+        f"{prefix}/task_00/expert_1_selection_count": 0.0,
+        f"{prefix}/task_01/routing_count": 10.0,
+        f"{prefix}/task_01/selection_total": 10.0,
+        f"{prefix}/task_01/expert_0_probability_sum": 0.0,
+        f"{prefix}/task_01/expert_1_probability_sum": 10.0,
+        f"{prefix}/task_01/expert_0_selection_count": 0.0,
+        f"{prefix}/task_01/expert_1_selection_count": 10.0,
+    }
+
+    metrics = gse_task_router_metrics(statistics, num_tasks=2, num_experts=2)
+
+    assert metrics["gse/task_router/covered_tasks"] == 2
+    assert metrics["gse/task_router/normalized_mutual_information"] == pytest.approx(
+        1.0
+    )
+    assert metrics["gse/task_router/mean_js_divergence"] > 0
+    assert metrics["gse/task_router/task_00/dominant_expert"] == 0
+    assert metrics["gse/task_router/task_01/dominant_expert"] == 1
 
 
 def test_configurable_auxiliary_loss_preserves_zero_coefficient_objective() -> None:

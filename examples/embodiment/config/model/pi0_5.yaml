@@ -40,6 +40,8 @@ gse:
   load_balancing_loss_coef: 0.0
   orthogonality_loss_coef: 0.0
   log_router_metrics: True
+  log_task_router_metrics: False
+  task_router_num_tasks: null
   log_orthogonality: True
   target_modules:
     - "q_proj"

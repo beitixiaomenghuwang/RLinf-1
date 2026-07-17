@@ -1,7 +1,7 @@
 """Auxiliary losses collected from GSE layers."""
 
 import math
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from typing import Literal
 
 import torch
@@ -10,6 +10,7 @@ from torch import nn
 from .injector import iter_gse_layers
 
 Reduction = Literal["mean", "sum"]
+TASK_ROUTER_STATS_PREFIX = "gse/task_router_stats"
 
 
 def _reduce(
@@ -116,6 +117,210 @@ def gse_router_metrics(model: nn.Module) -> dict[str, torch.Tensor]:
             expert_index
         ]
     return {name: value.detach() for name, value in metrics.items()}
+
+
+def gse_task_router_statistics(
+    model: nn.Module,
+    task_ids: torch.Tensor,
+    *,
+    num_tasks: int,
+) -> dict[str, torch.Tensor]:
+    """Collect count-weighted task/router sufficient statistics.
+
+    The returned sums can be added across micro-batches and distributed ranks
+    before ratios are computed, avoiding bias from uneven per-task batch sizes.
+    """
+    if num_tasks <= 0:
+        raise ValueError("num_tasks must be positive")
+    task_ids = task_ids.detach().reshape(-1).to(torch.long)
+    if task_ids.numel() == 0:
+        return {}
+    if torch.any((task_ids < 0) | (task_ids >= num_tasks)):
+        raise ValueError(f"task_ids must be in [0, {num_tasks})")
+
+    layer_stats = [
+        layer.router_stats
+        for _, layer in iter_gse_layers(model)
+        if layer.router_stats
+    ]
+    if not layer_stats:
+        return {}
+    num_experts = int(layer_stats[0]["probabilities"].shape[-1])
+    device = layer_stats[0]["probabilities"].device
+    probability_sums = torch.zeros(num_tasks, num_experts, device=device)
+    selection_counts = torch.zeros(num_tasks, num_experts, device=device)
+    routing_counts = torch.zeros(num_tasks, device=device)
+    selection_totals = torch.zeros(num_tasks, device=device)
+
+    for stats in layer_stats:
+        probabilities = stats["probabilities"].to(device)
+        selected_experts = stats["selected_experts"].to(device)
+        if probabilities.shape[-1] != num_experts:
+            raise ValueError("All GSE layers must use the same expert count")
+        if probabilities.shape[0] % task_ids.numel() != 0:
+            raise ValueError(
+                "Router items must be divisible by the task-id batch size, got "
+                f"{probabilities.shape[0]} and {task_ids.numel()}"
+            )
+        repeats = probabilities.shape[0] // task_ids.numel()
+        expanded_task_ids = task_ids.to(device).repeat_interleave(repeats)
+        probability_sums.index_add_(0, expanded_task_ids, probabilities.float())
+        routing_counts.index_add_(
+            0,
+            expanded_task_ids,
+            torch.ones_like(expanded_task_ids, dtype=torch.float32),
+        )
+        flat_tasks = expanded_task_ids[:, None].expand_as(selected_experts).reshape(-1)
+        flat_experts = selected_experts.reshape(-1)
+        flat_indices = flat_tasks * num_experts + flat_experts
+        selection_counts.view(-1).index_add_(
+            0,
+            flat_indices,
+            torch.ones_like(flat_indices, dtype=torch.float32),
+        )
+        selection_totals.index_add_(
+            0,
+            expanded_task_ids,
+            torch.full_like(
+                expanded_task_ids,
+                selected_experts.shape[-1],
+                dtype=torch.float32,
+            ),
+        )
+
+    statistics: dict[str, torch.Tensor] = {}
+    for task_index in range(num_tasks):
+        statistics[f"{TASK_ROUTER_STATS_PREFIX}/task_{task_index:02d}/routing_count"] = (
+            routing_counts[task_index]
+        )
+        statistics[
+            f"{TASK_ROUTER_STATS_PREFIX}/task_{task_index:02d}/selection_total"
+        ] = selection_totals[task_index]
+        for expert_index in range(num_experts):
+            statistics[
+                f"{TASK_ROUTER_STATS_PREFIX}/task_{task_index:02d}/"
+                f"expert_{expert_index}_probability_sum"
+            ] = probability_sums[task_index, expert_index]
+            statistics[
+                f"{TASK_ROUTER_STATS_PREFIX}/task_{task_index:02d}/"
+                f"expert_{expert_index}_selection_count"
+            ] = selection_counts[task_index, expert_index]
+    return {name: value.detach() for name, value in statistics.items()}
+
+
+def gse_task_router_metrics(
+    statistics: Mapping[str, float],
+    *,
+    num_tasks: int,
+    num_experts: int,
+) -> dict[str, float]:
+    """Convert globally summed task/router statistics into diagnostics."""
+    task_probabilities = []
+    task_selections = []
+    task_weights = []
+    metrics: dict[str, float] = {}
+    for task_index in range(num_tasks):
+        prefix = f"{TASK_ROUTER_STATS_PREFIX}/task_{task_index:02d}"
+        routing_count = float(statistics.get(f"{prefix}/routing_count", 0.0))
+        selection_total = float(statistics.get(f"{prefix}/selection_total", 0.0))
+        if routing_count <= 0 or selection_total <= 0:
+            continue
+        probabilities = torch.tensor(
+            [
+                float(
+                    statistics.get(
+                        f"{prefix}/expert_{expert_index}_probability_sum", 0.0
+                    )
+                )
+                / routing_count
+                for expert_index in range(num_experts)
+            ],
+            dtype=torch.float64,
+        )
+        selections = torch.tensor(
+            [
+                float(
+                    statistics.get(
+                        f"{prefix}/expert_{expert_index}_selection_count", 0.0
+                    )
+                )
+                / selection_total
+                for expert_index in range(num_experts)
+            ],
+            dtype=torch.float64,
+        )
+        task_probabilities.append(probabilities)
+        task_selections.append(selections)
+        task_weights.append(routing_count)
+        metrics[f"gse/task_router/task_{task_index:02d}/routing_items"] = routing_count
+        metrics[f"gse/task_router/task_{task_index:02d}/dominant_expert"] = float(
+            selections.argmax().item()
+        )
+        for expert_index in range(num_experts):
+            metrics[
+                f"gse/task_router/task_{task_index:02d}/"
+                f"expert_{expert_index}_selection"
+            ] = float(selections[expert_index])
+            metrics[
+                f"gse/task_router/task_{task_index:02d}/"
+                f"expert_{expert_index}_probability"
+            ] = float(probabilities[expert_index])
+
+    if not task_probabilities:
+        return {}
+    probability_matrix = torch.stack(task_probabilities)
+    selection_matrix = torch.stack(task_selections)
+    weights = torch.tensor(task_weights, dtype=torch.float64)
+    weights = weights / weights.sum()
+    global_selection = torch.sum(selection_matrix * weights[:, None], dim=0)
+    eps = torch.finfo(torch.float64).eps
+    mutual_information = torch.sum(
+        weights[:, None]
+        * selection_matrix
+        * (
+            selection_matrix.clamp_min(eps).log()
+            - global_selection.clamp_min(eps).log()[None]
+        )
+    )
+    mean_distribution = 0.5 * (
+        selection_matrix + global_selection.unsqueeze(0)
+    )
+    js_divergence = 0.5 * torch.sum(
+        selection_matrix
+        * (
+            selection_matrix.clamp_min(eps).log()
+            - mean_distribution.clamp_min(eps).log()
+        ),
+        dim=1,
+    ) + 0.5 * torch.sum(
+        global_selection.unsqueeze(0)
+        * (
+            global_selection.clamp_min(eps).log()
+            - mean_distribution.clamp_min(eps).log()
+        ),
+        dim=1,
+    )
+    normalized_mi = (
+        mutual_information / math.log(num_experts)
+        if num_experts > 1
+        else mutual_information.new_zeros(())
+    )
+    metrics.update(
+        {
+            "gse/task_router/covered_tasks": float(len(task_probabilities)),
+            "gse/task_router/normalized_mutual_information": float(normalized_mi),
+            "gse/task_router/mean_js_divergence": float(
+                torch.sum(js_divergence * weights)
+            ),
+            "gse/task_router/mean_probability_std_across_tasks": float(
+                probability_matrix.std(dim=0, unbiased=False).mean()
+            ),
+            "gse/task_router/mean_selection_std_across_tasks": float(
+                selection_matrix.std(dim=0, unbiased=False).mean()
+            ),
+        }
+    )
+    return metrics
 
 
 def gse_auxiliary_loss(

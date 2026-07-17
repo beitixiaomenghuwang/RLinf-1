@@ -14,6 +14,8 @@ from .losses import (
     gse_load_balancing_loss,
     gse_orthogonality_loss,
     gse_router_metrics,
+    gse_task_router_metrics,
+    gse_task_router_statistics,
     reset_gse_auxiliary_state,
 )
 from .state import gse_state_dict, load_gse_state_dict
@@ -28,6 +30,8 @@ __all__ = [
     "gse_load_balancing_loss",
     "gse_orthogonality_loss",
     "gse_router_metrics",
+    "gse_task_router_metrics",
+    "gse_task_router_statistics",
     "gse_state_dict",
     "inject_gse",
     "iter_gse_layers",

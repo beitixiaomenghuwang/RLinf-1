@@ -44,6 +44,8 @@ from rlinf.models import get_model
 from rlinf.models.embodiment.base_policy import ForwardType
 from rlinf.models.peft.gse import (
     gse_auxiliary_loss,
+    gse_task_router_metrics,
+    gse_task_router_statistics,
     reset_gse_auxiliary_state,
 )
 from rlinf.scheduler import Channel, Cluster, Worker
@@ -1385,6 +1387,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             f"{rollout_size} is not divisible by {batch_size_per_rank}"
         )
         metrics = {}
+        task_router_statistics: dict[str, float] = {}
         update_epoch = self.cfg.algorithm.get("update_epoch", 1)
         for _ in range(update_epoch):
             rollout_dataloader_iter = split_dict_to_chunk(
@@ -1414,6 +1417,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         micro_batch=batch,
                         metrics=metrics,
                         is_last=(idx + 1) == self.gradient_accumulation,
+                        task_router_statistics=task_router_statistics,
                     )
                     # avoid gpu memory leak
                     train_micro_batch[idx] = None
@@ -1437,6 +1441,18 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         mean_metric_dict = all_reduce_dict(
             mean_metric_dict, op=torch.distributed.ReduceOp.AVG
         )
+        if task_router_statistics:
+            reduced_statistics = all_reduce_dict(
+                task_router_statistics, op=torch.distributed.ReduceOp.SUM
+            )
+            mean_metric_dict.update(
+                gse_task_router_metrics(
+                    reduced_statistics,
+                    num_tasks=int(self.gse_cfg.get("task_router_num_tasks")),
+                    num_experts=int(self.gse_cfg.get("num_experts", 8))
+                    - int(self.gse_cfg.get("num_generalized_experts", 2)),
+                )
+            )
 
         return mean_metric_dict
 
@@ -1446,6 +1462,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         metrics: dict[str, list[float]],
         *,
         is_last: bool,
+        task_router_statistics: dict[str, float] | None = None,
     ) -> None:
         micro_batch = put_tensor_device(micro_batch, self.device)
         backward_ctx = self.before_micro_batch(self.model, is_last_micro_batch=is_last)
@@ -1456,6 +1473,9 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         loss_mask = micro_batch.get("loss_mask", None)
         loss_mask_sum = micro_batch.get("loss_mask_sum", None)
         forward_inputs = micro_batch.get("forward_inputs", None)
+        task_ids = None
+        if isinstance(forward_inputs, dict):
+            task_ids = forward_inputs.pop("task_ids", None)
 
         kwargs = {}
         if SupportedModel(self.cfg.actor.model.model_type) in [
@@ -1562,6 +1582,26 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             loss += auxiliary_loss
             if bool(self.gse_cfg.get("log_router_metrics", True)):
                 metrics_data.update(scalar_metrics_to_python(gse_metrics))
+            if (
+                bool(self.gse_cfg.get("log_task_router_metrics", False))
+                and task_router_statistics is not None
+                and isinstance(task_ids, torch.Tensor)
+            ):
+                num_tasks = self.gse_cfg.get("task_router_num_tasks")
+                if num_tasks is None:
+                    raise ValueError(
+                        "actor.model.gse.task_router_num_tasks is required when "
+                        "task-conditioned router metrics are enabled"
+                    )
+                micro_statistics = gse_task_router_statistics(
+                    self.model,
+                    task_ids,
+                    num_tasks=int(num_tasks),
+                )
+                for name, value in micro_statistics.items():
+                    task_router_statistics[name] = task_router_statistics.get(
+                        name, 0.0
+                    ) + float(value.item())
 
         loss /= self.gradient_accumulation
         with backward_ctx:

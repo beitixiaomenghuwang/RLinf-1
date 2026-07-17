@@ -163,6 +163,8 @@ class GSEAdapter(nn.Module):
             "selection_fraction": fractions.detach(),
             "mean_probability": mean_probabilities.detach(),
             "entropy": entropy.detach(),
+            "probabilities": probabilities.detach(),
+            "selected_experts": selected_experts.detach(),
             "num_routing_items": torch.tensor(
                 probabilities.shape[0], device=probabilities.device
             ),

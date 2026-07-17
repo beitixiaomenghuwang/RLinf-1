@@ -181,6 +181,8 @@ def test_openpi_gse_accepts_ppo_auxiliary_configuration() -> None:
             load_balancing_loss_coef=0.01,
             orthogonality_loss_coef=0.1,
             log_router_metrics=True,
+            log_task_router_metrics=True,
+            task_router_num_tasks=50,
             log_orthogonality=True,
         ),
     )

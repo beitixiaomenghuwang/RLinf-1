@@ -901,6 +901,9 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         }
         if forward_action is not None:
             forward_inputs["action"] = forward_action
+        task_ids = env_obs.get("task_ids")
+        if isinstance(task_ids, torch.Tensor):
+            forward_inputs["task_ids"] = task_ids.detach().clone()
 
         if self.config.is_nft:
             nft_outputs = {

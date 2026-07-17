@@ -297,6 +297,7 @@ class MetaWorldEnv(gym.Env):
             "main_images": full_image_tensor,
             "states": states,
             "task_descriptions": self.task_descriptions,
+            "task_ids": torch.as_tensor(self.task_ids.copy(), dtype=torch.long),
         }
         return obs
 
