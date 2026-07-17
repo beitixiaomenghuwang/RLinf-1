@@ -662,12 +662,12 @@ not compose `pi05_micro256` and do not add another throughput YAML profile.
 
 A 320-step run collects 81,920 trajectories, approximately 8.19 million
 environment steps, and performs 6,400 optimizer updates. At the measured steady
-step time, plus eighteen 512-trajectory evaluations, it should fit in roughly
+step time, plus sixteen 512-trajectory evaluations, it should fit in roughly
 19-23 hours. The cosine scheduler advances per optimizer update, not per global
 step, so every launch and resume must retain
 `actor.optim.total_training_steps=6400`.
 
-### 9.2 Stage 1: train to step 40
+### 9.2 Formal training command
 
 Use command-line overrides for all run-specific values:
 
@@ -689,47 +689,7 @@ python examples/embodiment/train_embodied_agent.py \
   runner.resume_dir=null \
   runner.logger.log_path="$RUN_DIR" \
   runner.logger.experiment_name="$EXP_NAME" \
-  runner.max_epochs=40 \
-  runner.save_interval=20 \
-  runner.val_check_interval=10 \
-  runner.max_checkpoints_to_keep=4 \
-  env.eval.total_num_envs=512 \
-  env.eval.use_fixed_reset_state_ids=True \
-  env.eval.is_eval=True \
-  actor.optim.lr=5e-5 \
-  actor.optim.total_training_steps=6400 \
-  actor.seed=42 \
-  rollout.seed=42 \
-  2>&1 | tee "$RUN_DIR/console-stage1.log"
-```
-
-This evaluates at steps 10, 20, 30, and 40, and saves at steps 20 and 40. Proceed
-to Stage 2 only when step 40 has no hard failure signal from Section 9.5. A
-temporarily flat success curve is not sufficient reason to stop because
-sparse-reward MT50 evaluations are noisy.
-
-### 9.3 Stage 2 and Stage 3 resume
-
-Resume to step 120 from the step-40 checkpoint:
-
-```bash
-export CKPT="$RUN_DIR/$EXP_NAME/checkpoints/global_step_40"
-test -d "$CKPT/actor"
-
-python examples/embodiment/train_embodied_agent.py \
-  --config-path /workspace/RLinf/examples/embodiment/config \
-  --config-name metaworld_50_ppo_openpi_pi05_gse \
-  env.train.total_num_envs=128 \
-  env.train.rollout_epoch=2 \
-  rollout.pipeline_stage_num=1 \
-  actor.micro_batch_size=128 \
-  actor.global_batch_size=1024 \
-  actor.model.model_path=/workspace/models/RLinf-Pi05-MetaWorld-SFT \
-  rollout.model.model_path=/workspace/models/RLinf-Pi05-MetaWorld-SFT \
-  runner.resume_dir="$CKPT" \
-  runner.logger.log_path="$RUN_DIR" \
-  runner.logger.experiment_name="$EXP_NAME" \
-  runner.max_epochs=120 \
+  runner.max_epochs=320 \
   runner.save_interval=20 \
   runner.val_check_interval=20 \
   runner.max_checkpoints_to_keep=4 \
@@ -740,22 +700,30 @@ python examples/embodiment/train_embodied_agent.py \
   actor.optim.total_training_steps=6400 \
   actor.seed=42 \
   rollout.seed=42 \
-  2>&1 | tee "$RUN_DIR/console-stage2.log"
+  2>&1 | tee "$RUN_DIR/console.log"
 ```
 
-If the step-120 checkpoint remains healthy, run the same command to step 320 by
-changing only:
+This runs directly to step 320 and evaluates and saves every 20 steps. A
+temporarily flat success curve is not sufficient reason to stop because
+sparse-reward MT50 evaluations are noisy. Stop only on a hard failure signal from
+Section 9.5 or when the one-day compute budget is exhausted.
+
+### 9.3 Resume after interruption
+
+Checkpoint resume restores model, optimizer, and LR scheduler. If the process is
+interrupted, point `CKPT` to the latest complete checkpoint and rerun the formal
+command with only `runner.resume_dir` changed:
 
 ```bash
-export CKPT="$RUN_DIR/$EXP_NAME/checkpoints/global_step_120"
-# In the Stage 2 command, use runner.resume_dir="$CKPT", runner.max_epochs=320,
-# and tee "$RUN_DIR/console-stage3.log". Keep every other override unchanged.
+export CKPT="$RUN_DIR/$EXP_NAME/checkpoints/global_step_100"
+test -d "$CKPT/actor"
+# Replace runner.resume_dir=null with runner.resume_dir="$CKPT" in Section 9.2
+# and append output with: 2>&1 | tee -a "$RUN_DIR/console.log"
 ```
 
-Checkpoint resume restores model, optimizer, and LR scheduler. Do not change
-`total_training_steps`, GSE architecture, optimizer, batch sizes, or seed between
-stages. With four retained checkpoints, archive any checkpoint selected as a
-candidate before later saves prune it.
+Do not change `total_training_steps`, GSE architecture, optimizer, batch sizes,
+or seed when resuming. With four retained checkpoints, archive any checkpoint
+selected as a candidate before later saves prune it.
 
 ### 9.4 Live monitoring
 
@@ -908,7 +876,7 @@ tests if making a generalization claim.
 - Do not terminate unrelated GPU jobs or delete shared Docker/Ray data.
 - Put checkpoints, TensorBoard data, videos, and large logs outside the repository.
 
-The immediate milestone is Stage 1 of the formal batch16 run, followed by the
-step-40 convergence review. Do not enable auxiliary losses until the baseline
-run and matched evaluations show whether gains and regressions correspond to
-useful expert specialization.
+The immediate milestone is the uninterrupted formal batch16 run with evaluation
+and checkpointing every 20 steps. Do not enable auxiliary losses until the
+baseline run and matched evaluations show whether gains and regressions
+correspond to useful expert specialization.
