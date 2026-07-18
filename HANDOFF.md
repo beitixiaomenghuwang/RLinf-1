@@ -811,6 +811,52 @@ command in Section 6.3, set `rollout.model.model_path` to
 each seed. Aggregate the resulting `metrics.jsonl` files with the multi-seed
 summary tool in Section 9.6.
 
+The following command runs all three evaluations sequentially inside the active
+OpenPI Docker shell. It keeps the actor on the original SFT path, because
+eval-only rollout workers load the candidate checkpoint directly:
+
+```bash
+export BEST_CKPT=/workspace/output/gse-formal-seed42/gse_formal_seed42/checkpoints/global_step_180
+test -f "$BEST_CKPT/actor/model_state_dict/full_weights.pt"
+export EVAL_ROOT=/workspace/output/gse-step180-multiseed
+mkdir -p "$EVAL_ROOT"
+
+for SEED in 42 43 44; do
+  export SEED
+  export RUN_DIR="$EVAL_ROOT/seed-$SEED"
+  mkdir -p "$RUN_DIR"
+  python examples/embodiment/train_embodied_agent.py \
+    --config-path /workspace/RLinf/examples/embodiment/config \
+    --config-name metaworld_50_ppo_openpi_pi05_gse \
+    '+model@rollout.model=pi0_5' \
+    actor.model.model_path=/workspace/models/RLinf-Pi05-MetaWorld-SFT \
+    rollout.model.model_path="$BEST_CKPT/actor" \
+    rollout.model.num_action_chunks=5 \
+    rollout.model.action_dim=4 \
+    rollout.model.openpi.config_name=pi05_metaworld \
+    rollout.model.openpi.num_images_in_input=1 \
+    rollout.model.gse.enabled=True \
+    rollout.model.gse.total_rank=64 \
+    rollout.model.gse.num_experts=8 \
+    rollout.model.gse.num_generalized_experts=2 \
+    rollout.model.gse.top_k=2 \
+    '+rollout.model.openpi_data.norm_stats_path=/workspace/models/RLinf-Pi05-MetaWorld-SFT/lerobot/metaworld_mt50/norm_stats.json' \
+    rollout.seed="$SEED" \
+    runner.only_eval=True \
+    runner.resume_dir=null \
+    runner.logger.log_path="$RUN_DIR" \
+    runner.logger.experiment_name="gse_step180_seed_$SEED" \
+    env.eval.total_num_envs=512 \
+    env.eval.use_fixed_reset_state_ids=True \
+    env.eval.is_eval=True \
+    2>&1 | tee "$RUN_DIR/console.log"
+done
+
+python -m toolkits.embodiment.summarize_multiseed_eval \
+  "$EVAL_ROOT"/seed-*/metrics.jsonl \
+  --output "$EVAL_ROOT/summary.json"
+```
+
 Training records use a zero-based loop index, hence the `+1` above; standalone
 eval-only records do not need this conversion.
 
@@ -869,26 +915,53 @@ intervals, per-task mean deltas, and improved/regressed/unchanged task counts.
 
 ### 9.7 Improvements after the baseline
 
-Continue the unchanged 320-step configuration first. The current candidate is
+The current candidate is
 `$RUN_DIR/$EXP_NAME/checkpoints/global_step_180`; do not overwrite or delete it.
-Then test one change at a time:
+First complete the three-seed evaluation above. Then test one model change at a
+time, keeping step-180 GSE as the reference:
 
-1. Add task-wise advantage normalization because global normalization can let
-   easy/high-variance tasks dominate multi-task PPO gradients.
-2. Use adaptive task sampling or capped tail-task weighting based on a smoothed
-   per-task success estimate; cap weights to avoid overfitting zero-success tasks.
-3. Add a small SFT behavior-cloning anchor or reference-policy KL only if long-run
-   evaluation shows forgetting. Both cost compute/memory and are not justified by
-   the current positive transfer result.
-4. Tune router temperature/top-k or a very small load-balance coefficient only
-   after NMI/JS plus per-task deltas show collapse or harmful specialization.
-   Orthogonality is already near zero and does not currently need a penalty.
+1. Add task-wise advantage normalization or capped tail-task weighting to address
+   task imbalance; first log per-task counts and advantage scales.
+2. Compare action-expert GSE against a parameter-matched plain LoRA and a
+   no-router multi-expert residual. This isolates the value of orthogonality and
+   routing before changing the VLM.
+3. Add a small SFT behavior-cloning anchor or reference-policy KL only if the
+   multi-seed result shows forgetting. Do not add it preemptively.
+4. Tune router temperature/top-k or a small load-balance coefficient only after
+   NMI/JS plus per-task deltas show collapse or harmful specialization.
 5. Compare GSE against full-parameter PPO and parameter-matched LoRA PPO using
    identical trajectories, seeds, reset states, optimizer updates, and evaluation.
 6. After selecting the objective, run at least three training seeds and held-out
    visual/state perturbations before claiming improved generalization.
 
-### 9.8 Current method summary
+### 9.8 When to decompose the VLM
+
+Do not add VLM GSE in the current step-180 reproduction. Add it only after all
+conditions below hold:
+
+- step-180 action-expert GSE beats SFT in the three-seed fixed-reset evaluation;
+- the action-expert GSE advantage survives a matched plain-LoRA and no-router
+  ablation;
+- task success is not improving only because of one or two outlier tasks, and
+  worst-10/zero-success-task counts are stable or better;
+- action-expert-only RL has plateaued, with finite KL/gradients and no critic
+  collapse, so there is evidence the remaining error is visual/language
+  representation rather than action decoding.
+
+When those conditions hold, use a separate VLM-GSE experiment initialized with
+zero-output B and orthogonal A, while keeping the action-expert GSE frozen for
+the first ablation. Start with the final VLM block or a small set of
+language-to-action projection layers, not the full VLM. Use a rank 8-16 adapter,
+two to four experts, and a small learning rate (roughly 0.1-0.25 times the
+action-expert GSE LR). Compare three settings: action-only, VLM-only, and
+joint-with-separate-LR. Only expand to more VLM layers if VLM-only improves
+macro and worst-10 without degrading action-only performance.
+
+This ordering preserves the causal story: action GSE adapts the controller;
+VLM GSE is a later representation-adaptation ablation justified by residual
+task failures, not a simultaneous source of unexplained gains.
+
+### 9.9 Current method summary
 
 The current policy starts from the fully trained Pi0.5 MetaWorld MT50 SFT
 checkpoint. The VLM and original action-expert parameters stay frozen. GSE wraps
