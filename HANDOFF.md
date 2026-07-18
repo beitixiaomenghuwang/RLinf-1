@@ -380,6 +380,38 @@ and actor time degraded; the larger actor micro batch did not improve kernel
 throughput. The formal run therefore returns to the validated batch16 settings
 using command-line overrides. Do not add more throughput YAML profiles.
 
+### 5.7 Formal run through step 220
+
+The first eleven fixed-reset evaluations of the formal batch16 run are:
+
+| Checkpoint | `success_once` | Macro mean | Worst-10 | Tasks >=90% |
+|-----------:|---------------:|-----------:|---------:|------------:|
+| 20  | 65.63% | 65.36% | 9.64%  | 20 |
+| 40  | 66.99% | 66.95% | 12.64% | 21 |
+| 60  | 70.90% | 70.78% | 9.73%  | 24 |
+| 80  | 68.16% | 68.13% | 15.82% | 18 |
+| 100 | 67.58% | 67.55% | 9.64%  | 20 |
+| 120 | 69.14% | 69.09% | 10.45% | 22 |
+| 140 | 69.73% | 69.62% | 12.64% | 18 |
+| 160 | 67.58% | 67.67% | 9.64%  | 20 |
+| 180 | **73.05%** | **73.13%** | **18.18%** | 21 |
+| 200 | 67.58% | 67.51% | 13.82% | 19 |
+| 220 | 68.95% | 68.82% | 12.55% | 19 |
+
+The step-180 checkpoint is currently the best observed checkpoint. It exceeds
+the reported official Flow-SDE `70.7%` by `2.35 pp` on `success_once` and by
+`2.43 pp` on task macro mean. This is a promising provisional result, not yet a
+strict comparison: both methods must use the same success field, 512-trajectory
+count, task reset pool, checkpoint selection rule, and rollout seed protocol.
+The step-200 regression also shows that one evaluation is too noisy to support a
+final claim. Keep `global_step_180` as the candidate and continue the unchanged
+run to step 320 unless a hard failure rule triggers.
+
+The router remains non-collapsed but effectively task-agnostic: at step 180,
+normalized entropy is `0.954`, task-router NMI is `5.63e-4`, and JS divergence is
+`2.53e-4`. Do not claim that the current gain comes from task specialization;
+the current evidence supports a shared residual improvement across tasks.
+
 ## 6. Eval-only behavior and reproducible evaluation
 
 ### 6.1 Critical loading rule
@@ -764,6 +796,21 @@ for line in path.open():
 PY
 ```
 
+For the current run, preserve the best checkpoint before checkpoint retention
+prunes it:
+
+```bash
+export BEST_CKPT=/workspace/output/gse-formal-seed42/gse_formal_seed42/checkpoints/global_step_180
+cp -a "$BEST_CKPT" /workspace/output/gse-formal-seed42/best_global_step_180
+```
+
+Run fixed-reset evaluation on this checkpoint with three rollout seeds (`42`,
+`43`, `44`) before comparing it with the official 70.7% result. Use the eval-only
+command in Section 6.3, set `rollout.model.model_path` to
+`$BEST_CKPT/actor`, and set `rollout.seed=$SEED`; use a separate `RUN_DIR` for
+each seed. Aggregate the resulting `metrics.jsonl` files with the multi-seed
+summary tool in Section 9.6.
+
 Training records use a zero-based loop index, hence the `+1` above; standalone
 eval-only records do not need this conversion.
 
@@ -822,7 +869,9 @@ intervals, per-task mean deltas, and improved/regressed/unchanged task counts.
 
 ### 9.7 Improvements after the baseline
 
-Run the 320-step configuration unchanged first. Then test one change at a time:
+Continue the unchanged 320-step configuration first. The current candidate is
+`$RUN_DIR/$EXP_NAME/checkpoints/global_step_180`; do not overwrite or delete it.
+Then test one change at a time:
 
 1. Add task-wise advantage normalization because global normalization can let
    easy/high-variance tasks dominate multi-task PPO gradients.
