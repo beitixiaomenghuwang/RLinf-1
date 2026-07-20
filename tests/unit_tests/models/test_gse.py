@@ -214,6 +214,47 @@ def test_router_metrics_aggregate_expert_utilization() -> None:
     torch.testing.assert_close(expert_probability.sum(), torch.tensor(1.0))
 
 
+def test_router_metrics_separate_incompatible_adapter_domains() -> None:
+    model = ToyModel()
+    inject_gse(
+        model.action_expert,
+        make_config(record_routing_assignments=True),
+        target_modules=("0",),
+    )
+    inject_gse(
+        model.vlm,
+        make_config(
+            total_rank=4,
+            num_experts=2,
+            num_generalized_experts=1,
+            top_k=1,
+            normalize_topk=False,
+        ),
+        target_modules=("0",),
+    )
+    model.action_expert[0].gse_domain = "action"
+    model.vlm[0].gse_domain = "vlm"
+    inputs = torch.randn(3, 5, 12)
+    model.action_expert[0](inputs)
+    model.vlm[0](inputs)
+
+    metrics = gse_router_metrics(model)
+
+    assert metrics["gse/router/active_layers"].item() == 1
+    assert metrics["gse/action_router/active_layers"].item() == 1
+    assert metrics["gse/vlm_router/active_layers"].item() == 1
+    assert "gse/vlm_router/expert_0_probability" in metrics
+    assert "gse/vlm_router/expert_1_probability" not in metrics
+
+    statistics = gse_task_router_statistics(
+        model,
+        torch.tensor([0, 1, 1]),
+        num_tasks=3,
+        domain="action",
+    )
+    assert statistics["gse/task_router_stats/task_00/routing_count"].item() == 1
+
+
 def test_task_router_statistics_preserve_task_counts() -> None:
     model = ToyModel()
     config = make_config(record_routing_assignments=True)

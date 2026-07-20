@@ -52,17 +52,10 @@ def gse_orthogonality_loss(
     )
 
 
-def gse_router_metrics(model: nn.Module) -> dict[str, torch.Tensor]:
-    """Aggregate detached router diagnostics across active GSE layers.
-
-    Layer statistics are weighted by their number of routing items so this also
-    behaves sensibly when sequence lengths or batch sizes differ across layers.
-    """
-    layer_stats = [
-        layer.router_stats
-        for _, layer in iter_gse_layers(model)
-        if layer.router_stats
-    ]
+def _aggregate_router_metrics(
+    layer_stats: list[dict[str, torch.Tensor]], metric_prefix: str
+) -> dict[str, torch.Tensor]:
+    """Aggregate compatible router statistics under one metric prefix."""
     if not layer_stats:
         return {}
 
@@ -99,24 +92,54 @@ def gse_router_metrics(model: nn.Module) -> dict[str, torch.Tensor]:
     )
 
     metrics = {
-        "gse/router/active_layers": reference.new_tensor(float(len(layer_stats))),
-        "gse/router/entropy": mean_entropy,
-        "gse/router/normalized_entropy": normalized_entropy,
-        "gse/router/selection_min": mean_selection.min(),
-        "gse/router/selection_max": mean_selection.max(),
-        "gse/router/selection_std": mean_selection.std(unbiased=False),
-        "gse/router/probability_min": mean_probability.min(),
-        "gse/router/probability_max": mean_probability.max(),
-        "gse/router/probability_std": mean_probability.std(unbiased=False),
+        f"{metric_prefix}/active_layers": reference.new_tensor(
+            float(len(layer_stats))
+        ),
+        f"{metric_prefix}/entropy": mean_entropy,
+        f"{metric_prefix}/normalized_entropy": normalized_entropy,
+        f"{metric_prefix}/selection_min": mean_selection.min(),
+        f"{metric_prefix}/selection_max": mean_selection.max(),
+        f"{metric_prefix}/selection_std": mean_selection.std(unbiased=False),
+        f"{metric_prefix}/probability_min": mean_probability.min(),
+        f"{metric_prefix}/probability_max": mean_probability.max(),
+        f"{metric_prefix}/probability_std": mean_probability.std(unbiased=False),
     }
     for expert_index in range(num_experts):
-        metrics[f"gse/router/expert_{expert_index}_selection"] = mean_selection[
+        metrics[f"{metric_prefix}/expert_{expert_index}_selection"] = mean_selection[
             expert_index
         ]
-        metrics[f"gse/router/expert_{expert_index}_probability"] = mean_probability[
+        metrics[f"{metric_prefix}/expert_{expert_index}_probability"] = mean_probability[
             expert_index
         ]
     return {name: value.detach() for name, value in metrics.items()}
+
+
+def gse_router_metrics(model: nn.Module) -> dict[str, torch.Tensor]:
+    """Aggregate detached router diagnostics, separating adapter domains."""
+    layers_by_domain: dict[str, list[dict[str, torch.Tensor]]] = {}
+    for _, layer in iter_gse_layers(model):
+        if not layer.router_stats:
+            continue
+        domain = str(getattr(layer, "gse_domain", "default"))
+        layers_by_domain.setdefault(domain, []).append(layer.router_stats)
+    if not layers_by_domain:
+        return {}
+
+    metrics: dict[str, torch.Tensor] = {}
+    if "action" in layers_by_domain:
+        metrics.update(
+            _aggregate_router_metrics(layers_by_domain["action"], "gse/router")
+        )
+    elif len(layers_by_domain) == 1:
+        metrics.update(
+            _aggregate_router_metrics(next(iter(layers_by_domain.values())), "gse/router")
+        )
+    for domain, layer_stats in layers_by_domain.items():
+        if len(layers_by_domain) > 1:
+            metrics.update(
+                _aggregate_router_metrics(layer_stats, f"gse/{domain}_router")
+            )
+    return metrics
 
 
 def gse_task_router_statistics(
@@ -124,6 +147,7 @@ def gse_task_router_statistics(
     task_ids: torch.Tensor,
     *,
     num_tasks: int,
+    domain: str | None = None,
 ) -> dict[str, torch.Tensor]:
     """Collect count-weighted task/router sufficient statistics.
 
@@ -142,6 +166,8 @@ def gse_task_router_statistics(
         layer.router_stats
         for _, layer in iter_gse_layers(model)
         if layer.router_stats
+        and "probabilities" in layer.router_stats
+        and (domain is None or getattr(layer, "gse_domain", None) == domain)
     ]
     if not layer_stats:
         return {}

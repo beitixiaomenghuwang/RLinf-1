@@ -25,6 +25,7 @@ from rlinf.models.peft.gse import (
     GSEConfig,
     GSEInjectionReport,
     inject_gse,
+    iter_gse_layers,
     mark_only_gse_as_trainable,
 )
 
@@ -37,11 +38,14 @@ DEFAULT_ACTION_EXPERT_TARGETS = (
     "up_proj",
     "down_proj",
 )
+DEFAULT_VLM_TARGETS = DEFAULT_ACTION_EXPERT_TARGETS
 
 _INTEGRATION_FIELDS = {
     "enabled",
+    "layer_indices",
     "target_modules",
     "exclude_modules",
+    "train_action_adapters",
     "train_value_head",
     "require_pi05",
     "load_balancing_loss_coef",
@@ -50,6 +54,7 @@ _INTEGRATION_FIELDS = {
     "log_task_router_metrics",
     "task_router_num_tasks",
     "log_orthogonality",
+    "vlm",
 }
 _GSE_CONFIG_FIELDS = {field.name for field in fields(GSEConfig)}
 
@@ -63,6 +68,15 @@ def state_dict_contains_gse(state_dict: Mapping[str, Any]) -> bool:
     """Identify a full checkpoint saved after GSE injection."""
     markers = (".generalized_experts.", ".specialized_experts.")
     return any(any(marker in name for marker in markers) for name in state_dict)
+
+
+def state_dict_contains_vlm_gse(state_dict: Mapping[str, Any]) -> bool:
+    """Return whether a checkpoint contains GSE adapters in the VLM tower."""
+    return any(
+        ".paligemma." in name
+        and (".generalized_experts." in name or ".specialized_experts." in name)
+        for name in state_dict
+    )
 
 
 def _build_core_config(config: Mapping[str, Any]) -> GSEConfig:
@@ -90,11 +104,125 @@ def get_action_expert_transformer(model: nn.Module) -> nn.Module:
         ) from error
 
 
+def get_vlm_transformer(model: nn.Module) -> nn.Module:
+    """Return the Gemma language transformer inside the PaliGemma VLM."""
+    try:
+        return model.paligemma_with_expert.paligemma.language_model
+    except AttributeError as error:
+        raise ValueError(
+            "OpenPI VLM GSE requires "
+            "model.paligemma_with_expert.paligemma.language_model"
+        ) from error
+
+
+def _tag_gse_domain(model: nn.Module, domain: str) -> None:
+    for _, layer in iter_gse_layers(model):
+        layer.gse_domain = domain
+
+
+def _resolve_layer_indices(transformer: nn.Module, configured: Any) -> tuple[int, ...]:
+    try:
+        num_layers = len(transformer.layers)
+    except (AttributeError, TypeError) as error:
+        raise ValueError("OpenPI VLM transformer must expose a layers sequence") from error
+    raw_indices = (-1,) if configured is None else configured
+    if isinstance(raw_indices, int):
+        raw_indices = (raw_indices,)
+    normalized = []
+    for raw_index in raw_indices:
+        index = int(raw_index)
+        if index < 0:
+            index += num_layers
+        if not 0 <= index < num_layers:
+            raise ValueError(
+                f"VLM GSE layer index {raw_index} is outside [0, {num_layers})"
+            )
+        if index not in normalized:
+            normalized.append(index)
+    if not normalized:
+        raise ValueError("VLM GSE layer_indices must not be empty")
+    return tuple(normalized)
+
+
+def _inject_vlm_layers(
+    transformer: nn.Module,
+    core_config: GSEConfig,
+    layer_indices: tuple[int, ...],
+    targets: tuple[str, ...],
+    exclusions: tuple[str, ...],
+) -> GSEInjectionReport:
+    names: tuple[str, ...] = ()
+    adapter_parameters = 0
+    for position, layer_index in enumerate(layer_indices):
+        layer_config = core_config
+        if core_config.init_seed is not None:
+            layer_config = replace(
+                core_config,
+                init_seed=core_config.init_seed + 10_000 * position,
+            )
+        layer_report = inject_gse(
+            transformer.layers[layer_index],
+            layer_config,
+            targets,
+            exclude_modules=exclusions,
+            strict=True,
+        )
+        names += tuple(
+            f"layers.{layer_index}.{name}"
+            for name in layer_report.injected_module_names
+        )
+        adapter_parameters += layer_report.adapter_parameters
+    return GSEInjectionReport(
+        injected_module_names=names,
+        adapter_parameters=adapter_parameters,
+        trainable_parameters=0,
+    )
+
+
+def _merge_reports(
+    action_report: GSEInjectionReport,
+    vlm_report: GSEInjectionReport | None,
+) -> GSEInjectionReport:
+    names = tuple(
+        f"action_expert.{name}" for name in action_report.injected_module_names
+    )
+    adapter_parameters = action_report.adapter_parameters
+    if vlm_report is not None:
+        names += tuple(f"vlm.{name}" for name in vlm_report.injected_module_names)
+        adapter_parameters += vlm_report.adapter_parameters
+    return GSEInjectionReport(
+        injected_module_names=names,
+        adapter_parameters=adapter_parameters,
+        trainable_parameters=0,
+    )
+
+
+def _existing_gse_report(model: nn.Module) -> GSEInjectionReport:
+    layers = tuple(iter_gse_layers(model))
+    if not layers:
+        raise ValueError("Expected existing action GSE adapters, but found none")
+    return GSEInjectionReport(
+        injected_module_names=tuple(name for name, _ in layers),
+        adapter_parameters=sum(
+            parameter.numel()
+            for _, layer in layers
+            for parameter in layer.adapter.parameters()
+        ),
+        trainable_parameters=sum(
+            parameter.numel()
+            for parameter in model.parameters()
+            if parameter.requires_grad
+        ),
+    )
+
+
 def configure_openpi_gse(
     model: nn.Module,
     config: Mapping[str, Any],
+    *,
+    action_already_injected: bool = False,
 ) -> GSEInjectionReport:
-    """Inject GSE into the action transformer and freeze non-GSE actor weights."""
+    """Inject action and optional VLM GSE, then select trainable adapters."""
     if not is_gse_enabled(config):
         raise ValueError("configure_openpi_gse requires enabled=true")
     if bool(config.get("require_pi05", True)) and not bool(
@@ -106,15 +234,48 @@ def configure_openpi_gse(
     action_expert = get_action_expert_transformer(model)
     target_modules = tuple(config.get("target_modules", DEFAULT_ACTION_EXPERT_TARGETS))
     exclude_modules = tuple(config.get("exclude_modules", ()))
-    report = inject_gse(
-        action_expert,
-        core_config,
-        target_modules,
-        exclude_modules=exclude_modules,
-        strict=True,
-    )
+    if action_already_injected:
+        action_report = _existing_gse_report(action_expert)
+    else:
+        action_report = inject_gse(
+            action_expert,
+            core_config,
+            target_modules,
+            exclude_modules=exclude_modules,
+            strict=True,
+        )
+    _tag_gse_domain(action_expert, "action")
+
+    vlm_config = config.get("vlm", None)
+    vlm_report = None
+    if is_gse_enabled(vlm_config):
+        if not isinstance(vlm_config, Mapping):
+            raise TypeError("OpenPI GSE vlm configuration must be a mapping")
+        vlm = get_vlm_transformer(model)
+        layer_indices = _resolve_layer_indices(
+            vlm, vlm_config.get("layer_indices", (-1,))
+        )
+        vlm_targets = tuple(vlm_config.get("target_modules", DEFAULT_VLM_TARGETS))
+        vlm_exclusions = tuple(vlm_config.get("exclude_modules", ()))
+        vlm_report = _inject_vlm_layers(
+            vlm,
+            _build_core_config(vlm_config),
+            layer_indices,
+            vlm_targets,
+            vlm_exclusions,
+        )
+        _tag_gse_domain(vlm, "vlm")
+
+    report = _merge_reports(action_report, vlm_report)
 
     mark_only_gse_as_trainable(model)
+    if not bool(config.get("train_action_adapters", True)):
+        if vlm_report is None:
+            raise ValueError(
+                "train_action_adapters=false requires an enabled VLM GSE"
+            )
+        for _, layer in iter_gse_layers(action_expert):
+            layer.requires_grad_(False)
     if bool(config.get("train_value_head", True)) and hasattr(model, "value_head"):
         model.value_head.requires_grad_(True)
     report = replace(
@@ -128,8 +289,10 @@ def configure_openpi_gse(
 
     model.gse_injection_report = report
     logging.getLogger(__name__).info(
-        "Injected GSE into %d OpenPI action-expert linear layers (%d parameters)",
+        "Injected GSE into %d OpenPI linear layers (%d action, %d VLM; %d parameters)",
         len(report.injected_module_names),
+        len(action_report.injected_module_names),
+        len(vlm_report.injected_module_names) if vlm_report is not None else 0,
         report.adapter_parameters,
     )
     return report

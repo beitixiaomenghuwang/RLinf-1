@@ -1597,6 +1597,11 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     self.model,
                     task_ids,
                     num_tasks=int(num_tasks),
+                    domain=(
+                        "action"
+                        if bool(self.gse_cfg.get("vlm", {}).get("enabled", False))
+                        else None
+                    ),
                 )
                 for name, value in micro_statistics.items():
                     task_router_statistics[name] = task_router_statistics.get(

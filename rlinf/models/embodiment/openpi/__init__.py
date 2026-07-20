@@ -33,6 +33,7 @@ def get_model(cfg: DictConfig, torch_dtype=None):
         configure_openpi_gse,
         is_gse_enabled,
         state_dict_contains_gse,
+        state_dict_contains_vlm_gse,
     )
     from rlinf.models.embodiment.openpi.openpi_action_model import (
         OpenPi0Config,
@@ -97,15 +98,40 @@ def get_model(cfg: DictConfig, torch_dtype=None):
             model_state_dict.update(state_dict)
 
     checkpoint_has_gse = state_dict_contains_gse(model_state_dict)
+    checkpoint_has_vlm_gse = state_dict_contains_vlm_gse(model_state_dict)
+    vlm_gse_enabled = is_gse_enabled(
+        gse_config.get("vlm", None) if gse_config is not None else None
+    )
+    upgrade_action_checkpoint_with_vlm = (
+        checkpoint_has_gse and vlm_gse_enabled and not checkpoint_has_vlm_gse
+    )
     if checkpoint_has_gse and not gse_enabled:
         raise ValueError(
             "The checkpoint contains GSE parameters, but model.gse.enabled is false"
         )
+    if checkpoint_has_vlm_gse and not vlm_gse_enabled:
+        raise ValueError(
+            "The checkpoint contains VLM GSE parameters, but model.gse.vlm.enabled "
+            "is false"
+        )
     if checkpoint_has_gse:
-        configure_openpi_gse(model, gse_config)
+        if upgrade_action_checkpoint_with_vlm:
+            action_only_config = dict(gse_config)
+            action_only_config["vlm"] = {"enabled": False}
+            action_only_config["train_action_adapters"] = True
+            configure_openpi_gse(model, action_only_config)
+        else:
+            configure_openpi_gse(model, gse_config)
 
     model.load_state_dict(model_state_dict, strict=False)
     del model_state_dict
+
+    if upgrade_action_checkpoint_with_vlm:
+        configure_openpi_gse(
+            model,
+            gse_config,
+            action_already_injected=True,
+        )
 
     model.paligemma_with_expert.to_bfloat16_for_selected_params("bfloat16")
     if gse_enabled and not checkpoint_has_gse:

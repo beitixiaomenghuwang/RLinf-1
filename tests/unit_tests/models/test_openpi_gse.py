@@ -8,7 +8,9 @@ from rlinf.models.embodiment.openpi.gse import (
     DEFAULT_ACTION_EXPERT_TARGETS,
     configure_openpi_gse,
     get_action_expert_transformer,
+    get_vlm_transformer,
     state_dict_contains_gse,
+    state_dict_contains_vlm_gse,
 )
 from rlinf.models.peft.gse import GSELinear
 
@@ -55,7 +57,11 @@ class ToyOpenPi(nn.Module):
         self.paligemma_with_expert.gemma_expert.model.layers = nn.ModuleList(
             [ToyDecoderLayer(), ToyDecoderLayer()]
         )
-        self.paligemma_with_expert.paligemma = nn.Linear(12, 12)
+        self.paligemma_with_expert.paligemma = nn.Module()
+        self.paligemma_with_expert.paligemma.language_model = nn.Module()
+        self.paligemma_with_expert.paligemma.language_model.layers = nn.ModuleList(
+            [ToyDecoderLayer(), ToyDecoderLayer()]
+        )
         self.action_in_proj = nn.Linear(4, 12)
         self.action_out_proj = nn.Linear(12, 4)
         self.time_mlp_in = nn.Linear(12, 12)
@@ -93,7 +99,10 @@ def test_configure_openpi_gse_targets_only_action_transformer() -> None:
     report = configure_openpi_gse(model, make_integration_config())
 
     assert len(report.injected_module_names) == 14
-    assert all(name.startswith("layers.") for name in report.injected_module_names)
+    assert all(
+        name.startswith("action_expert.layers.")
+        for name in report.injected_module_names
+    )
     wrapped_q_proj = model.paligemma_with_expert.gemma_expert.model.layers[
         0
     ].self_attn.q_proj
@@ -103,7 +112,11 @@ def test_configure_openpi_gse_targets_only_action_transformer() -> None:
 
     assert isinstance(model.action_in_proj, nn.Linear)
     assert not model.action_in_proj.weight.requires_grad
-    assert not model.paligemma_with_expert.paligemma.weight.requires_grad
+    vlm_q_proj = model.paligemma_with_expert.paligemma.language_model.layers[
+        0
+    ].self_attn.q_proj
+    assert isinstance(vlm_q_proj, nn.Linear)
+    assert not vlm_q_proj.weight.requires_grad
     assert model.value_head.weight.requires_grad
     assert wrapped_q_proj.router.weight.requires_grad
     assert not wrapped_q_proj.base_layer.weight.requires_grad
@@ -125,6 +138,11 @@ def test_get_action_expert_reports_incompatible_model() -> None:
         get_action_expert_transformer(nn.Linear(2, 2))
 
 
+def test_get_vlm_transformer_reports_incompatible_model() -> None:
+    with pytest.raises(ValueError, match="paligemma.language_model"):
+        get_vlm_transformer(nn.Linear(2, 2))
+
+
 def test_state_dict_detection_distinguishes_sft_and_gse_checkpoints() -> None:
     sft_state = {
         "paligemma_with_expert.gemma_expert.model.layers.0.weight": torch.ones(1)
@@ -133,9 +151,72 @@ def test_state_dict_detection_distinguishes_sft_and_gse_checkpoints() -> None:
         "paligemma_with_expert.gemma_expert.model.layers.0.self_attn.q_proj."
         "generalized_experts.0.lora_a.weight": torch.ones(1)
     }
+    vlm_gse_state = {
+        "paligemma_with_expert.paligemma.language_model.layers.1.self_attn.q_proj."
+        "generalized_experts.0.lora_a.weight": torch.ones(1)
+    }
 
     assert not state_dict_contains_gse(sft_state)
     assert state_dict_contains_gse(gse_state)
+    assert not state_dict_contains_vlm_gse(gse_state)
+    assert state_dict_contains_vlm_gse(vlm_gse_state)
+
+
+def test_configure_openpi_gse_adds_last_layer_vlm_adapters() -> None:
+    model = ToyOpenPi()
+    action_q_proj = model.paligemma_with_expert.gemma_expert.model.layers[
+        0
+    ].self_attn.q_proj
+    vlm_q_proj = model.paligemma_with_expert.paligemma.language_model.layers[
+        -1
+    ].self_attn.q_proj
+    action_inputs = torch.randn(2, 3, 12)
+    vlm_inputs = torch.randn(2, 3, 12)
+    expected_action = action_q_proj(action_inputs)
+    expected_vlm = vlm_q_proj(vlm_inputs)
+    config = make_integration_config(
+        train_action_adapters=False,
+        vlm={
+            "enabled": True,
+            "layer_indices": [-1],
+            "target_modules": ["q_proj", "v_proj"],
+            "total_rank": 8,
+            "lora_alpha": 8.0,
+            "num_experts": 4,
+            "num_generalized_experts": 1,
+            "top_k": 2,
+            "init_seed": 19,
+        },
+    )
+
+    report = configure_openpi_gse(model, config)
+
+    assert len(report.injected_module_names) == 16
+    assert isinstance(
+        model.paligemma_with_expert.paligemma.language_model.layers[
+            -1
+        ].self_attn.q_proj,
+        GSELinear,
+    )
+    assert isinstance(
+        model.paligemma_with_expert.paligemma.language_model.layers[
+            0
+        ].self_attn.q_proj,
+        nn.Linear,
+    )
+    wrapped_action = model.paligemma_with_expert.gemma_expert.model.layers[
+        0
+    ].self_attn.q_proj
+    wrapped_vlm = model.paligemma_with_expert.paligemma.language_model.layers[
+        -1
+    ].self_attn.q_proj
+    torch.testing.assert_close(wrapped_action(action_inputs), expected_action)
+    torch.testing.assert_close(wrapped_vlm(vlm_inputs), expected_vlm)
+    assert wrapped_action.gse_domain == "action"
+    assert wrapped_vlm.gse_domain == "vlm"
+    assert not wrapped_action.router.weight.requires_grad
+    assert wrapped_vlm.router.weight.requires_grad
+    assert model.value_head.weight.requires_grad
 
 
 def test_actor_and_rollout_build_identical_trainable_state_structure() -> None:
@@ -169,9 +250,61 @@ def test_actor_and_rollout_build_identical_trainable_state_structure() -> None:
         )
 
 
+def test_action_checkpoint_initializes_joint_model_without_changing_policy() -> None:
+    source = ToyOpenPi()
+    action_config = make_integration_config()
+    configure_openpi_gse(source, action_config)
+    source_action = source.paligemma_with_expert.gemma_expert.model.layers[
+        0
+    ].self_attn.q_proj
+    with torch.no_grad():
+        for expert in source_action.all_experts:
+            expert.lora_b.weight.normal_(std=0.01)
+    inputs = torch.randn(2, 3, 12)
+    expected_action = source_action(inputs)
+    source_state = source.state_dict()
+
+    target = ToyOpenPi()
+    joint_config = make_integration_config(
+        train_action_adapters=False,
+        vlm={
+            "enabled": True,
+            "layer_indices": [-1],
+            "target_modules": ["q_proj"],
+            "total_rank": 8,
+            "lora_alpha": 8.0,
+            "num_experts": 4,
+            "num_generalized_experts": 1,
+            "top_k": 2,
+        },
+    )
+    configure_openpi_gse(target, action_config)
+    target.load_state_dict(source_state, strict=False)
+    target_vlm_base = target.paligemma_with_expert.paligemma.language_model.layers[
+        -1
+    ].self_attn.q_proj
+    expected_vlm = target_vlm_base(inputs)
+    configure_openpi_gse(target, joint_config, action_already_injected=True)
+
+    target_action = target.paligemma_with_expert.gemma_expert.model.layers[
+        0
+    ].self_attn.q_proj
+    target_vlm = target.paligemma_with_expert.paligemma.language_model.layers[
+        -1
+    ].self_attn.q_proj
+    torch.testing.assert_close(target_action(inputs), expected_action)
+    torch.testing.assert_close(target_vlm(inputs), expected_vlm)
+
+
 def test_openpi_gse_rejects_unknown_configuration_fields() -> None:
     with pytest.raises(ValueError, match="Unknown OpenPI GSE fields"):
         configure_openpi_gse(ToyOpenPi(), make_integration_config(unknown_option=True))
+
+    with pytest.raises(ValueError, match="Unknown OpenPI GSE fields"):
+        configure_openpi_gse(
+            ToyOpenPi(),
+            make_integration_config(vlm={"enabled": True, "unknown_option": True}),
+        )
 
 
 def test_openpi_gse_accepts_ppo_auxiliary_configuration() -> None:
