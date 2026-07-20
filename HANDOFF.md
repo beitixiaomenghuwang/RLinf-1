@@ -978,10 +978,13 @@ refer to action adapters.
 
 ### 9.9 Six-GPU VLM-GSE run
 
-This uses 96 train environments so each of six rollout replicas keeps batch 16.
-Two rollout epochs produce 3,840 PPO samples; actor global batch 768 gives five
-minibatches and is divisible by `128 * 6`. Evaluation uses 600 trajectories,
-exactly 12 per MT50 task and divisible by six.
+This explicitly places actor, environment, and rollout workers on GPU ranks 0-5;
+`CUDA_VISIBLE_DEVICES` alone does not reduce the world size when the connected
+Ray cluster still advertises eight GPUs. Use 192 train environments so each of
+six rollout replicas receives batch 32. One rollout epoch produces 3,840 PPO
+samples; actor global batch 768 gives five minibatches and is divisible by
+`128 * 6`. Evaluation uses 600 trajectories, exactly 12 per MT50 task and
+divisible by six.
 
 Run inside the OpenPI Docker shell without adding a YAML profile:
 
@@ -996,11 +999,12 @@ mkdir -p "$RUN_DIR"
 python examples/embodiment/train_embodied_agent.py \
   --config-path /workspace/RLinf/examples/embodiment/config \
   --config-name metaworld_50_ppo_openpi_pi05_gse \
+  'cluster.component_placement={actor\,env:0-5,rollout:0-5}' \
   actor.model.model_path="$ACTION_CKPT/actor" \
   rollout.model.model_path="$ACTION_CKPT/actor" \
   '+actor.model.openpi_data.norm_stats_path=/workspace/models/RLinf-Pi05-MetaWorld-SFT/lerobot/metaworld_mt50/norm_stats.json' \
-  env.train.total_num_envs=96 \
-  env.train.rollout_epoch=2 \
+  env.train.total_num_envs=192 \
+  env.train.rollout_epoch=1 \
   env.eval.total_num_envs=600 \
   env.eval.use_fixed_reset_state_ids=True \
   env.eval.is_eval=True \
