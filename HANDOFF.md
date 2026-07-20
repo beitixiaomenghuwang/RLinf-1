@@ -390,19 +390,19 @@ using command-line overrides. Do not add more throughput YAML profiles.
 
 The first eleven fixed-reset evaluations of the formal batch16 run are:
 
-| Checkpoint | `success_once` | Macro mean | Worst-10 | Tasks >=90% |
-|-----------:|---------------:|-----------:|---------:|------------:|
-| 20  | 65.63% | 65.36% | 9.64%  | 20 |
-| 40  | 66.99% | 66.95% | 12.64% | 21 |
-| 60  | 70.90% | 70.78% | 9.73%  | 24 |
-| 80  | 68.16% | 68.13% | 15.82% | 18 |
-| 100 | 67.58% | 67.55% | 9.64%  | 20 |
-| 120 | 69.14% | 69.09% | 10.45% | 22 |
-| 140 | 69.73% | 69.62% | 12.64% | 18 |
-| 160 | 67.58% | 67.67% | 9.64%  | 20 |
-| 180 | **73.05%** | **73.13%** | **18.18%** | 21 |
-| 200 | 67.58% | 67.51% | 13.82% | 19 |
-| 220 | 68.95% | 68.82% | 12.55% | 19 |
+| Checkpoint | `success_once` | Macro mean |   Worst-10 | Tasks >=90% |
+| ---------: | -------------: | ---------: | ---------: | ----------: |
+|         20 |         65.63% |     65.36% |      9.64% |          20 |
+|         40 |         66.99% |     66.95% |     12.64% |          21 |
+|         60 |         70.90% |     70.78% |      9.73% |          24 |
+|         80 |         68.16% |     68.13% |     15.82% |          18 |
+|        100 |         67.58% |     67.55% |      9.64% |          20 |
+|        120 |         69.14% |     69.09% |     10.45% |          22 |
+|        140 |         69.73% |     69.62% |     12.64% |          18 |
+|        160 |         67.58% |     67.67% |      9.64% |          20 |
+|        180 |     **73.05%** | **73.13%** | **18.18%** |          21 |
+|        200 |         67.58% |     67.51% |     13.82% |          19 |
+|        220 |         68.95% |     68.82% |     12.55% |          19 |
 
 The step-180 checkpoint is currently the best observed checkpoint. It exceeds
 the reported official Flow-SDE `70.7%` by `2.35 pp` on `success_once` and by
@@ -555,7 +555,7 @@ mkdir -p \
 Start Docker:
 
 ```bash
-docker run -it --rm \
+docker run -it --rm   --privileged \
   --gpus all \
   --shm-size 256g \
   --network host \
@@ -1005,11 +1005,11 @@ python examples/embodiment/train_embodied_agent.py \
   '+actor.model.openpi_data.norm_stats_path=/workspace/models/RLinf-Pi05-MetaWorld-SFT/lerobot/metaworld_mt50/norm_stats.json' \
   env.train.total_num_envs=192 \
   env.train.rollout_epoch=1 \
-  env.eval.total_num_envs=600 \
+  env.eval.total_num_envs=96 \
   env.eval.use_fixed_reset_state_ids=True \
   env.eval.is_eval=True \
   rollout.pipeline_stage_num=1 \
-  actor.micro_batch_size=128 \
+  actor.micro_batch_size=64 \
   actor.global_batch_size=768 \
   +actor.model.gse.train_action_adapters=false \
   +actor.model.gse.vlm.enabled=true \
@@ -1021,7 +1021,7 @@ python examples/embodiment/train_embodied_agent.py \
   +actor.model.gse.vlm.num_generalized_experts=1 \
   +actor.model.gse.vlm.top_k=2 \
   +actor.model.gse.vlm.init_seed=4200 \
-  runner.resume_dir=null \
+  runner.resume_dir="$CKPT" \
   runner.logger.log_path="$RUN_DIR" \
   runner.logger.experiment_name="$EXP_NAME" \
   runner.max_epochs=60 \
@@ -1034,7 +1034,7 @@ python examples/embodiment/train_embodied_agent.py \
   actor.optim.total_training_steps=60 \
   actor.seed=42 \
   rollout.seed=42 \
-  2>&1 | tee "$RUN_DIR/console.log"
+  2>&1 | tee -a "$RUN_DIR/console.log"
 ```
 
 Before the 60-step run, use the same command with a fresh smoke `RUN_DIR`,
