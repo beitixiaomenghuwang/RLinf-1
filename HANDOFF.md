@@ -1102,6 +1102,90 @@ tests if making a generalization claim.
 - Do not terminate unrelated GPU jobs or delete shared Docker/Ray data.
 - Put checkpoints, TensorBoard data, videos, and large logs outside the repository.
 
-The immediate milestone is the two-step six-GPU VLM-GSE smoke run, followed by
-the 60-step final-block ablation if gradients, memory, and weight synchronization
-are healthy. Keep auxiliary losses disabled during this comparison.
+## 11. Next-conversation handoff
+
+### 11.1 Current run state
+
+The active experiment is `gse-action180-vlm-last-seed42`. It starts from the
+selected action-GSE step-180 checkpoint, freezes all action adapters, and trains
+the seven GSE-wrapped projections in VLM language layer 17 plus the value head.
+The six-GPU run uses explicit placement on ranks 0-5, 192 trajectories per
+global step, `rollout_epoch=1`, actor global batch 768, and actor micro batch 64.
+Micro batch 128 OOMed in the actor forward at the VLM MLP `up_proj` GSE
+specialized expert; micro batch 64 runs successfully and gives two-way gradient
+accumulation per rank.
+
+The first successful training-step metrics were healthy:
+
+```text
+approx_kl=2.60e-4, clip_fraction=0.0015, grad_norm=0.497
+critic explained_variance=0.787, value_loss=0.016
+action router normalized_entropy=0.954
+VLM router entropy=0.754, normalized_entropy about 0.686
+VLM specialized selection about [0.499, 0.217, 0.284]
+```
+
+The VLM router is skewed but not collapsed; all three specialized experts still
+receive traffic. Do not enable a balancing loss from one step. Track whether the
+same expert remains selected almost always over multiple checkpoints. The
+training-rollout `success_once=65.63%` came from only 192 trajectories and is not
+comparable to the action-only three-seed result.
+
+The command currently uses `env.eval.total_num_envs=96`. Treat this only as a
+runtime health check: it gives fewer than two trials per MT50 task and makes
+worst-5/worst-10 and tasks-above-90 statistically unusable. For checkpoint
+selection, run a separate matched evaluation with 600 trajectories on six GPUs
+(12 per task), or use the established 512-trajectory protocol for both candidate
+and baseline on eight GPUs. When starting fresh, set `runner.resume_dir=null`;
+when resuming, explicitly export `CKPT` to the runner checkpoint directory before
+using `runner.resume_dir="$CKPT"`.
+
+### 11.2 Work to do when results arrive
+
+1. Identify the evaluated checkpoint and confirm whether the run was fresh or
+   resumed. Record wall time, peak GPU memory, trajectories, optimizer updates,
+   and exact seeds.
+2. Parse `metrics.jsonl` across all available steps. Check success-once, macro,
+   worst-10, tasks above 90%, KL, clip fraction, gradient norm, critic explained
+   variance, and both action/VLM router statistics. Do not select a checkpoint
+   from one noisy evaluation.
+3. Select the best provisional VLM checkpoint using repeated fixed-reset
+   evaluations, then evaluate it and action-only step 180 with identical seeds,
+   reset states, trajectory counts, Flow-SDE settings, and success definitions.
+   Report paired per-task deltas and the multi-seed confidence interval.
+4. Consider VLM GSE successful only if the matched comparison improves macro
+   success or materially improves worst-10 without a meaningful macro regression.
+   The action-only reference is `72.72%` success-once and `72.73%` macro over
+   three seeds, with `18.73%` worst-10.
+5. If final-block VLM GSE succeeds, next compare action-only, frozen-action plus
+   VLM GSE, and joint action+VLM GSE with separate learning rates. Add language
+   layer 16 only after the final-block result is reproduced over multiple seeds.
+6. If it does not succeed, do not expand the VLM. First diagnose paired task
+   regressions and router skew. The next primary method experiment is task-wise
+   advantage normalization; an attention-only VLM target
+   `[q_proj,k_proj,v_proj,o_proj]` is a separate memory/architecture ablation.
+7. Before paper claims, run parameter-matched plain-LoRA PPO, no-router
+   multi-expert PPO, and full-parameter PPO under the same data and evaluation
+   budget, followed by at least three training seeds and held-out visual/state
+   perturbations.
+
+For eval-only loading of a joint action+VLM checkpoint, point
+`rollout.model.model_path` directly at its saved actor directory and mirror the
+complete GSE configuration under `rollout.model.gse`; eval-only mode does not
+synchronize actor weights to rollout workers.
+
+### 11.3 Git requirement for future work
+
+After every completed code/config/test/documentation stage, run the focused
+validation and automatically create a signed Conventional Commit with
+`git commit -s`; do not wait for another user reminder. Inspect `git status`
+before staging, preserve unrelated user changes, never include checkpoints or
+large outputs, and do not push, rebase, reset, or clean the worktree unless the
+user explicitly requests it. Record each new commit and its validation result in
+this handoff.
+
+The immediate milestone for the next conversation is to ingest the completed
+`gse-action180-vlm-last-seed42` metrics, select candidate checkpoints without
+using the 96-trajectory health-check result as evidence, and launch the matched
+action-only versus VLM evaluation. Keep auxiliary losses disabled until those
+results establish whether router skew is persistent and harmful.
