@@ -181,6 +181,7 @@ d292f580  parallel Pi0.5 rollout profiles and routing validation
 39ccbf3b  validated batch16 rollout and actor budget
 8646d1a0  high-memory Pi0.5 rollout and actor profiles
 c798a718  reproducible rollout seeds and multi-seed evaluation summaries
+8c59a4a9  VLM GSE upgrade from action-only checkpoints
 ```
 
 `dcac37c1` is required for eval-only runs. In eval-only mode the rollout worker
@@ -203,15 +204,20 @@ for token routing.
 rollout processes per GPU. It also validates that environment batches are
 divisible by the rollout worker count before workers launch.
 
-`8646d1a0` adds independent rollout-capacity and actor-activation profiles. The
-recommended 8 x A100 80 GB composition is `metaworld_pi05_batch32` plus
-`pi05_micro256`; the batch64 profile is an optional capacity probe, not the
-default.
+`8646d1a0` adds rollout-capacity and actor-activation profiles used during
+throughput characterization. Later measurements showed that the original
+batch16 setting remains faster; batch32/micro256 is not the formal default and
+batch64 OOMs.
 
 `c798a718` makes Flow-SDE rollout randomness reproducible with a base seed plus
 rollout rank, writes complete scalar tables to `metrics.jsonl`, adds short aliases
 for otherwise truncated task-router metrics, and provides a matched multi-seed
 summary tool.
+
+`8c59a4a9` upgrades action-only checkpoints by loading trained action GSE before
+injecting optional zero-output VLM GSE. It supports freezing action adapters,
+selected VLM layer indices, domain-separated router metrics, and safe loading of
+future joint checkpoints.
 
 ## 5. Validation completed
 
@@ -411,6 +417,21 @@ The router remains non-collapsed but effectively task-agnostic: at step 180,
 normalized entropy is `0.954`, task-router NMI is `5.63e-4`, and JS divergence is
 `2.53e-4`. Do not claim that the current gain comes from task specialization;
 the current evidence supports a shared residual improvement across tasks.
+
+The matched three-seed evaluation of step 180 gives:
+
+```text
+success_once: mean 72.72%, std 2.16%, approximate 95% CI [70.28%, 75.17%]
+macro mean:   mean 72.73%, std 2.07%, approximate 95% CI [70.38%, 75.07%]
+success_end:  mean 47.20%, std 1.24%
+worst-10:     mean 18.73%, std 6.32%
+worst-5:      mean  6.91%, std 6.50%
+```
+
+Seed 42 is the highest run. The three-seed mean is `2.02 pp` above the reported
+official 70.7%, but 70.7% remains inside the approximate confidence interval.
+The result supports moving to an isolated VLM-GSE ablation, while a strict
+superiority claim still requires matched official checkpoints/seeds.
 
 ## 6. Eval-only behavior and reproducible evaluation
 
@@ -693,11 +714,11 @@ batch64 OOMed. Use the validated batch16 values directly on the command line; do
 not compose `pi05_micro256` and do not add another throughput YAML profile.
 
 A 320-step run collects 81,920 trajectories, approximately 8.19 million
-environment steps, and performs 6,400 optimizer updates. At the measured steady
-step time, plus sixteen 512-trajectory evaluations, it should fit in roughly
-19-23 hours. The cosine scheduler advances per optimizer update, not per global
-step, so every launch and resume must retain
-`actor.optim.total_training_steps=6400`.
+environment steps, and performs 6,400 optimizer updates. The embodied actor calls
+the LR scheduler once per global step, after all PPO minibatches; the historical
+`total_training_steps=6400` therefore made the action-GSE LR nearly constant
+rather than decaying over 320 steps. Preserve this fact when reproducing the
+action-only result. New experiments should set the intended scheduler explicitly.
 
 ### 9.2 Formal training command
 
@@ -936,46 +957,125 @@ time, keeping step-180 GSE as the reference:
 
 ### 9.8 When to decompose the VLM
 
-Do not add VLM GSE in the current step-180 reproduction. Add it only after all
-conditions below hold:
+The action-only result has plateaued and its three-seed mean remains above SFT,
+so an isolated VLM-GSE ablation is now appropriate. Commit `8c59a4a9` supports
+upgrading an action-only checkpoint in the correct order: load step-180 action
+GSE first, then inject zero-output VLM GSE. The initial upgraded policy is exactly
+the step-180 policy.
 
-- step-180 action-expert GSE beats SFT in the three-seed fixed-reset evaluation;
-- the action-expert GSE advantage survives a matched plain-LoRA and no-router
-  ablation;
-- task success is not improving only because of one or two outlier tasks, and
-  worst-10/zero-success-task counts are stable or better;
-- action-expert-only RL has plateaued, with finite KL/gradients and no critic
-  collapse, so there is evidence the remaining error is visual/language
-  representation rather than action decoding.
+The first ablation freezes all 126 trained action GSE layers and trains only:
 
-When those conditions hold, use a separate VLM-GSE experiment initialized with
-zero-output B and orthogonal A, while keeping the action-expert GSE frozen for
-the first ablation. Start with the final VLM block or a small set of
-language-to-action projection layers, not the full VLM. Use a rank 8-16 adapter,
-two to four experts, and a small learning rate (roughly 0.1-0.25 times the
-action-expert GSE LR). Compare three settings: action-only, VLM-only, and
-joint-with-separate-LR. Only expand to more VLM layers if VLM-only improves
-macro and worst-10 without degrading action-only performance.
+- seven projections in VLM language layer 17 (the final block);
+- rank 16 split across four experts (one generalized, three specialized,
+  `top_k=2`);
+- the existing value head.
 
-This ordering preserves the causal story: action GSE adapts the controller;
-VLM GSE is a later representation-adaptation ablation justified by residual
-task failures, not a simultaneous source of unexplained gains.
+The real SFT model contains 1,175,552 trainable VLM-GSE parameters and about
+2.39M trainable parameters including the value head. The measured initial VLM
+residual difference is exactly zero. Router metrics are separated into
+`gse/action_router/*` and `gse/vlm_router/*`; legacy `gse/router/*` continues to
+refer to action adapters.
 
-### 9.9 Current method summary
+### 9.9 Six-GPU VLM-GSE run
 
-The current policy starts from the fully trained Pi0.5 MetaWorld MT50 SFT
+This uses 96 train environments so each of six rollout replicas keeps batch 16.
+Two rollout epochs produce 3,840 PPO samples; actor global batch 768 gives five
+minibatches and is divisible by `128 * 6`. Evaluation uses 600 trajectories,
+exactly 12 per MT50 task and divisible by six.
+
+Run inside the OpenPI Docker shell without adding a YAML profile:
+
+```bash
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5
+export ACTION_CKPT=/workspace/output/gse-formal-seed42/gse_formal_seed42/checkpoints/global_step_180
+test -f "$ACTION_CKPT/actor/model_state_dict/full_weights.pt"
+export RUN_DIR=/workspace/output/gse-action180-vlm-last-seed42
+export EXP_NAME=gse_action180_vlm_last_seed42
+mkdir -p "$RUN_DIR"
+
+python examples/embodiment/train_embodied_agent.py \
+  --config-path /workspace/RLinf/examples/embodiment/config \
+  --config-name metaworld_50_ppo_openpi_pi05_gse \
+  actor.model.model_path="$ACTION_CKPT/actor" \
+  rollout.model.model_path="$ACTION_CKPT/actor" \
+  '+actor.model.openpi_data.norm_stats_path=/workspace/models/RLinf-Pi05-MetaWorld-SFT/lerobot/metaworld_mt50/norm_stats.json' \
+  env.train.total_num_envs=96 \
+  env.train.rollout_epoch=2 \
+  env.eval.total_num_envs=600 \
+  env.eval.use_fixed_reset_state_ids=True \
+  env.eval.is_eval=True \
+  rollout.pipeline_stage_num=1 \
+  actor.micro_batch_size=128 \
+  actor.global_batch_size=768 \
+  +actor.model.gse.train_action_adapters=false \
+  +actor.model.gse.vlm.enabled=true \
+  '+actor.model.gse.vlm.layer_indices=[-1]' \
+  '+actor.model.gse.vlm.target_modules=[q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj]' \
+  +actor.model.gse.vlm.total_rank=16 \
+  +actor.model.gse.vlm.lora_alpha=16.0 \
+  +actor.model.gse.vlm.num_experts=4 \
+  +actor.model.gse.vlm.num_generalized_experts=1 \
+  +actor.model.gse.vlm.top_k=2 \
+  +actor.model.gse.vlm.init_seed=4200 \
+  runner.resume_dir=null \
+  runner.logger.log_path="$RUN_DIR" \
+  runner.logger.experiment_name="$EXP_NAME" \
+  runner.max_epochs=60 \
+  runner.save_interval=10 \
+  runner.val_check_interval=10 \
+  runner.max_checkpoints_to_keep=4 \
+  actor.optim.lr=1e-5 \
+  actor.optim.value_lr=5e-5 \
+  actor.optim.lr_scheduler=constant \
+  actor.optim.total_training_steps=60 \
+  actor.seed=42 \
+  rollout.seed=42 \
+  2>&1 | tee "$RUN_DIR/console.log"
+```
+
+Before the 60-step run, use the same command with a fresh smoke `RUN_DIR`,
+`runner.max_epochs=2`, `runner.save_interval=-1`, and
+`runner.val_check_interval=-1`. Verify startup logs report 126 action plus seven
+VLM GSE layers, action-GSE trainable parameters are zero, and the first two PPO
+updates have finite gradients.
+
+During training, the Hugging Face rollout worker copies `actor.model`, so these
+actor-side GSE overrides also construct VLM GSE on every rollout replica. In
+eval-only mode this is different: the worker uses `rollout.model` directly, so
+mirror the complete action/VLM GSE configuration under `rollout.model.gse` when
+evaluating a saved joint checkpoint.
+
+Use the 600-trajectory evaluations only to rank checkpoints within this six-GPU
+run. Do not compare them numerically with the earlier 512-trajectory `72.72%`
+mean. For the final decision, evaluate action-only step 180 and the selected VLM
+checkpoint with identical seeds, fixed resets, and trajectory counts: use 600
+for both on six GPUs, or repeat the established 512-trajectory protocol for both
+on eight GPUs. Select VLM only if that matched comparison improves macro success
+or materially improves worst-10 without a macro regression. If the last-block
+ablation fails, do not expand the full VLM; next test task-wise advantage
+normalization. If it succeeds, compare action-only, VLM-only-on-action180, and
+joint action+VLM with separate learning rates before adding layer 16 or earlier
+blocks.
+
+### 9.10 Current method summary
+
+The action-only reference starts from the fully trained Pi0.5 MetaWorld MT50 SFT
 checkpoint. The VLM and original action-expert parameters stay frozen. GSE wraps
 126 linear projections in the 18-layer action expert with two always-active
 generalized experts and six routed specialized experts (`top_k=2`, total rank
 64). Orthogonal A matrices and zero B matrices make the initial residual exactly
 zero, so the initial policy is identical to SFT.
 
-RLinf then uses Flow-SDE/Flow-Noise PPO to collect balanced MT50 trajectories.
-Only GSE/router parameters and the value head are optimized. Each global step
-collects 256 trajectories, computes GAE with a shared multi-task value head, and
-runs four PPO update epochs over five global minibatches. Load-balance and
-orthogonality losses remain disabled; router/task specialization is monitored
-rather than forced. The formal objective is therefore parameter-efficient
+RLinf uses Flow-SDE/Flow-Noise PPO to collect balanced MT50 trajectories. In the
+action-only reference, only action GSE/router parameters and the value head are
+optimized. The new branch loads its selected step-180 checkpoint, freezes those
+trained action adapters, then adds zero-output GSE to seven projections in the
+final VLM language block. Its six-GPU step collects 192 trajectories and runs
+four PPO update epochs over five global minibatches; only VLM GSE/router
+parameters and the value head update.
+
+Load-balance and orthogonality losses remain disabled; router/task specialization
+is monitored rather than forced. The formal objective is parameter-efficient
 residual multi-task RL post-training of a frozen SFT VLA, with fixed-reset
 per-task evaluation used to detect positive transfer, conflict, and forgetting.
 
@@ -989,8 +1089,8 @@ tests if making a generalization claim.
 - Read the repository-root `AGENTS.md` before editing.
 - Preserve unrelated user changes and real server paths.
 - Keep the official full-parameter Pi0.5 PPO config unchanged as a baseline.
-- Do not expand GSE into the VLM backbone before the action-expert experiment is
-  stable and an ablation justifies it.
+- Keep the first VLM GSE ablation restricted to the final language block; do not
+  expand earlier layers until it beats the action-only checkpoint.
 - Zero-B initialization delays useful A/router gradients until B becomes nonzero.
 - Aggregate load balance over a diverse multi-task batch; per-sample balancing can
   be meaningless or harmful.
@@ -998,7 +1098,6 @@ tests if making a generalization claim.
 - Do not terminate unrelated GPU jobs or delete shared Docker/Ray data.
 - Put checkpoints, TensorBoard data, videos, and large logs outside the repository.
 
-The immediate milestone is the uninterrupted formal batch16 run with evaluation
-and checkpointing every 20 steps. Do not enable auxiliary losses until the
-baseline run and matched evaluations show whether gains and regressions
-correspond to useful expert specialization.
+The immediate milestone is the two-step six-GPU VLM-GSE smoke run, followed by
+the 60-step final-block ablation if gradients, memory, and weight synchronization
+are healthy. Keep auxiliary losses disabled during this comparison.
