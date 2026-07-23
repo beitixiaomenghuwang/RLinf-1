@@ -490,6 +490,8 @@ def compute_task_advantage_metrics(data_buffer: dict, num_tasks: int) -> dict:
     means per-task sample counts are uneven, large ``task_advantage/std_cv``
     means per-task advantage scale is uneven.
     """
+    from rlinf.scheduler.worker.worker import Worker
+
     forward_inputs = data_buffer.get("forward_inputs", {}) or {}
     task_ids = forward_inputs.get("task_ids", None)
     advantages = data_buffer.get("advantages", None)
@@ -499,6 +501,9 @@ def compute_task_advantage_metrics(data_buffer: dict, num_tasks: int) -> dict:
     stats = _accumulate_task_advantage_stats(
         task_ids, advantages, data_buffer.get("loss_mask", None), num_tasks
     )
+    # The rollout batch may still live on CPU at this point; all_reduce requires
+    # a device the process group's backend (e.g. NCCL) supports.
+    stats = stats.to(Worker.torch_platform.current_device())
     torch.distributed.all_reduce(stats, op=torch.distributed.ReduceOp.SUM)
     return _finalize_task_advantage_metrics(stats, num_tasks)
 
