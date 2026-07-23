@@ -1118,29 +1118,47 @@ Deliberate expansion beyond the single-block ablation, requested before the
 last-block result was matched-evaluated against action-only step 180. Same
 upgrade order as 9.8 (load step-180 action GSE, freeze it, add zero-output VLM
 GSE) but with `layer_indices=[-4,-3,-2,-1]` (language layers 14-17) instead of
-`[-1]`, four times as many wrapped VLM projections (28 instead of 7), same
-per-layer `total_rank=16`/`num_experts=4`/`num_generalized_experts=1`/`top_k=2`.
-Config lives in a dedicated profile,
+`[-1]`, four times as many wrapped VLM projections (28 instead of 7). Config
+lives in a dedicated profile,
 `examples/embodiment/config/metaworld_50_ppo_openpi_pi05_gse_vlm_last4.yaml`,
 rather than CLI-only overrides, since it is meant to be reused directly.
 
-This run uses the full eight-GPU cluster (`component_placement: all`, no
-`CUDA_VISIBLE_DEVICES` restriction needed), and keeps the same
-`env.train`/`env.eval` sizing already validated for eight-GPU action-only GSE
-training and evaluation (`total_num_envs=64`, `rollout_epoch=8` for training;
-`total_num_envs=500`, `rollout_epoch=1` for eval, matching the established
-512-trajectory protocol) — so, unlike the six-GPU single-layer ablation, its
-eval numbers can be compared directly against the three-seed action-only
-baseline without a separate matched re-eval.
+Rank was deliberately raised beyond a literal copy of the single-block
+ablation's hyperparameters. The single-block run used
+`total_rank=16`/`num_experts=4`/`num_generalized_experts=1`/`top_k=2`, which
+splits to rank 4 per expert (`16 / 4`) — about 0.2% of the VLM's
+`hidden_size=2048` and too small to be confident that a null result reflects
+the method rather than insufficient capacity. This config instead uses
+`total_rank=64`/`lora_alpha=64.0`, matching the action expert's own GSE
+capacity (the action expert relies on the unmodified `GSEConfig` defaults of
+the same values), keeping `num_experts=4`/`num_generalized_experts=1`/`top_k=2`
+unchanged. That splits to rank 16 per expert; with the always-active
+generalized expert plus the two routed specialized experts selected by
+`top_k=2`, the effective active rank in any one forward pass is `3 * 16 = 48`
+out of a rank-64 capacity pool. `lora_alpha` scales with `total_rank` so
+`scaling = lora_alpha / total_rank = 1.0` stays the same ratio as the
+single-block ablation and the action expert, rather than implicitly
+attenuating the larger rank.
 
-Wrapping four VLM blocks instead of one roughly quadruples the extra
-activation memory the actor's forward/backward pass carries for VLM GSE, on
-top of the same per-GPU memory pressure that already forced
-`micro_batch_size=64` (down from the default 128) for the single-layer
-ablation on six GPUs. The new config starts conservatively at
-`actor.micro_batch_size=32`; treat this as an untested guess, not a validated
-value — confirm with a `max_epochs=2` smoke run before trusting a full run, and
-raise it back toward 64 only if that smoke run shows headroom.
+Trainable VLM-GSE parameters scale with `total_rank` for the expert factors
+plus a `total_rank`-independent router term per projection
+(`total_rank * (in_features + out_features) + 3 * in_features`, three routed
+experts, no router bias); the single-block ablation's documented 1,175,552
+figure at `total_rank=16` and this config's `total_rank=64` both reproduce
+exactly from that formula given Gemma-2B's per-projection dimensions. One
+`total_rank=64` layer has 4,444,160 trainable VLM-GSE parameters (not a clean
+4x of the rank-16 figure, since the router term does not scale with rank);
+four layers give 17,776,640, plus the unchanged value head (~1.21M), for about
+19M total trainable parameters — still under 1% of the frozen ~3B backbone.
+
+Wrapping four VLM blocks at 4x the per-expert rank of the single-layer
+ablation multiplies per-GPU activation memory well beyond the single-layer
+ablation, which already OOMed at `micro_batch_size=128` on six GPUs and
+required 64. The new config starts conservatively at
+`actor.micro_batch_size=16`; treat this as an untested guess, not a validated
+value — confirm with a `max_epochs=2` smoke run before trusting a full run,
+raise toward 32 only if that smoke run shows headroom, and drop to 8 if 16
+still OOMs.
 
 Run inside the OpenPI Docker shell:
 
@@ -1168,8 +1186,8 @@ python examples/embodiment/train_embodied_agent.py \
 # Verify startup logs report 126 frozen action GSE layers plus 28 trainable
 # VLM GSE layers (four blocks x seven projections), action-GSE trainable
 # parameters are zero, and the first two PPO updates have finite gradients
-# before continuing. If step 3 (micro_batch_size=32) OOMs in the actor
-# forward/backward, drop to 16 and repeat the smoke test.
+# before continuing. If step 3 (micro_batch_size=16) OOMs in the actor
+# forward/backward, drop to 8 and repeat the smoke test.
 
 python examples/embodiment/train_embodied_agent.py \
   --config-path /workspace/RLinf/examples/embodiment/config \
@@ -1218,11 +1236,14 @@ expanding the VLM further.
 
 A second, deliberately expanded experiment was added on top of this one before
 its matched-evaluation result came back: `gse-action180-vlm-last4-seed42`
-(9.11), which widens `layer_indices` from `[-1]` to `[-4,-3,-2,-1]` and moves
-from a six-GPU constrained placement to the full eight-GPU cluster. Its
-`actor.micro_batch_size=32` is an untested guess based on the four-block
-memory increase over the single-block ablation, not a validated value — run
-the `max_epochs=2` smoke test in 9.11 before trusting a full run. Evaluate it
+(9.11), which widens `layer_indices` from `[-1]` to `[-4,-3,-2,-1]`, raises
+`total_rank` from 16 to 64 (matching the action expert's own GSE capacity,
+judged necessary since rank 4 per expert was too small to trust a null result
+as a capacity-independent finding), and moves from a six-GPU constrained
+placement to the full eight-GPU cluster. Its `actor.micro_batch_size=16` is an
+untested guess based on the combined four-block-count and 4x-rank memory
+increase over the single-block ablation, not a validated value — run the
+`max_epochs=2` smoke test in 9.11 before trusting a full run. Evaluate it
 against action-only step 180 using the established 512-trajectory eight-GPU
 protocol, same as any other eight-GPU candidate.
 

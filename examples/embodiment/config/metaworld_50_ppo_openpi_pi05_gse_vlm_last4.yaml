@@ -125,12 +125,14 @@ actor:
   group_name: "ActorGroup"
   training_backend: "fsdp"
   # VLM GSE across four language blocks (28 wrapped projections instead of 7)
-  # roughly quadruples per-GPU activation memory from the single-layer
-  # ablation, which already OOMed at micro_batch_size=128 on six GPUs and
-  # required 64. Start conservative at 32 and confirm with the max_epochs=2
-  # smoke run before trusting the full 60-step run; raise back toward 64 only
-  # if the smoke run shows headroom.
-  micro_batch_size: 32
+  # at 4x the per-expert rank of the single-layer ablation (total_rank raised
+  # to match the action expert's own capacity, see below) multiplies per-GPU
+  # activation memory well beyond the single-layer ablation, which already
+  # OOMed at micro_batch_size=128 on six GPUs and required 64. Start
+  # conservative at 16 and confirm with the max_epochs=2 smoke run before
+  # trusting the full 60-step run; raise toward 32 only if the smoke run shows
+  # headroom, and drop to 8 if 16 still OOMs.
+  micro_batch_size: 16
   global_batch_size: 2048
   seed: 42
   enable_offload: False
@@ -161,12 +163,19 @@ actor:
       vlm:
         enabled: True
         # Last four language blocks (was layer_indices=[-1] only, HANDOFF.md
-        # 9.8/9.9); everything else about the recipe is unchanged.
+        # 9.8/9.9).
         layer_indices: [-4, -3, -2, -1]
         target_modules:
           [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
-        total_rank: 16
-        lora_alpha: 16.0
+        # Raised from the single-layer ablation's total_rank=16 to match the
+        # action expert's own GSE capacity (action expert relies on the
+        # GSEConfig defaults total_rank=64/lora_alpha=64.0); rank 16 (4 per
+        # expert) was judged too small relative to hidden_size=2048 to show a
+        # clear effect in only 60 steps. lora_alpha scales with total_rank to
+        # keep scaling=lora_alpha/total_rank=1.0, same ratio as the
+        # single-layer ablation and the action expert.
+        total_rank: 64
+        lora_alpha: 64.0
         num_experts: 4
         num_generalized_experts: 1
         top_k: 2
