@@ -69,6 +69,12 @@ algorithm:
   rewards_lower_bound: 0.1
   rewards_upper_bound: 0.9
 
+  # Diagnostic only: log per-task (MT50) PPO sample counts and advantage
+  # mean/std, to decide between tail-task loss weighting and per-task
+  # advantage normalization. Does not affect the training objective.
+  log_task_advantage_metrics: True
+  task_advantage_num_tasks: 50
+
 env:
   group_name: "EnvGroup"
   train:

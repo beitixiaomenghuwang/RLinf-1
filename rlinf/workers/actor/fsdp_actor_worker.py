@@ -69,6 +69,7 @@ from rlinf.utils.metric_utils import (
     compute_loss_mask,
     compute_rollout_metrics,
     compute_split_num,
+    compute_task_advantage_metrics,
     scalar_metrics_to_python,
 )
 from rlinf.utils.nested_dict_process import (
@@ -1278,6 +1279,18 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             self.rollout_batch.update({"loss_mask_sum": kwargs["loss_mask_sum"]})
 
         rollout_metrics = compute_rollout_metrics(self.rollout_batch)
+        if self.cfg.algorithm.get("log_task_advantage_metrics", False):
+            num_tasks = self.cfg.algorithm.get("task_advantage_num_tasks")
+            if num_tasks is None:
+                raise ValueError(
+                    "algorithm.task_advantage_num_tasks is required when "
+                    "algorithm.log_task_advantage_metrics=True"
+                )
+            rollout_metrics.update(
+                compute_task_advantage_metrics(
+                    self.rollout_batch, num_tasks=int(num_tasks)
+                )
+            )
         return rollout_metrics
 
     def _build_sft_data_loader(self):

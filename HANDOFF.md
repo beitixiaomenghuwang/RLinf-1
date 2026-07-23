@@ -943,6 +943,30 @@ time, keeping step-180 GSE as the reference:
 
 1. Add task-wise advantage normalization or capped tail-task weighting to address
    task imbalance; first log per-task counts and advantage scales.
+
+   The logging is implemented: set `algorithm.log_task_advantage_metrics: True`
+   and `algorithm.task_advantage_num_tasks: 50` (already enabled by default in
+   `examples/embodiment/config/metaworld_50_ppo_openpi_pi05_gse.yaml`) to emit,
+   once per global step from `compute_advantages_and_returns`
+   (`rlinf/workers/actor/fsdp_actor_worker.py`), per-task PPO sample counts and
+   advantage mean/std (`rollout/task_advantage/task_XX/{count,mean,std}` in
+   `metrics.jsonl`; per-task keys are suppressed from the terminal table, only
+   the summary scalars print). Decision rule from the two summary scalars:
+   - Large `rollout/task_advantage/count_cv` (coefficient of variation of
+     per-task counts) → per-task sample counts are uneven → prefer **tail-task
+     loss weighting**.
+   - Large `rollout/task_advantage/std_cv` (coefficient of variation of
+     per-task advantage std) while `count_cv` is small → per-task advantage
+     *scale* differs, not just sample count → prefer **per-task advantage
+     normalization**.
+   - Both large → consider combining the two.
+   This requires a live rollout batch, so it was not present in the two
+   already-completed VLM-GSE evaluations (step 30/step 60); read it from the
+   next training run's `metrics.jsonl` before picking between the two options.
+   Implementation: `rlinf/utils/metric_utils.py`
+   (`compute_task_advantage_metrics`/`_accumulate_task_advantage_stats`/
+   `_finalize_task_advantage_metrics`), unit-tested in
+   `tests/unit_tests/test_task_advantage_metrics.py`.
 2. Compare action-expert GSE against a parameter-matched plain LoRA and a
    no-router multi-expert residual. This isolates the value of orthogonality and
    routing before changing the VLM.

@@ -374,6 +374,135 @@ def compute_rollout_metrics(data_buffer: dict) -> dict:
     return rollout_metrics
 
 
+def _accumulate_task_advantage_stats(
+    task_ids: torch.Tensor,
+    advantages: torch.Tensor,
+    loss_mask: torch.Tensor | None,
+    num_tasks: int,
+) -> torch.Tensor:
+    """Scatter per-sample advantages into per-task sufficient statistics.
+
+    Returns a local (unreduced) ``[num_tasks, 3]`` tensor of
+    ``(count, advantage_sum, advantage_sumsq)`` per task, safe to sum across
+    micro-batches and distributed ranks before computing per-task mean/std.
+    """
+    if num_tasks <= 0:
+        raise ValueError("num_tasks must be positive")
+    task_ids = task_ids.detach().reshape(-1).to(torch.long)
+    advantages = advantages.detach().reshape(-1).to(torch.float32)
+    if task_ids.numel() != advantages.numel():
+        raise ValueError(
+            "task_ids and advantages must have the same number of elements, got "
+            f"{task_ids.numel()} and {advantages.numel()}"
+        )
+    device = advantages.device
+    task_ids = task_ids.to(device)
+    if task_ids.numel() > 0 and torch.any((task_ids < 0) | (task_ids >= num_tasks)):
+        raise ValueError(f"task_ids must be in [0, {num_tasks})")
+
+    if loss_mask is not None:
+        mask = loss_mask.detach().reshape(-1).to(device=device, dtype=torch.bool)
+        if mask.numel() != advantages.numel():
+            raise ValueError(
+                "loss_mask must have the same number of elements as advantages, "
+                f"got {mask.numel()} and {advantages.numel()}"
+            )
+        task_ids = task_ids[mask]
+        advantages = advantages[mask]
+
+    stats = torch.zeros(num_tasks, 3, device=device, dtype=torch.float32)
+    if task_ids.numel() == 0:
+        return stats
+    stats[:, 0].index_add_(0, task_ids, torch.ones_like(advantages))
+    stats[:, 1].index_add_(0, task_ids, advantages)
+    stats[:, 2].index_add_(0, task_ids, advantages * advantages)
+    return stats
+
+
+def _finalize_task_advantage_metrics(
+    stats: torch.Tensor, num_tasks: int
+) -> dict[str, float]:
+    """Convert globally summed per-task advantage statistics into metrics."""
+    counts = stats[:, 0]
+    sums = stats[:, 1]
+    sumsqs = stats[:, 2]
+
+    metrics: dict[str, float] = {}
+    covered_counts = []
+    covered_means = []
+    covered_stds = []
+    for task_index in range(num_tasks):
+        count = float(counts[task_index].item())
+        if count <= 0:
+            continue
+        mean = float(sums[task_index].item()) / count
+        variance = max(float(sumsqs[task_index].item()) / count - mean * mean, 0.0)
+        std = math.sqrt(variance)
+        metrics[f"task_advantage/task_{task_index:02d}/count"] = count
+        metrics[f"task_advantage/task_{task_index:02d}/mean"] = mean
+        metrics[f"task_advantage/task_{task_index:02d}/std"] = std
+        covered_counts.append(count)
+        covered_means.append(mean)
+        covered_stds.append(std)
+
+    if not covered_counts:
+        return {}
+
+    counts_tensor = torch.tensor(covered_counts, dtype=torch.float64)
+    means_tensor = torch.tensor(covered_means, dtype=torch.float64)
+    stds_tensor = torch.tensor(covered_stds, dtype=torch.float64)
+
+    counts_mean = float(counts_tensor.mean())
+    stds_mean = float(stds_tensor.mean())
+    metrics.update(
+        {
+            "task_advantage/covered_tasks": float(len(covered_counts)),
+            "task_advantage/count_min": float(counts_tensor.min()),
+            "task_advantage/count_max": float(counts_tensor.max()),
+            "task_advantage/count_mean": counts_mean,
+            "task_advantage/mean_min": float(means_tensor.min()),
+            "task_advantage/mean_max": float(means_tensor.max()),
+            "task_advantage/std_min": float(stds_tensor.min()),
+            "task_advantage/std_max": float(stds_tensor.max()),
+            "task_advantage/std_mean": stds_mean,
+            # Coefficient of variation across tasks: large count_cv indicates
+            # uneven per-task sample counts (evidence for tail-task loss
+            # weighting); large std_cv with small count_cv indicates uneven
+            # per-task advantage scale (evidence for per-task advantage
+            # normalization).
+            "task_advantage/count_cv": float(counts_tensor.std(unbiased=False))
+            / counts_mean
+            if counts_mean > 0
+            else 0.0,
+            "task_advantage/std_cv": float(stds_tensor.std(unbiased=False)) / stds_mean
+            if stds_mean > 0
+            else 0.0,
+        }
+    )
+    return metrics
+
+
+def compute_task_advantage_metrics(data_buffer: dict, num_tasks: int) -> dict:
+    """Log per-task PPO sample counts and advantage mean/std.
+
+    Diagnostic for deciding between tail-task loss weighting and per-task
+    advantage normalization on MetaWorld MT50: large ``task_advantage/count_cv``
+    means per-task sample counts are uneven, large ``task_advantage/std_cv``
+    means per-task advantage scale is uneven.
+    """
+    forward_inputs = data_buffer.get("forward_inputs", {}) or {}
+    task_ids = forward_inputs.get("task_ids", None)
+    advantages = data_buffer.get("advantages", None)
+    if task_ids is None or advantages is None:
+        return {}
+
+    stats = _accumulate_task_advantage_stats(
+        task_ids, advantages, data_buffer.get("loss_mask", None), num_tasks
+    )
+    torch.distributed.all_reduce(stats, op=torch.distributed.ReduceOp.SUM)
+    return _finalize_task_advantage_metrics(stats, num_tasks)
+
+
 def append_to_dict(data, new_data):
     for key, val in new_data.items():
         if key not in data:
@@ -542,6 +671,10 @@ def print_metrics_table(
                 "replay_buffer": "Replay Buffer",
             }
             if category in category_map:
+                if category == "rollout" and metric_name.startswith(
+                    "task_advantage/task_"
+                ):
+                    continue
                 categories[category_map[category]][metric_name] = value
             elif category == "train":
                 if metric_name.startswith("gse/task_router/task_"):
