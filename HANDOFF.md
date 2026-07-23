@@ -1112,6 +1112,92 @@ transfer relative to SFT, environment steps, trainable parameters, optimizer
 memory, peak GPU memory, and wall time. Include held-out visual/state perturbation
 tests if making a generalization claim.
 
+### 9.11 Eight-GPU VLM-last-four-layers run
+
+Deliberate expansion beyond the single-block ablation, requested before the
+last-block result was matched-evaluated against action-only step 180. Same
+upgrade order as 9.8 (load step-180 action GSE, freeze it, add zero-output VLM
+GSE) but with `layer_indices=[-4,-3,-2,-1]` (language layers 14-17) instead of
+`[-1]`, four times as many wrapped VLM projections (28 instead of 7), same
+per-layer `total_rank=16`/`num_experts=4`/`num_generalized_experts=1`/`top_k=2`.
+Config lives in a dedicated profile,
+`examples/embodiment/config/metaworld_50_ppo_openpi_pi05_gse_vlm_last4.yaml`,
+rather than CLI-only overrides, since it is meant to be reused directly.
+
+This run uses the full eight-GPU cluster (`component_placement: all`, no
+`CUDA_VISIBLE_DEVICES` restriction needed), and keeps the same
+`env.train`/`env.eval` sizing already validated for eight-GPU action-only GSE
+training and evaluation (`total_num_envs=64`, `rollout_epoch=8` for training;
+`total_num_envs=500`, `rollout_epoch=1` for eval, matching the established
+512-trajectory protocol) — so, unlike the six-GPU single-layer ablation, its
+eval numbers can be compared directly against the three-seed action-only
+baseline without a separate matched re-eval.
+
+Wrapping four VLM blocks instead of one roughly quadruples the extra
+activation memory the actor's forward/backward pass carries for VLM GSE, on
+top of the same per-GPU memory pressure that already forced
+`micro_batch_size=64` (down from the default 128) for the single-layer
+ablation on six GPUs. The new config starts conservatively at
+`actor.micro_batch_size=32`; treat this as an untested guess, not a validated
+value — confirm with a `max_epochs=2` smoke run before trusting a full run, and
+raise it back toward 64 only if that smoke run shows headroom.
+
+Run inside the OpenPI Docker shell:
+
+```bash
+export ACTION_CKPT=/workspace/output/gse-formal-seed42/gse_formal_seed42/checkpoints/global_step_180
+test -f "$ACTION_CKPT/actor/model_state_dict/full_weights.pt"
+export RUN_DIR=/workspace/output/gse-action180-vlm-last4-seed42
+export EXP_NAME=gse_action180_vlm_last4_seed42
+mkdir -p "$RUN_DIR"
+
+# Smoke test first: same command, max_epochs=2, save/val checks disabled.
+python examples/embodiment/train_embodied_agent.py \
+  --config-path /workspace/RLinf/examples/embodiment/config \
+  --config-name metaworld_50_ppo_openpi_pi05_gse_vlm_last4 \
+  actor.model.model_path="$ACTION_CKPT/actor" \
+  rollout.model.model_path="$ACTION_CKPT/actor" \
+  actor.model.openpi_data.norm_stats_path=/workspace/models/RLinf-Pi05-MetaWorld-SFT/lerobot/metaworld_mt50/norm_stats.json \
+  runner.logger.log_path="$RUN_DIR" \
+  runner.logger.experiment_name="${EXP_NAME}_smoke" \
+  runner.max_epochs=2 \
+  runner.save_interval=-1 \
+  runner.val_check_interval=-1 \
+  2>&1 | tee -a "$RUN_DIR/smoke_console.log"
+
+# Verify startup logs report 126 frozen action GSE layers plus 28 trainable
+# VLM GSE layers (four blocks x seven projections), action-GSE trainable
+# parameters are zero, and the first two PPO updates have finite gradients
+# before continuing. If step 3 (micro_batch_size=32) OOMs in the actor
+# forward/backward, drop to 16 and repeat the smoke test.
+
+python examples/embodiment/train_embodied_agent.py \
+  --config-path /workspace/RLinf/examples/embodiment/config \
+  --config-name metaworld_50_ppo_openpi_pi05_gse_vlm_last4 \
+  actor.model.model_path="$ACTION_CKPT/actor" \
+  rollout.model.model_path="$ACTION_CKPT/actor" \
+  actor.model.openpi_data.norm_stats_path=/workspace/models/RLinf-Pi05-MetaWorld-SFT/lerobot/metaworld_mt50/norm_stats.json \
+  runner.logger.log_path="$RUN_DIR" \
+  runner.logger.experiment_name="$EXP_NAME" \
+  actor.seed=42 \
+  rollout.seed=42 \
+  2>&1 | tee -a "$RUN_DIR/console.log"
+```
+
+To resume this run itself after an interruption (not to reload the action-180
+base weights again — `actor.model.model_path`/`rollout.model.model_path`
+already handle that on first launch), export `CKPT` to this run's own
+checkpoint directory and add `runner.resume_dir="$CKPT"` on the same command.
+
+Compare the selected checkpoint against action-only step 180 with identical
+seeds, fixed resets, and the 512-trajectory eight-GPU protocol, using the same
+success bar as 9.9/11.2: improve macro success or materially improve worst-10
+without a meaningful macro regression. This run does not wait on the
+single-layer ablation's result; if it also fails to clear the bar, fall back to
+the standing recommendation in 11.2 item 6 (diagnose paired task regressions
+and router skew, then try task-wise advantage normalization) rather than
+expanding the VLM further.
+
 ## 10. Development cautions
 
 - Read the repository-root `AGENTS.md` before editing.
@@ -1130,7 +1216,18 @@ tests if making a generalization claim.
 
 ### 11.1 Current run state
 
-The active experiment is `gse-action180-vlm-last-seed42`. It starts from the
+A second, deliberately expanded experiment was added on top of this one before
+its matched-evaluation result came back: `gse-action180-vlm-last4-seed42`
+(9.11), which widens `layer_indices` from `[-1]` to `[-4,-3,-2,-1]` and moves
+from a six-GPU constrained placement to the full eight-GPU cluster. Its
+`actor.micro_batch_size=32` is an untested guess based on the four-block
+memory increase over the single-block ablation, not a validated value — run
+the `max_epochs=2` smoke test in 9.11 before trusting a full run. Evaluate it
+against action-only step 180 using the established 512-trajectory eight-GPU
+protocol, same as any other eight-GPU candidate.
+
+The first (six-GPU, single-block) active experiment is
+`gse-action180-vlm-last-seed42`. It starts from the
 selected action-GSE step-180 checkpoint, freezes all action adapters, and trains
 the seven GSE-wrapped projections in VLM language layer 17 plus the value head.
 The six-GPU run uses explicit placement on ranks 0-5, 192 trajectories per
