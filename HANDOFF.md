@@ -1192,11 +1192,21 @@ python examples/embodiment/train_embodied_agent.py \
 python examples/embodiment/train_embodied_agent.py \
   --config-path /workspace/RLinf/examples/embodiment/config \
   --config-name metaworld_50_ppo_openpi_pi05_gse_vlm_last4 \
+  env.train.total_num_envs=256 \
+  env.train.rollout_epoch=1 \
   actor.model.model_path="$ACTION_CKPT/actor" \
+  actor.micro_batch_size=128 \
+  actor.global_batch_size=1024 \
+  env.eval.total_num_envs=512 \
   rollout.model.model_path="$ACTION_CKPT/actor" \
   actor.model.openpi_data.norm_stats_path=/workspace/models/RLinf-Pi05-MetaWorld-SFT/lerobot/metaworld_mt50/norm_stats.json \
+  runner.resume_dir=null \
   runner.logger.log_path="$RUN_DIR" \
   runner.logger.experiment_name="$EXP_NAME" \
+  runner.max_epochs=20 \
+  runner.save_interval=10 \
+  runner.val_check_interval=10 \
+  runner.max_checkpoints_to_keep=4 \
   actor.seed=42 \
   rollout.seed=42 \
   2>&1 | tee -a "$RUN_DIR/console.log"

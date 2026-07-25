@@ -31,7 +31,7 @@ runner:
   # Bounded ablation run, not open-ended training: same scale as the six-GPU
   # single-layer VLM-GSE ablation (HANDOFF.md 9.9), enough steps to see whether
   # matched evaluation against action-only step 180 moves at all.
-  max_epochs: 60
+  max_epochs: 20
   max_steps: -1
 
   only_eval: False
