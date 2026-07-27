@@ -35,6 +35,11 @@ def get_model(cfg: DictConfig, torch_dtype=None):
         state_dict_contains_gse,
         state_dict_contains_vlm_gse,
     )
+    from rlinf.models.embodiment.openpi.lora import (
+        configure_openpi_action_lora,
+        is_action_lora_enabled,
+        state_dict_contains_action_lora,
+    )
     from rlinf.models.embodiment.openpi.openpi_action_model import (
         OpenPi0Config,
         OpenPi0ForRLActionPrediction,
@@ -56,6 +61,7 @@ def get_model(cfg: DictConfig, torch_dtype=None):
 
     gse_config = cfg.get("gse", None)
     gse_enabled = is_gse_enabled(gse_config)
+    action_lora_enabled = is_action_lora_enabled(cfg)
     if gse_enabled and cfg.get("is_lora", False):
         raise ValueError("OpenPI GSE and LoRA cannot be enabled at the same time")
 
@@ -99,6 +105,14 @@ def get_model(cfg: DictConfig, torch_dtype=None):
 
     checkpoint_has_gse = state_dict_contains_gse(model_state_dict)
     checkpoint_has_vlm_gse = state_dict_contains_vlm_gse(model_state_dict)
+    checkpoint_has_action_lora = state_dict_contains_action_lora(model_state_dict)
+    if checkpoint_has_gse and checkpoint_has_action_lora:
+        raise ValueError("The checkpoint cannot contain both GSE and action LoRA")
+    if checkpoint_has_action_lora and not action_lora_enabled:
+        raise ValueError(
+            "The checkpoint contains action LoRA parameters, but "
+            "is_lora=true and lora_target=action_expert are not configured"
+        )
     vlm_gse_enabled = is_gse_enabled(
         gse_config.get("vlm", None) if gse_config is not None else None
     )
@@ -122,6 +136,8 @@ def get_model(cfg: DictConfig, torch_dtype=None):
             configure_openpi_gse(model, action_only_config)
         else:
             configure_openpi_gse(model, gse_config)
+    elif checkpoint_has_action_lora:
+        configure_openpi_action_lora(model, cfg)
 
     model.load_state_dict(model_state_dict, strict=False)
     del model_state_dict
@@ -136,6 +152,8 @@ def get_model(cfg: DictConfig, torch_dtype=None):
     model.paligemma_with_expert.to_bfloat16_for_selected_params("bfloat16")
     if gse_enabled and not checkpoint_has_gse:
         configure_openpi_gse(model, gse_config)
+    if action_lora_enabled and not checkpoint_has_action_lora:
+        configure_openpi_action_lora(model, cfg)
     # fsdp replace
     # model.paligemma_with_expert.replace_gemma_decoder_layers()
     # load data stats
