@@ -456,6 +456,9 @@ matched trajectory counts, seeds, GPU placement, and RL environment-step budgets
 
 ## 6. Eval-only behavior and reproducible evaluation
 
+All commands in Sections 6 and 9 assume that the Docker shell has first been
+initialized as described in Section 7, including the `WANDB_OVERRIDES` array.
+
 ### 6.1 Critical loading rule
 
 With `runner.only_eval=True`:
@@ -497,6 +500,7 @@ python examples/embodiment/train_embodied_agent.py \
   env.eval.total_num_envs=512 \
   env.eval.use_fixed_reset_state_ids=True \
   env.eval.is_eval=True \
+  "${WANDB_OVERRIDES[@]}" \
   2>&1 | tee "$RUN_DIR/console.log"
 ```
 
@@ -536,6 +540,7 @@ python examples/embodiment/train_embodied_agent.py \
   env.eval.total_num_envs=512 \
   env.eval.use_fixed_reset_state_ids=True \
   env.eval.is_eval=True \
+  "${WANDB_OVERRIDES[@]}" \
   2>&1 | tee "$RUN_DIR/console.log"
 ```
 
@@ -587,6 +592,7 @@ python examples/embodiment/train_embodied_agent.py \
   env.eval.total_num_envs=512 \
   env.eval.use_fixed_reset_state_ids=True \
   env.eval.is_eval=True \
+  "${WANDB_OVERRIDES[@]}" \
   2>&1 | tee "$RUN_DIR/console.log"
 ```
 
@@ -604,6 +610,12 @@ export PI05_RL=/DATA/disk0/xueyang/model/RLinf-Pi05-MetaWorld-RL-FlowSDE
 export GSE_OUTPUT=/DATA/disk0/xueyang/model/pi05-gse
 export HF_CACHE=/home/xueyang/RLinf/cache/huggingface
 export RAY_SCRATCH=/DATA/disk0/xueyang/Data/rlinf-ray
+# Set these in the host shell before starting Docker. Never write the API key
+# into this repository, a command file, or a committed YAML file.
+export WANDB_ENTITY=your-wandb-entity  # Replace with the W&B user or team name.
+export WANDB_PROJECT=pi05-multitask-peft-rl
+export WANDB_MODE=online
+: "${WANDB_API_KEY:?Export WANDB_API_KEY in the host shell before starting Docker}"
 mkdir -p \
   "$GSE_OUTPUT" \
   "$HF_CACHE" \
@@ -630,6 +642,10 @@ docker run -it --rm   --privileged \
   -e RLINF_RAY_TEMP_DIR=/workspace/ray/session \
   -e RLINF_RAY_OBJECT_SPILL_DIR=/workspace/ray/spill \
   -e TMPDIR=/workspace/ray/tmp \
+  -e WANDB_API_KEY \
+  -e WANDB_ENTITY \
+  -e WANDB_PROJECT \
+  -e WANDB_MODE \
   -v "$RLINF_REPO":/workspace/RLinf \
   -v "$PI05_SFT":/workspace/models/RLinf-Pi05-MetaWorld-SFT:ro \
   -v "$PI05_RL":/workspace/models/RLinf-Pi05-MetaWorld-RL-FlowSDE:ro \
@@ -652,7 +668,30 @@ export PYTHONPATH=/workspace/RLinf:${PYTHONPATH:-}
 export MUJOCO_GL=egl
 export PYOPENGL_PLATFORM=egl
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+
+# Append this array to every paper training and evaluation command. Keep
+# TensorBoard enabled as a local backup while also streaming all scalar metrics
+# and the resolved config to W&B.
+WANDB_OVERRIDES=(
+  'runner.logger.logger_backends=[tensorboard,wandb]'
+  "runner.logger.project_name=${WANDB_PROJECT}"
+  "+runner.logger.wandb_entity=${WANDB_ENTITY}"
+)
+
+if [[ "${WANDB_MODE}" == "online" ]]; then
+  wandb status
+fi
 ```
+
+Use a unique `runner.logger.experiment_name` for every method, training seed,
+checkpoint, and evaluation seed. W&B uses this value as the run name. Keep
+`runner.logger.log_path` unique as well so TensorBoard, `metrics.jsonl`, W&B
+metadata, and console logs cannot overwrite another run. If the server loses
+network access, set `WANDB_MODE=offline` before starting Docker; after the run,
+sync the generated directory with `wandb sync "$RUN_DIR"/wandb/wandb/offline-run-*`.
+W&B is a visualization and comparison backend, not the sole result store:
+`metrics.jsonl`, checkpoints, the resolved config, and multi-seed summaries
+remain the paper's source of truth.
 
 ### Docker space issue
 
@@ -808,6 +847,7 @@ python examples/embodiment/train_embodied_agent.py \
   actor.optim.total_training_steps=6400 \
   actor.seed=42 \
   rollout.seed=42 \
+  "${WANDB_OVERRIDES[@]}" \
   2>&1 | tee "$RUN_DIR/console.log"
 ```
 
@@ -840,6 +880,15 @@ TensorBoard:
 ```bash
 tensorboard --logdir "$RUN_DIR/tensorboard" --host 0.0.0.0 --port 6006
 ```
+
+W&B should show the same scalar namespaces as TensorBoard and
+`metrics.jsonl`: `env/*`, `rollout/*`, `train/*`, `eval/*`, and `time/*`.
+Immediately after the first global step, verify that the W&B run contains
+`env/success_once`, `rollout/rewards`, `train/actor/approx_kl`,
+`train/critic/explained_variance`, and `time/step`. For GSE runs, also verify
+`train/gse/router/normalized_entropy` and `train/gse/task_router/nmi`. A missing
+namespace usually means the wrong Hydra overrides or config profile was used;
+do not continue a long run until it is resolved.
 
 Compact exact metrics without relying on truncated terminal columns:
 
@@ -925,6 +974,7 @@ for SEED in 42 43 44; do
     env.eval.total_num_envs=512 \
     env.eval.use_fixed_reset_state_ids=True \
     env.eval.is_eval=True \
+    "${WANDB_OVERRIDES[@]}" \
     2>&1 | tee "$RUN_DIR/console.log"
 done
 
@@ -1055,90 +1105,6 @@ residual difference is exactly zero. Router metrics are separated into
 `gse/action_router/*` and `gse/vlm_router/*`; legacy `gse/router/*` continues to
 refer to action adapters.
 
-### 9.9 Six-GPU VLM-GSE run
-
-This explicitly places actor, environment, and rollout workers on GPU ranks 0-5;
-`CUDA_VISIBLE_DEVICES` alone does not reduce the world size when the connected
-Ray cluster still advertises eight GPUs. Use 192 train environments so each of
-six rollout replicas receives batch 32. One rollout epoch produces 3,840 PPO
-samples; actor global batch 768 gives five minibatches and is divisible by
-`128 * 6`. Evaluation uses 600 trajectories, exactly 12 per MT50 task and
-divisible by six.
-
-Run inside the OpenPI Docker shell without adding a YAML profile:
-
-```bash
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5
-export ACTION_CKPT=/workspace/output/gse-formal-seed42/gse_formal_seed42/checkpoints/global_step_180
-test -f "$ACTION_CKPT/actor/model_state_dict/full_weights.pt"
-export RUN_DIR=/workspace/output/gse-action180-vlm-last-seed42
-export EXP_NAME=gse_action180_vlm_last_seed42
-mkdir -p "$RUN_DIR"
-
-python examples/embodiment/train_embodied_agent.py \
-  --config-path /workspace/RLinf/examples/embodiment/config \
-  --config-name metaworld_50_ppo_openpi_pi05_gse \
-  'cluster.component_placement={actor\,env:0-5,rollout:0-5}' \
-  actor.model.model_path="$ACTION_CKPT/actor" \
-  rollout.model.model_path="$ACTION_CKPT/actor" \
-  '+actor.model.openpi_data.norm_stats_path=/workspace/models/RLinf-Pi05-MetaWorld-SFT/lerobot/metaworld_mt50/norm_stats.json' \
-  env.train.total_num_envs=192 \
-  env.train.rollout_epoch=1 \
-  env.eval.total_num_envs=96 \
-  env.eval.use_fixed_reset_state_ids=True \
-  env.eval.is_eval=True \
-  rollout.pipeline_stage_num=1 \
-  actor.micro_batch_size=64 \
-  actor.global_batch_size=768 \
-  +actor.model.gse.train_action_adapters=false \
-  +actor.model.gse.vlm.enabled=true \
-  '+actor.model.gse.vlm.layer_indices=[-1]' \
-  '+actor.model.gse.vlm.target_modules=[q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj]' \
-  +actor.model.gse.vlm.total_rank=16 \
-  +actor.model.gse.vlm.lora_alpha=16.0 \
-  +actor.model.gse.vlm.num_experts=4 \
-  +actor.model.gse.vlm.num_generalized_experts=1 \
-  +actor.model.gse.vlm.top_k=2 \
-  +actor.model.gse.vlm.init_seed=4200 \
-  runner.resume_dir="$CKPT" \
-  runner.logger.log_path="$RUN_DIR" \
-  runner.logger.experiment_name="$EXP_NAME" \
-  runner.max_epochs=60 \
-  runner.save_interval=10 \
-  runner.val_check_interval=10 \
-  runner.max_checkpoints_to_keep=4 \
-  actor.optim.lr=1e-5 \
-  actor.optim.value_lr=5e-5 \
-  actor.optim.lr_scheduler=constant \
-  actor.optim.total_training_steps=60 \
-  actor.seed=42 \
-  rollout.seed=42 \
-  2>&1 | tee -a "$RUN_DIR/console.log"
-```
-
-Before the 60-step run, use the same command with a fresh smoke `RUN_DIR`,
-`runner.max_epochs=2`, `runner.save_interval=-1`, and
-`runner.val_check_interval=-1`. Verify startup logs report 126 action plus seven
-VLM GSE layers, action-GSE trainable parameters are zero, and the first two PPO
-updates have finite gradients.
-
-During training, the Hugging Face rollout worker copies `actor.model`, so these
-actor-side GSE overrides also construct VLM GSE on every rollout replica. In
-eval-only mode this is different: the worker uses `rollout.model` directly, so
-mirror the complete action/VLM GSE configuration under `rollout.model.gse` when
-evaluating a saved joint checkpoint.
-
-Use the 600-trajectory evaluations only to rank checkpoints within this six-GPU
-run. Do not compare them numerically with the earlier 512-trajectory `72.72%`
-mean. For the final decision, evaluate action-only step 180 and the selected VLM
-checkpoint with identical seeds, fixed resets, and trajectory counts: use 600
-for both on six GPUs, or repeat the established 512-trajectory protocol for both
-on eight GPUs. Select VLM only if that matched comparison improves macro success
-or materially improves worst-10 without a macro regression. If the last-block
-ablation fails, do not expand the full VLM; next test task-wise advantage
-normalization. If it succeeds, compare action-only, VLM-only-on-action180, and
-joint action+VLM with separate learning rates before adding layer 16 or earlier
-blocks.
 
 ### 9.10 Current method summary
 
@@ -1236,6 +1202,7 @@ python examples/embodiment/train_embodied_agent.py \
   runner.max_epochs=2 \
   runner.save_interval=-1 \
   runner.val_check_interval=-1 \
+  "${WANDB_OVERRIDES[@]}" \
   2>&1 | tee -a "$RUN_DIR/smoke_console.log"
 
 # Verify startup logs report 126 frozen action GSE layers plus 28 trainable
@@ -1264,6 +1231,7 @@ python examples/embodiment/train_embodied_agent.py \
   runner.max_checkpoints_to_keep=4 \
   actor.seed=42 \
   rollout.seed=42 \
+  "${WANDB_OVERRIDES[@]}" \
   2>&1 | tee -a "$RUN_DIR/console.log"
 ```
 
@@ -1319,6 +1287,7 @@ python examples/embodiment/train_embodied_agent.py \
   actor.optim.total_training_steps=6400 \
   actor.seed=42 \
   rollout.seed=42 \
+  "${WANDB_OVERRIDES[@]}" \
   2>&1 | tee "$RUN_DIR/console.log"
 ```
 
@@ -1368,6 +1337,7 @@ python examples/embodiment/train_embodied_agent.py \
   env.eval.total_num_envs=448 \
   env.eval.use_fixed_reset_state_ids=True \
   env.eval.is_eval=True \
+  "${WANDB_OVERRIDES[@]}" \
   2>&1 | tee "$EVAL_DIR/console.log"
 ```
 
