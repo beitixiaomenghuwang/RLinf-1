@@ -612,7 +612,7 @@ export HF_CACHE=/home/xueyang/RLinf/cache/huggingface
 export RAY_SCRATCH=/DATA/disk0/xueyang/Data/rlinf-ray
 # Set these in the host shell before starting Docker. Never write the API key
 # into this repository, a command file, or a committed YAML file.
-export WANDB_ENTITY=your-wandb-entity  # Replace with the W&B user or team name.
+export WANDB_ENTITY=gxy1000h-jilin-university  # Replace with the W&B user or team name.
 export WANDB_PROJECT=pi05-multitask-peft-rl
 export WANDB_MODE=online
 : "${WANDB_API_KEY:?Export WANDB_API_KEY in the host shell before starting Docker}"
