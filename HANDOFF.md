@@ -752,11 +752,11 @@ on all changed Python files. Both the training config with task-conditioned
 router metrics and the GSE eval-only overrides in Section 6.3 resolved
 successfully in the same Docker image.
 
-On 2026-07-30, the three Section 9.13 launch scripts passed `bash -n` and
+On 2026-07-30, the three Section 9.13 config profiles and terminal overrides
 resolved successfully in `rlinf/rlinf:agentic-rlinf0.3-maniskill_libero` with
-their final command lines enforcing micro/global batch `16/1024`, SFT model
-paths, `runner.resume_dir=null`, and trainable action adapters. The focused GSE
-and OpenPI-GSE tests passed: `27 passed`.
+micro/global batch `16/1024`, SFT model paths, `runner.resume_dir=null`, and
+trainable action adapters. The focused GSE and OpenPI-GSE tests passed:
+`27 passed`.
 
 ### Task-conditioned router metrics
 
@@ -1371,53 +1371,129 @@ profile sets `total_rank=32` and `lora_alpha=32`, so eight experts receive rank
 4 each while preserving unit adapter scaling.
 
 The commands below assume the Docker initialization and `WANDB_OVERRIDES` from
-Section 7. The launch scripts explicitly enforce
-`actor.micro_batch_size=16` and `actor.global_batch_size=1024` and forward any
-additional Hydra overrides. Use one isolated eight-GPU job/container per command
-when launching them concurrently.
+Section 7. All important experiment parameters are expanded as terminal
+overrides so they can be edited in one place. Use one isolated eight-GPU
+job/container per command when launching them concurrently.
 
 Action-only rank 32:
 
 ```bash
-bash examples/embodiment/run_metaworld_gse_action_r32.sh \
-  "${WANDB_OVERRIDES[@]}"
+export SFT_MODEL=/workspace/models/RLinf-Pi05-MetaWorld-SFT
+export RUN_DIR=/workspace/output/gse-action-r32-seed42
+export EXP_NAME=gse_action_r32_seed42
+mkdir -p "$RUN_DIR"
+
+python examples/embodiment/train_embodied_agent.py \
+  --config-path /workspace/RLinf/examples/embodiment/config \
+  --config-name metaworld_50_ppo_openpi_pi05_gse_action_r32 \
+  env.train.total_num_envs=128 \
+  env.train.rollout_epoch=2 \
+  actor.micro_batch_size=16 \
+  actor.global_batch_size=1024 \
+  actor.model.model_path="$SFT_MODEL" \
+  rollout.model.model_path="$SFT_MODEL" \
+  actor.model.gse.total_rank=32 \
+  actor.model.gse.lora_alpha=32.0 \
+  actor.model.gse.train_action_adapters=True \
+  runner.resume_dir=null \
+  runner.logger.log_path="$RUN_DIR" \
+  runner.logger.experiment_name="$EXP_NAME" \
+  runner.max_epochs=320 \
+  runner.save_interval=20 \
+  runner.val_check_interval=20 \
+  runner.max_checkpoints_to_keep=4 \
+  env.eval.total_num_envs=512 \
+  actor.optim.lr=5e-5 \
+  actor.optim.total_training_steps=6400 \
+  actor.seed=42 \
+  rollout.seed=42 \
+  "${WANDB_OVERRIDES[@]}" \
+  2>&1 | tee "$RUN_DIR/console.log"
 ```
 
 Joint action + VLM-last4 from SFT:
 
 ```bash
-RUN_DIR=/workspace/output/gse-joint-vlm-last4-smoke \
-EXP_NAME=gse_joint_vlm_last4_smoke \
-bash examples/embodiment/run_metaworld_gse_joint_vlm_last4.sh \
-  runner.max_epochs=2 \
-  runner.save_interval=-1 \
-  runner.val_check_interval=-1 \
-  "${WANDB_OVERRIDES[@]}"
+export SFT_MODEL=/workspace/models/RLinf-Pi05-MetaWorld-SFT
+export RUN_DIR=/workspace/output/gse-joint-vlm-last4-seed42
+export EXP_NAME=gse_joint_vlm_last4_seed42
+mkdir -p "$RUN_DIR"
 
-# Launch the full run only after the smoke run is healthy.
-bash examples/embodiment/run_metaworld_gse_joint_vlm_last4.sh \
-  "${WANDB_OVERRIDES[@]}"
+python examples/embodiment/train_embodied_agent.py \
+  --config-path /workspace/RLinf/examples/embodiment/config \
+  --config-name metaworld_50_ppo_openpi_pi05_gse_joint_vlm_last4 \
+  env.train.total_num_envs=128 \
+  env.train.rollout_epoch=2 \
+  actor.micro_batch_size=16 \
+  actor.global_batch_size=1024 \
+  actor.model.model_path="$SFT_MODEL" \
+  rollout.model.model_path="$SFT_MODEL" \
+  actor.model.gse.train_action_adapters=True \
+  'actor.model.gse.vlm.layer_indices=[-4,-3,-2,-1]' \
+  actor.model.gse.vlm.total_rank=64 \
+  actor.model.gse.vlm.lora_alpha=64.0 \
+  runner.resume_dir=null \
+  runner.logger.log_path="$RUN_DIR" \
+  runner.logger.experiment_name="$EXP_NAME" \
+  runner.max_epochs=240 \
+  runner.save_interval=10 \
+  runner.val_check_interval=10 \
+  runner.max_checkpoints_to_keep=4 \
+  env.eval.total_num_envs=512 \
+  actor.optim.lr=1e-5 \
+  actor.optim.value_lr=5e-5 \
+  actor.optim.total_training_steps=240 \
+  actor.optim.lr_scheduler=constant \
+  actor.seed=42 \
+  rollout.seed=42 \
+  "${WANDB_OVERRIDES[@]}" \
+  2>&1 | tee "$RUN_DIR/console.log"
 ```
 
 Joint action + all 18 VLM language layers from SFT:
 
 ```bash
-RUN_DIR=/workspace/output/gse-joint-vlm-all-smoke \
-EXP_NAME=gse_joint_vlm_all_smoke \
-bash examples/embodiment/run_metaworld_gse_joint_vlm_all.sh \
-  runner.max_epochs=2 \
-  runner.save_interval=-1 \
-  runner.val_check_interval=-1 \
-  "${WANDB_OVERRIDES[@]}"
+export SFT_MODEL=/workspace/models/RLinf-Pi05-MetaWorld-SFT
+export RUN_DIR=/workspace/output/gse-joint-vlm-all-seed42
+export EXP_NAME=gse_joint_vlm_all_seed42
+mkdir -p "$RUN_DIR"
 
-# Launch the full run only after the smoke run is healthy.
-bash examples/embodiment/run_metaworld_gse_joint_vlm_all.sh \
-  "${WANDB_OVERRIDES[@]}"
+python examples/embodiment/train_embodied_agent.py \
+  --config-path /workspace/RLinf/examples/embodiment/config \
+  --config-name metaworld_50_ppo_openpi_pi05_gse_joint_vlm_all \
+  env.train.total_num_envs=128 \
+  env.train.rollout_epoch=2 \
+  actor.micro_batch_size=16 \
+  actor.global_batch_size=1024 \
+  actor.model.model_path="$SFT_MODEL" \
+  rollout.model.model_path="$SFT_MODEL" \
+  actor.model.gse.train_action_adapters=True \
+  'actor.model.gse.vlm.layer_indices=[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17]' \
+  actor.model.gse.vlm.total_rank=64 \
+  actor.model.gse.vlm.lora_alpha=64.0 \
+  runner.resume_dir=null \
+  runner.logger.log_path="$RUN_DIR" \
+  runner.logger.experiment_name="$EXP_NAME" \
+  runner.max_epochs=240 \
+  runner.save_interval=10 \
+  runner.val_check_interval=10 \
+  runner.max_checkpoints_to_keep=4 \
+  env.eval.total_num_envs=512 \
+  actor.optim.lr=1e-5 \
+  actor.optim.value_lr=5e-5 \
+  actor.optim.total_training_steps=240 \
+  actor.optim.lr_scheduler=constant \
+  actor.seed=42 \
+  rollout.seed=42 \
+  "${WANDB_OVERRIDES[@]}" \
+  2>&1 | tee "$RUN_DIR/console.log"
 ```
 
 Both joint profiles intentionally start at micro batch 16. If an all-layer
-smoke run OOMs, change that profile/script deliberately and record the resulting
-gradient-accumulation difference; do not silently alter the 1,024 global batch.
+smoke run OOMs, change the terminal override deliberately and record the
+resulting gradient-accumulation difference; do not silently alter the 1,024
+global batch. For a two-step smoke run, change `runner.max_epochs=240` to `2`
+and set both `runner.save_interval=-1` and `runner.val_check_interval=-1`.
 
 For both joint runs, startup must report 126 action GSE layers plus 28 VLM GSE
 layers for last4 or 126 VLM GSE layers for all18. Confirm that action and VLM
