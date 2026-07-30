@@ -1,15 +1,17 @@
-# Joint action + all 18 VLM language-block GSE training from the original SFT
-# checkpoint. The vision encoder and all original base weights remain frozen.
+# Joint action + VLM GSE training from the original SFT checkpoint. Both
+# adapter domains are zero-output at initialization and train together. The
+# default VLM surface is the last four language blocks; override layer_indices
+# on the command line for other layer ranges.
 defaults:
   - metaworld_50_ppo_openpi_pi05_gse
   - _self_
 
 runner:
   logger:
-    experiment_name: "metaworld_50_ppo_openpi_pi05_gse_joint_vlm_all"
-  max_epochs: 240
-  val_check_interval: 10
-  save_interval: 10
+    experiment_name: "metaworld_50_ppo_openpi_pi05_gse_joint_vlm"
+  max_epochs: 320
+  val_check_interval: 20
+  save_interval: 20
   max_checkpoints_to_keep: 4
   resume_dir: null
   ckpt_path: null
@@ -22,8 +24,6 @@ env:
     total_num_envs: 512
 
 actor:
-  # Start with the same batch settings as the other parallel experiments. Run
-  # a two-step smoke test and lower only this micro batch if all-layer GSE OOMs.
   micro_batch_size: 16
   global_batch_size: 1024
   model:
@@ -33,7 +33,7 @@ actor:
       train_action_adapters: True
       vlm:
         enabled: True
-        layer_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
+        layer_indices: [-4, -3, -2, -1]
         target_modules:
           [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
         total_rank: 64
@@ -43,9 +43,12 @@ actor:
         top_k: 2
         init_seed: 4200
   optim:
+    # Main comparisons use no warmup and an explicit constant LR. Add warmup
+    # only as a separate stability ablation when early PPO diagnostics spike.
     lr: 1.0e-5
     value_lr: 5.0e-5
     total_training_steps: ${runner.max_epochs}
+    lr_warmup_steps: 0
     lr_scheduler: "constant"
 
 rollout:

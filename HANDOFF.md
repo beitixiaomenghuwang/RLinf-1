@@ -752,7 +752,7 @@ on all changed Python files. Both the training config with task-conditioned
 router metrics and the GSE eval-only overrides in Section 6.3 resolved
 successfully in the same Docker image.
 
-On 2026-07-30, the three Section 9.13 config profiles and terminal overrides
+On 2026-07-30, the two Section 9.13 config profiles and three terminal overrides
 resolved successfully in `rlinf/rlinf:agentic-rlinf0.3-maniskill_libero` with
 micro/global batch `16/1024`, SFT model paths, `runner.resume_dir=null`, and
 trainable action adapters. The focused GSE and OpenPI-GSE tests passed:
@@ -1352,23 +1352,34 @@ python examples/embodiment/train_embodied_agent.py \
 
 ### 9.13 Three parallel from-SFT GSE experiments
 
-Three standalone Hydra profiles cover the next comparison. All three load the
-original Pi0.5 MT50 SFT checkpoint, set `runner.resume_dir=null`, inject
-zero-output GSE, and train the selected adapters from step 0. Do not point any
-of these runs at the action-GSE step-180 checkpoint.
+Three experiments using two reusable Hydra profiles cover the next comparison.
+All three load the original Pi0.5 MT50 SFT checkpoint, set
+`runner.resume_dir=null`, inject zero-output GSE, and train the selected adapters
+from step 0. Do not point any of these runs at the action-GSE step-180
+checkpoint.
 
 | Experiment | Config | Trainable GSE surface | Initial actor micro batch |
 |---|---|---|---|
-| Action-only rank 32 | `metaworld_50_ppo_openpi_pi05_gse_action_r32` | All 18 action blocks, total rank 32 | 16 |
-| Joint action + VLM last 4 | `metaworld_50_ppo_openpi_pi05_gse_joint_vlm_last4` | All action blocks plus VLM language blocks 14-17, rank 64 | 16 |
-| Joint action + all VLM layers | `metaworld_50_ppo_openpi_pi05_gse_joint_vlm_all` | All action blocks plus all 18 VLM language blocks, rank 64 | 16 |
+| Action-only rank 32 | `metaworld_50_ppo_openpi_pi05_gse` | All 18 action blocks, total rank 32 | 16 |
+| Joint action + VLM last 4 | `metaworld_50_ppo_openpi_pi05_gse_joint_vlm` | All action blocks plus VLM language blocks 14-17, rank 64 | 16 |
+| Joint action + all VLM layers | `metaworld_50_ppo_openpi_pi05_gse_joint_vlm` | All action blocks plus all 18 VLM language blocks, rank 64 | 16 |
 
 Here, "all VLM layers" means GSE on the seven target linear projections in all
 18 language Transformer blocks. The original VLM/action weights and visual
 encoder remain frozen; it does not mean full-parameter VLM PPO. Both action and
-VLM adapters/routers train jointly in the two joint profiles. The rank-32 action
+VLM adapters/routers train jointly in the two joint runs. The rank-32 action
 profile sets `total_rank=32` and `lora_alpha=32`, so eight experts receive rank
 4 each while preserving unit adapter scaling.
+
+The main comparison uses no LR warmup. Zero-output initialization already starts
+from the exact SFT policy, and the validated action-GSE run did not require a
+warmup. Add a 5% warmup only as a separate stability ablation if the first
+checkpoints show excessive KL, clip fraction, or gradient norm. The historical
+action-GSE command used cosine decay with `total_training_steps=6400` for only
+320 scheduler calls, so the LR retained about 99.4% of its initial value; this
+was effectively a constant LR, not a meaningful cosine decay. New experiments
+therefore request `lr_scheduler=constant` explicitly and inherit
+`total_training_steps=${runner.max_epochs}`.
 
 The commands below assume the Docker initialization and `WANDB_OVERRIDES` from
 Section 7. All important experiment parameters are expanded as terminal
@@ -1385,7 +1396,7 @@ mkdir -p "$RUN_DIR"
 
 python examples/embodiment/train_embodied_agent.py \
   --config-path /workspace/RLinf/examples/embodiment/config \
-  --config-name metaworld_50_ppo_openpi_pi05_gse_action_r32 \
+  --config-name metaworld_50_ppo_openpi_pi05_gse \
   env.train.total_num_envs=128 \
   env.train.rollout_epoch=2 \
   actor.micro_batch_size=16 \
@@ -1394,7 +1405,7 @@ python examples/embodiment/train_embodied_agent.py \
   rollout.model.model_path="$SFT_MODEL" \
   actor.model.gse.total_rank=32 \
   actor.model.gse.lora_alpha=32.0 \
-  actor.model.gse.train_action_adapters=True \
+  +actor.model.gse.train_action_adapters=True \
   runner.resume_dir=null \
   runner.logger.log_path="$RUN_DIR" \
   runner.logger.experiment_name="$EXP_NAME" \
@@ -1404,7 +1415,8 @@ python examples/embodiment/train_embodied_agent.py \
   runner.max_checkpoints_to_keep=4 \
   env.eval.total_num_envs=512 \
   actor.optim.lr=5e-5 \
-  actor.optim.total_training_steps=6400 \
+  actor.optim.lr_warmup_steps=0 \
+  actor.optim.lr_scheduler=constant \
   actor.seed=42 \
   rollout.seed=42 \
   "${WANDB_OVERRIDES[@]}" \
@@ -1421,7 +1433,7 @@ mkdir -p "$RUN_DIR"
 
 python examples/embodiment/train_embodied_agent.py \
   --config-path /workspace/RLinf/examples/embodiment/config \
-  --config-name metaworld_50_ppo_openpi_pi05_gse_joint_vlm_last4 \
+  --config-name metaworld_50_ppo_openpi_pi05_gse_joint_vlm \
   env.train.total_num_envs=128 \
   env.train.rollout_epoch=2 \
   actor.micro_batch_size=16 \
@@ -1435,14 +1447,14 @@ python examples/embodiment/train_embodied_agent.py \
   runner.resume_dir=null \
   runner.logger.log_path="$RUN_DIR" \
   runner.logger.experiment_name="$EXP_NAME" \
-  runner.max_epochs=240 \
-  runner.save_interval=10 \
-  runner.val_check_interval=10 \
+  runner.max_epochs=320 \
+  runner.save_interval=20 \
+  runner.val_check_interval=20 \
   runner.max_checkpoints_to_keep=4 \
   env.eval.total_num_envs=512 \
   actor.optim.lr=1e-5 \
   actor.optim.value_lr=5e-5 \
-  actor.optim.total_training_steps=240 \
+  actor.optim.lr_warmup_steps=0 \
   actor.optim.lr_scheduler=constant \
   actor.seed=42 \
   rollout.seed=42 \
@@ -1460,7 +1472,7 @@ mkdir -p "$RUN_DIR"
 
 python examples/embodiment/train_embodied_agent.py \
   --config-path /workspace/RLinf/examples/embodiment/config \
-  --config-name metaworld_50_ppo_openpi_pi05_gse_joint_vlm_all \
+  --config-name metaworld_50_ppo_openpi_pi05_gse_joint_vlm \
   env.train.total_num_envs=128 \
   env.train.rollout_epoch=2 \
   actor.micro_batch_size=16 \
@@ -1474,14 +1486,14 @@ python examples/embodiment/train_embodied_agent.py \
   runner.resume_dir=null \
   runner.logger.log_path="$RUN_DIR" \
   runner.logger.experiment_name="$EXP_NAME" \
-  runner.max_epochs=240 \
-  runner.save_interval=10 \
-  runner.val_check_interval=10 \
+  runner.max_epochs=320 \
+  runner.save_interval=20 \
+  runner.val_check_interval=20 \
   runner.max_checkpoints_to_keep=4 \
   env.eval.total_num_envs=512 \
   actor.optim.lr=1e-5 \
   actor.optim.value_lr=5e-5 \
-  actor.optim.total_training_steps=240 \
+  actor.optim.lr_warmup_steps=0 \
   actor.optim.lr_scheduler=constant \
   actor.seed=42 \
   rollout.seed=42 \
@@ -1489,10 +1501,10 @@ python examples/embodiment/train_embodied_agent.py \
   2>&1 | tee "$RUN_DIR/console.log"
 ```
 
-Both joint profiles intentionally start at micro batch 16. If an all-layer
+Both joint runs intentionally start at micro batch 16. If an all-layer
 smoke run OOMs, change the terminal override deliberately and record the
 resulting gradient-accumulation difference; do not silently alter the 1,024
-global batch. For a two-step smoke run, change `runner.max_epochs=240` to `2`
+global batch. For a two-step smoke run, change `runner.max_epochs=320` to `2`
 and set both `runner.save_interval=-1` and `runner.val_check_interval=-1`.
 
 For both joint runs, startup must report 126 action GSE layers plus 28 VLM GSE
