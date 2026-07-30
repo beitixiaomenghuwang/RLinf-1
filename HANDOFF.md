@@ -1383,6 +1383,12 @@ late-stage settling. New experiments use a half-cycle cosine schedule with
 `runner.max_epochs`, so the LR decays across the full run and approaches zero at
 the final checkpoint.
 
+This scheduler correction applies only to fresh launches with
+`runner.resume_dir=null`. Resuming a checkpoint restores its saved optimizer and
+scheduler state; a run started with constant LR or the historical 6,400-step
+horizon must be restarted from SFT rather than resumed if it is intended to use
+the corrected full-run cosine decay.
+
 The commands below assume the Docker initialization and `WANDB_OVERRIDES` from
 Section 7. All important experiment parameters are expanded as terminal
 overrides so they can be edited in one place. Use one isolated eight-GPU
