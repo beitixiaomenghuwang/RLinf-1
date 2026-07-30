@@ -1,0 +1,53 @@
+# Joint action + VLM-last-four GSE training from the original SFT checkpoint.
+# Both adapter domains are zero-output at initialization and train together.
+defaults:
+  - metaworld_50_ppo_openpi_pi05_gse
+  - _self_
+
+runner:
+  logger:
+    experiment_name: "metaworld_50_ppo_openpi_pi05_gse_joint_vlm_last4"
+  max_epochs: 240
+  val_check_interval: 10
+  save_interval: 10
+  max_checkpoints_to_keep: 4
+  resume_dir: null
+  ckpt_path: null
+
+env:
+  train:
+    rollout_epoch: 2
+    total_num_envs: 128
+  eval:
+    total_num_envs: 512
+
+actor:
+  # Validate with a two-step smoke run before a long launch; lower to 8 on OOM.
+  micro_batch_size: 16
+  global_batch_size: 1024
+  model:
+    model_path: "/path/to/model/RLinf-Pi05-MetaWorld-SFT"
+    gse:
+      enabled: True
+      train_action_adapters: True
+      vlm:
+        enabled: True
+        layer_indices: [-4, -3, -2, -1]
+        target_modules:
+          [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+        total_rank: 64
+        lora_alpha: 64.0
+        num_experts: 4
+        num_generalized_experts: 1
+        top_k: 2
+        init_seed: 4200
+  optim:
+    # One shared adapter LR; this matches the established VLM-GSE setting.
+    lr: 1.0e-5
+    value_lr: 5.0e-5
+    total_training_steps: ${runner.max_epochs}
+    lr_scheduler: "constant"
+
+rollout:
+  model:
+    model_path: "/path/to/model/RLinf-Pi05-MetaWorld-SFT"

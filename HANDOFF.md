@@ -1,6 +1,6 @@
 # Pi0.5 Multi-Task Parameter-Efficient RL Handoff
 
-Last updated: 2026-07-28
+Last updated: 2026-07-30
 
 This document is the complete handoff for the Pi0.5 MetaWorld MT50 project. It
 retains validated experiments, output/checkpoint paths, reproducible commands,
@@ -96,6 +96,9 @@ outputs under `/DATA/disk0/xueyang/model/pi05-gse`.
 | Plain-LoRA step-80 evaluation | `/workspace/output/action-lora-r64-step80-eval-seed42` |
 | VLM last-block run | `/workspace/output/gse-action180-vlm-last-seed42` |
 | VLM last-four run | `/workspace/output/gse-action180-vlm-last4-seed42` |
+| Action-GSE rank-32 run | `/workspace/output/gse-action-r32-seed42` |
+| Joint action + VLM-last4 from-SFT run | `/workspace/output/gse-joint-vlm-last4-seed42` |
+| Joint action + all-VLM-layers from-SFT run | `/workspace/output/gse-joint-vlm-all-seed42` |
 
 For any path above, replace the `/workspace/output` prefix with
 `/DATA/disk0/xueyang/model/pi05-gse` to obtain its host path. Checkpoints and
@@ -749,6 +752,12 @@ on all changed Python files. Both the training config with task-conditioned
 router metrics and the GSE eval-only overrides in Section 6.3 resolved
 successfully in the same Docker image.
 
+On 2026-07-30, the three Section 9.13 launch scripts passed `bash -n` and
+resolved successfully in `rlinf/rlinf:agentic-rlinf0.3-maniskill_libero` with
+their final command lines enforcing micro/global batch `16/1024`, SFT model
+paths, `runner.resume_dir=null`, and trainable action adapters. The focused GSE
+and OpenPI-GSE tests passed: `27 passed`.
+
 ### Task-conditioned router metrics
 
 The MetaWorld GSE config enables:
@@ -1341,13 +1350,90 @@ python examples/embodiment/train_embodied_agent.py \
   2>&1 | tee "$EVAL_DIR/console.log"
 ```
 
+### 9.13 Three parallel from-SFT GSE experiments
+
+Three standalone Hydra profiles cover the next comparison. All three load the
+original Pi0.5 MT50 SFT checkpoint, set `runner.resume_dir=null`, inject
+zero-output GSE, and train the selected adapters from step 0. Do not point any
+of these runs at the action-GSE step-180 checkpoint.
+
+| Experiment | Config | Trainable GSE surface | Initial actor micro batch |
+|---|---|---|---|
+| Action-only rank 32 | `metaworld_50_ppo_openpi_pi05_gse_action_r32` | All 18 action blocks, total rank 32 | 16 |
+| Joint action + VLM last 4 | `metaworld_50_ppo_openpi_pi05_gse_joint_vlm_last4` | All action blocks plus VLM language blocks 14-17, rank 64 | 16 |
+| Joint action + all VLM layers | `metaworld_50_ppo_openpi_pi05_gse_joint_vlm_all` | All action blocks plus all 18 VLM language blocks, rank 64 | 16 |
+
+Here, "all VLM layers" means GSE on the seven target linear projections in all
+18 language Transformer blocks. The original VLM/action weights and visual
+encoder remain frozen; it does not mean full-parameter VLM PPO. Both action and
+VLM adapters/routers train jointly in the two joint profiles. The rank-32 action
+profile sets `total_rank=32` and `lora_alpha=32`, so eight experts receive rank
+4 each while preserving unit adapter scaling.
+
+The commands below assume the Docker initialization and `WANDB_OVERRIDES` from
+Section 7. The launch scripts explicitly enforce
+`actor.micro_batch_size=16` and `actor.global_batch_size=1024` and forward any
+additional Hydra overrides. Use one isolated eight-GPU job/container per command
+when launching them concurrently.
+
+Action-only rank 32:
+
+```bash
+bash examples/embodiment/run_metaworld_gse_action_r32.sh \
+  "${WANDB_OVERRIDES[@]}"
+```
+
+Joint action + VLM-last4 from SFT:
+
+```bash
+RUN_DIR=/workspace/output/gse-joint-vlm-last4-smoke \
+EXP_NAME=gse_joint_vlm_last4_smoke \
+bash examples/embodiment/run_metaworld_gse_joint_vlm_last4.sh \
+  runner.max_epochs=2 \
+  runner.save_interval=-1 \
+  runner.val_check_interval=-1 \
+  "${WANDB_OVERRIDES[@]}"
+
+# Launch the full run only after the smoke run is healthy.
+bash examples/embodiment/run_metaworld_gse_joint_vlm_last4.sh \
+  "${WANDB_OVERRIDES[@]}"
+```
+
+Joint action + all 18 VLM language layers from SFT:
+
+```bash
+RUN_DIR=/workspace/output/gse-joint-vlm-all-smoke \
+EXP_NAME=gse_joint_vlm_all_smoke \
+bash examples/embodiment/run_metaworld_gse_joint_vlm_all.sh \
+  runner.max_epochs=2 \
+  runner.save_interval=-1 \
+  runner.val_check_interval=-1 \
+  "${WANDB_OVERRIDES[@]}"
+
+# Launch the full run only after the smoke run is healthy.
+bash examples/embodiment/run_metaworld_gse_joint_vlm_all.sh \
+  "${WANDB_OVERRIDES[@]}"
+```
+
+Both joint profiles intentionally start at micro batch 16. If an all-layer
+smoke run OOMs, change that profile/script deliberately and record the resulting
+gradient-accumulation difference; do not silently alter the 1,024 global batch.
+
+For both joint runs, startup must report 126 action GSE layers plus 28 VLM GSE
+layers for last4 or 126 VLM GSE layers for all18. Confirm that action and VLM
+adapter trainable counts are both nonzero, the first two PPO updates have finite
+loss/gradient values, and the initial residual remains zero before committing a
+long run. Keep the same 128 environments x 2 rollout epochs, 1,024 global batch,
+fixed 512-trajectory evaluation, PPO settings, seeds, and checkpoint selection
+protocol when comparing the three methods.
+
 ## 10. Development cautions
 
 - Read the repository-root `AGENTS.md` before editing.
 - Preserve unrelated user changes and real server paths.
 - Keep the official full-parameter Pi0.5 PPO config unchanged as a baseline.
-- Keep the first VLM GSE ablation restricted to the final language block; do not
-  expand earlier layers until it beats the action-only checkpoint.
+- Keep the staged action-180 VLM ablations distinct from the new from-SFT joint
+  experiments; never resume one protocol from a checkpoint of the other.
 - Zero-B initialization delays useful A/router gradients until B becomes nonzero.
 - Aggregate load balance over a diverse multi-task batch; per-sample balancing can
   be meaningless or harmful.
@@ -1358,6 +1444,12 @@ python examples/embodiment/train_embodied_agent.py \
 ## 11. Next-conversation handoff
 
 ### 11.1 Current run state
+
+Three new from-SFT experiments are ready to launch in parallel from Section
+9.13: action-only rank 32, joint action+VLM-last4, and joint action+all18 VLM
+language layers. All three deliberately use actor micro/global batch `16/1024`;
+run the two-step smoke commands for both joint profiles before long training.
+These experiments are separate from the staged action-180 VLM runs below.
 
 A second, deliberately expanded experiment was added on top of this one before
 its matched-evaluation result came back: `gse-action180-vlm-last4-seed42`
@@ -1451,8 +1543,9 @@ large outputs, and do not push, rebase, reset, or clean the worktree unless the
 user explicitly requests it. Record each new commit and its validation result in
 this handoff.
 
-The immediate milestone for the next conversation is to run or ingest
-`gse-action180-vlm-last4-seed42`, select candidate checkpoints without treating
-small health-check evaluations as paper evidence, and launch a matched
-action-only versus VLM evaluation. Keep auxiliary losses disabled until those
-results establish whether router skew is persistent and harmful.
+The immediate milestone for the next conversation is to smoke-test and launch
+the three Section 9.13 from-SFT experiments, while continuing to ingest the
+staged `gse-action180-vlm-last4-seed42` result if it arrives. Keep the two
+protocols separate, select checkpoints without treating health-check evaluations
+as paper evidence, and keep auxiliary losses disabled until matched results show
+that router skew is persistent and harmful.
