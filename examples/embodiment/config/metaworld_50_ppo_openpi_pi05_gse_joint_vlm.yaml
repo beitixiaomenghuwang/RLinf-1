@@ -43,13 +43,14 @@ actor:
         top_k: 2
         init_seed: 4200
   optim:
-    # Main comparisons use no warmup and an explicit constant LR. Add warmup
-    # only as a separate stability ablation when early PPO diagnostics spike.
+    # Decay over the complete global-step horizon so the final checkpoints can
+    # converge. Add warmup only as a separate early-stability ablation.
     lr: 1.0e-5
     value_lr: 5.0e-5
     total_training_steps: ${runner.max_epochs}
     lr_warmup_steps: 0
-    lr_scheduler: "constant"
+    lr_scheduler: "cosine"
+    num_cycles: 0.5
 
 rollout:
   model:

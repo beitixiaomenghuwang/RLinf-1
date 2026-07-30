@@ -754,9 +754,9 @@ successfully in the same Docker image.
 
 On 2026-07-30, the two Section 9.13 config profiles and three terminal overrides
 resolved successfully in `rlinf/rlinf:agentic-rlinf0.3-maniskill_libero` with
-micro/global batch `16/1024`, SFT model paths, `runner.resume_dir=null`, and
-trainable action adapters. The focused GSE and OpenPI-GSE tests passed:
-`27 passed`.
+micro/global batch `16/1024`, SFT model paths, `runner.resume_dir=null`,
+trainable action adapters, and a 320-step cosine schedule. The focused GSE and
+OpenPI-GSE tests passed: `27 passed`.
 
 ### Task-conditioned router metrics
 
@@ -1377,9 +1377,11 @@ warmup. Add a 5% warmup only as a separate stability ablation if the first
 checkpoints show excessive KL, clip fraction, or gradient norm. The historical
 action-GSE command used cosine decay with `total_training_steps=6400` for only
 320 scheduler calls, so the LR retained about 99.4% of its initial value; this
-was effectively a constant LR, not a meaningful cosine decay. New experiments
-therefore request `lr_scheduler=constant` explicitly and inherit
-`total_training_steps=${runner.max_epochs}`.
+was effectively a constant LR and likely contributed to the observed lack of
+late-stage settling. New experiments use a half-cycle cosine schedule with
+`num_cycles=0.5` and keep `total_training_steps` exactly synchronized with
+`runner.max_epochs`, so the LR decays across the full run and approaches zero at
+the final checkpoint.
 
 The commands below assume the Docker initialization and `WANDB_OVERRIDES` from
 Section 7. All important experiment parameters are expanded as terminal
@@ -1415,8 +1417,10 @@ python examples/embodiment/train_embodied_agent.py \
   runner.max_checkpoints_to_keep=4 \
   env.eval.total_num_envs=512 \
   actor.optim.lr=5e-5 \
+  'actor.optim.total_training_steps=${runner.max_epochs}' \
   actor.optim.lr_warmup_steps=0 \
-  actor.optim.lr_scheduler=constant \
+  actor.optim.lr_scheduler=cosine \
+  actor.optim.num_cycles=0.5 \
   actor.seed=42 \
   rollout.seed=42 \
   "${WANDB_OVERRIDES[@]}" \
@@ -1454,8 +1458,10 @@ python examples/embodiment/train_embodied_agent.py \
   env.eval.total_num_envs=512 \
   actor.optim.lr=1e-5 \
   actor.optim.value_lr=5e-5 \
+  'actor.optim.total_training_steps=${runner.max_epochs}' \
   actor.optim.lr_warmup_steps=0 \
-  actor.optim.lr_scheduler=constant \
+  actor.optim.lr_scheduler=cosine \
+  actor.optim.num_cycles=0.5 \
   actor.seed=42 \
   rollout.seed=42 \
   "${WANDB_OVERRIDES[@]}" \
@@ -1493,8 +1499,10 @@ python examples/embodiment/train_embodied_agent.py \
   env.eval.total_num_envs=512 \
   actor.optim.lr=1e-5 \
   actor.optim.value_lr=5e-5 \
+  'actor.optim.total_training_steps=${runner.max_epochs}' \
   actor.optim.lr_warmup_steps=0 \
-  actor.optim.lr_scheduler=constant \
+  actor.optim.lr_scheduler=cosine \
+  actor.optim.num_cycles=0.5 \
   actor.seed=42 \
   rollout.seed=42 \
   "${WANDB_OVERRIDES[@]}" \
