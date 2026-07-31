@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import logging
+import math
 import os
 import queue
 import re
@@ -37,6 +39,73 @@ from rlinf.utils.timers import Timer
 logger = logging.getLogger(__name__)
 
 _GLOBAL_STEP_CHECKPOINT = re.compile(r"^global_step_(\d+)$")
+_BEST_MACRO_MEAN_CHECKPOINT = "best_macro_mean"
+_BEST_MACRO_MEAN_METADATA = "best_metric.json"
+
+
+def _link_or_copy_checkpoint_file(source: str, destination: str) -> str:
+    """Hard-link immutable checkpoint files, falling back to a regular copy."""
+    try:
+        os.link(source, destination)
+    except OSError:
+        shutil.copy2(source, destination)
+    return destination
+
+
+def promote_checkpoint_as_best(
+    checkpoints_dir: str | os.PathLike,
+    global_step: int,
+    macro_mean: float,
+) -> Path:
+    """Create an independently retained best-macro checkpoint snapshot."""
+    root = Path(checkpoints_dir)
+    source = root / f"global_step_{global_step}"
+    if not source.is_dir():
+        raise FileNotFoundError(f"Checkpoint to promote does not exist: {source}")
+
+    destination = root / _BEST_MACRO_MEAN_CHECKPOINT
+    staging = root / f".{_BEST_MACRO_MEAN_CHECKPOINT}.step_{global_step}.tmp"
+    previous = root / f".{_BEST_MACRO_MEAN_CHECKPOINT}.previous"
+    shutil.rmtree(staging, ignore_errors=True)
+    shutil.rmtree(previous, ignore_errors=True)
+    shutil.copytree(source, staging, copy_function=_link_or_copy_checkpoint_file)
+    metadata = {
+        "metric": "task_success/macro_mean",
+        "value": float(macro_mean),
+        "global_step": int(global_step),
+    }
+    with (staging / _BEST_MACRO_MEAN_METADATA).open("w", encoding="utf-8") as file:
+        json.dump(metadata, file, indent=2, sort_keys=True)
+        file.write("\n")
+
+    try:
+        if destination.exists():
+            destination.rename(previous)
+        staging.rename(destination)
+    except Exception:
+        if not destination.exists() and previous.exists():
+            previous.rename(destination)
+        raise
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+        if destination.exists():
+            shutil.rmtree(previous, ignore_errors=True)
+    return destination
+
+
+def load_best_macro_mean(checkpoints_dir: str | os.PathLike) -> float:
+    """Load the persisted best macro mean, or negative infinity if absent."""
+    metadata_path = (
+        Path(checkpoints_dir) / _BEST_MACRO_MEAN_CHECKPOINT / _BEST_MACRO_MEAN_METADATA
+    )
+    if not metadata_path.is_file():
+        return float("-inf")
+    try:
+        with metadata_path.open(encoding="utf-8") as file:
+            value = float(json.load(file)["value"])
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError, OSError):
+        return float("-inf")
+    return value if math.isfinite(value) else float("-inf")
 
 
 def prune_old_checkpoints(
@@ -65,6 +134,7 @@ def prune_old_checkpoints(
         shutil.rmtree(path)
         removed.append(path)
     return tuple(removed)
+
 
 if TYPE_CHECKING:
     from rlinf.workers.actor.async_fsdp_sac_policy_worker import (
@@ -146,6 +216,14 @@ class EmbodiedRunner:
 
         self.logger = get_logger()
         self.metric_logger = MetricLogger(cfg)
+        self.save_best_macro_mean = bool(
+            self.cfg.runner.get("save_best_macro_mean", False)
+        )
+        self.best_eval_macro_mean = (
+            load_best_macro_mean(self._checkpoints_dir())
+            if self.save_best_macro_mean
+            else float("-inf")
+        )
         self.enable_per_worker_metric_log = bool(
             self.cfg.runner.get("per_worker_log", False)
         )
@@ -349,15 +427,18 @@ class EmbodiedRunner:
         )
 
         eval_metrics = {}
+        # Persist the just-completed update before validation, since evaluation
+        # can fail independently (for example, during environment rendering).
+        if save_model:
+            self._save_checkpoint()
+
         if run_val:
             with self.timer("eval"):
                 self.update_rollout_weights()
                 eval_metrics = self.evaluate()
                 eval_metrics = {f"eval/{k}": v for k, v in eval_metrics.items()}
                 self.metric_logger.log(data=eval_metrics, step=step)
-
-        if save_model:
-            self._save_checkpoint()
+                self._maybe_save_best_macro_mean(eval_metrics)
 
         return eval_metrics
 
@@ -612,7 +693,8 @@ class EmbodiedRunner:
 
         eval_metrics = {f"eval/{key}": value for key, value in eval_metrics.items()}
         time_metrics = {
-            f"time/{key}": value for key, value in self.timer.consume_durations().items()
+            f"time/{key}": value
+            for key, value in self.timer.consume_durations().items()
         }
         self.metric_logger.log(data=eval_metrics, step=self.global_step)
         self.metric_logger.log(data=time_metrics, step=self.global_step)
@@ -706,19 +788,49 @@ class EmbodiedRunner:
 
         self._finish_run()
 
+    def _checkpoints_dir(self) -> Path:
+        return (
+            Path(self.cfg.runner.logger.log_path)
+            / self.cfg.runner.logger.experiment_name
+            / "checkpoints"
+        )
+
+    def _maybe_save_best_macro_mean(self, eval_metrics: dict) -> None:
+        if not self.save_best_macro_mean:
+            return
+        macro_mean = eval_metrics.get("eval/task_success/macro_mean")
+        if macro_mean is None:
+            self.logger.warning(
+                "Best-macro checkpoint is enabled, but evaluation did not return "
+                "task_success/macro_mean."
+            )
+            return
+        macro_mean = float(macro_mean)
+        if not math.isfinite(macro_mean) or macro_mean <= self.best_eval_macro_mean:
+            return
+
+        checkpoint_path = self._checkpoints_dir() / f"global_step_{self.global_step}"
+        if not checkpoint_path.is_dir():
+            self._save_checkpoint()
+        best_path = promote_checkpoint_as_best(
+            self._checkpoints_dir(), self.global_step, macro_mean
+        )
+        self.best_eval_macro_mean = macro_mean
+        self.logger.info(
+            "Saved best task-success macro mean %.6f at step %d to %s.",
+            macro_mean,
+            self.global_step,
+            best_path,
+        )
+
     def _save_checkpoint(self):
         self.logger.info(f"Saving checkpoint at step {self.global_step}.")
-        base_output_dir = os.path.join(
-            self.cfg.runner.logger.log_path,
-            self.cfg.runner.logger.experiment_name,
-            f"checkpoints/global_step_{self.global_step}",
-        )
+        base_output_dir = self._checkpoints_dir() / f"global_step_{self.global_step}"
         actor_save_path = os.path.join(base_output_dir, "actor")
         os.makedirs(actor_save_path, exist_ok=True)
         self.actor.save_checkpoint(actor_save_path, self.global_step).wait()
-        checkpoints_dir = os.path.dirname(base_output_dir)
         removed = prune_old_checkpoints(
-            checkpoints_dir,
+            self._checkpoints_dir(),
             self.cfg.runner.get("max_checkpoints_to_keep", None),
         )
         for path in removed:
