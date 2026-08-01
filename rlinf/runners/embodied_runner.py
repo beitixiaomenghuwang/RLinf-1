@@ -41,6 +41,7 @@ logger = logging.getLogger(__name__)
 _GLOBAL_STEP_CHECKPOINT = re.compile(r"^global_step_(\d+)$")
 _BEST_MACRO_MEAN_CHECKPOINT = "best_macro_mean"
 _BEST_MACRO_MEAN_METADATA = "best_metric.json"
+_EVALUATION_COMPLETE_METADATA = "evaluation_complete.json"
 
 
 def _link_or_copy_checkpoint_file(source: str, destination: str) -> str:
@@ -439,8 +440,64 @@ class EmbodiedRunner:
                 eval_metrics = {f"eval/{k}": v for k, v in eval_metrics.items()}
                 self.metric_logger.log(data=eval_metrics, step=step)
                 self._maybe_save_best_macro_mean(eval_metrics)
+                self._mark_evaluation_complete(eval_metrics)
 
         return eval_metrics
+
+    def _resume_needs_evaluation(self) -> bool:
+        resume_dir = self.cfg.runner.get("resume_dir", None)
+        if resume_dir is None or not self.cfg.runner.get("eval_on_resume", False):
+            return False
+        run_val, _, _ = check_progress(
+            self.global_step,
+            self.max_steps,
+            self.cfg.runner.val_check_interval,
+            self.cfg.runner.save_interval,
+            1.0,
+            run_time_exceeded=False,
+        )
+        marker = Path(resume_dir) / _EVALUATION_COMPLETE_METADATA
+        return run_val and not marker.is_file()
+
+    def _evaluate_resumed_checkpoint(self) -> None:
+        if not self._resume_needs_evaluation():
+            return
+        self.logger.info(
+            "Evaluating resumed checkpoint at step %d before continuing training.",
+            self.global_step,
+        )
+        with self.timer("eval"):
+            self.update_rollout_weights()
+            eval_metrics = self.evaluate()
+            eval_metrics = {f"eval/{key}": value for key, value in eval_metrics.items()}
+            self.metric_logger.log(data=eval_metrics, step=self.global_step)
+            self._maybe_save_best_macro_mean(eval_metrics)
+            self._mark_evaluation_complete(eval_metrics)
+
+    def _mark_evaluation_complete(self, eval_metrics: dict) -> None:
+        metadata = {
+            "global_step": int(self.global_step),
+            "task_success_macro_mean": eval_metrics.get(
+                "eval/task_success/macro_mean"
+            ),
+        }
+        checkpoint_paths = {
+            self._checkpoints_dir() / f"global_step_{self.global_step}"
+        }
+        resume_dir = self.cfg.runner.get("resume_dir", None)
+        if resume_dir is not None:
+            resume_path = Path(resume_dir)
+            if resume_path.name == f"global_step_{self.global_step}":
+                checkpoint_paths.add(resume_path)
+        for checkpoint_path in checkpoint_paths:
+            if not checkpoint_path.is_dir():
+                continue
+            marker = checkpoint_path / _EVALUATION_COMPLETE_METADATA
+            staging = marker.with_suffix(".tmp")
+            with staging.open("w", encoding="utf-8") as file:
+                json.dump(metadata, file, indent=2, sort_keys=True)
+                file.write("\n")
+            staging.replace(marker)
 
     def _log_step_metrics(
         self,
@@ -595,6 +652,7 @@ class EmbodiedRunner:
         if self.cfg.runner.get("use_training_pipeline", False):
             return self.run_pipeline()
 
+        self._evaluate_resumed_checkpoint()
         start_step = self.global_step
         start_time = time.time()
         for _step in range(start_step, self.max_steps):
@@ -710,6 +768,7 @@ class EmbodiedRunner:
         return eval_metrics
 
     def run_pipeline(self):
+        self._evaluate_resumed_checkpoint()
         start_step = self.global_step
         start_time = time.time()
         for _step in range(start_step, self.max_steps):

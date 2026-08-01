@@ -28,6 +28,11 @@ from rlinf.runners.embodied_runner import (
 )
 
 
+class ConfigNamespace(SimpleNamespace):
+    def get(self, key, default=None):
+        return getattr(self, key, default)
+
+
 def test_prune_old_checkpoints_keeps_latest_steps_and_unrelated_paths(tmp_path) -> None:
     for step in (10, 2, 1):
         checkpoint = tmp_path / f"global_step_{step}"
@@ -60,7 +65,11 @@ def test_prune_old_checkpoints_rejects_zero_retention(tmp_path) -> None:
 def test_checkpoint_is_saved_before_evaluation() -> None:
     runner = EmbodiedRunner.__new__(EmbodiedRunner)
     runner.cfg = SimpleNamespace(
-        runner=SimpleNamespace(val_check_interval=10, save_interval=10)
+        runner=SimpleNamespace(
+            val_check_interval=10,
+            save_interval=10,
+            resume_dir=None,
+        )
     )
     runner.global_step = 10
     runner.max_steps = 20
@@ -71,11 +80,51 @@ def test_checkpoint_is_saved_before_evaluation() -> None:
     runner.evaluate = lambda: calls.append("evaluate") or {"success_once": 0.5}
     runner.metric_logger = SimpleNamespace(log=lambda **_kwargs: calls.append("log"))
     runner._maybe_save_best_macro_mean = lambda _metrics: calls.append("best")
+    runner._mark_evaluation_complete = lambda _metrics: calls.append("mark")
 
     metrics = runner._maybe_eval_and_checkpoint(step=9)
 
     assert metrics == {"eval/success_once": 0.5}
-    assert calls == ["save", "sync", "evaluate", "log", "best"]
+    assert calls == ["save", "sync", "evaluate", "log", "best", "mark"]
+
+
+def test_resume_evaluates_pending_checkpoint_before_training(tmp_path) -> None:
+    resume_dir = tmp_path / "global_step_20"
+    resume_dir.mkdir()
+    runner = EmbodiedRunner.__new__(EmbodiedRunner)
+    runner.cfg = SimpleNamespace(
+        runner=ConfigNamespace(
+            resume_dir=str(resume_dir),
+            eval_on_resume=True,
+            val_check_interval=20,
+            save_interval=20,
+        )
+    )
+    runner.global_step = 20
+    runner.max_steps = 320
+
+    assert runner._resume_needs_evaluation()
+
+    (resume_dir / "evaluation_complete.json").write_text("{}\n")
+    assert not runner._resume_needs_evaluation()
+
+
+def test_resume_does_not_evaluate_between_intervals(tmp_path) -> None:
+    resume_dir = tmp_path / "global_step_21"
+    resume_dir.mkdir()
+    runner = EmbodiedRunner.__new__(EmbodiedRunner)
+    runner.cfg = SimpleNamespace(
+        runner=ConfigNamespace(
+            resume_dir=str(resume_dir),
+            eval_on_resume=True,
+            val_check_interval=20,
+            save_interval=20,
+        )
+    )
+    runner.global_step = 21
+    runner.max_steps = 320
+
+    assert not runner._resume_needs_evaluation()
 
 
 def test_best_macro_checkpoint_is_independent_of_retention(tmp_path) -> None:
