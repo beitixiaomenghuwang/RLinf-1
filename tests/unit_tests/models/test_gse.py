@@ -10,11 +10,14 @@ from rlinf.models.peft.gse import (
     GSEConfig,
     GSELinear,
     gse_auxiliary_loss,
+    gse_layerwise_task_router_metrics,
+    gse_layerwise_task_router_statistics,
     gse_load_balancing_loss,
     gse_orthogonality_loss,
     gse_router_metrics,
     gse_state_dict,
     gse_task_router_metrics,
+    gse_task_router_metrics_from_tensor,
     gse_task_router_statistics,
     inject_gse,
     joint_lora_a,
@@ -281,15 +284,13 @@ def test_task_router_statistics_preserve_task_counts() -> None:
     for task_index in (0, 1):
         probability_sum = sum(
             statistics[
-                f"{prefix}/task_{task_index:02d}/"
-                f"expert_{expert_index}_probability_sum"
+                f"{prefix}/task_{task_index:02d}/expert_{expert_index}_probability_sum"
             ]
             for expert_index in range(num_specialized)
         )
         selection_count = sum(
             statistics[
-                f"{prefix}/task_{task_index:02d}/"
-                f"expert_{expert_index}_selection_count"
+                f"{prefix}/task_{task_index:02d}/expert_{expert_index}_selection_count"
             ]
             for expert_index in range(num_specialized)
         )
@@ -301,6 +302,55 @@ def test_task_router_statistics_preserve_task_counts() -> None:
             selection_count,
             statistics[f"{prefix}/task_{task_index:02d}/selection_total"],
         )
+
+
+def test_layerwise_task_router_statistics_are_compact_and_count_preserving() -> None:
+    model = ToyModel()
+    config = make_config(record_routing_assignments=True)
+    inject_gse(
+        model,
+        config,
+        target_modules=("action_expert.0", "action_expert.2"),
+    )
+    model(torch.randn(3, 5, 12))
+
+    statistics = gse_layerwise_task_router_statistics(
+        model, torch.tensor([0, 1, 1]), num_tasks=3
+    )
+
+    assert statistics.shape == (2, 3, 2 + 2 * config.num_specialized_experts)
+    torch.testing.assert_close(statistics[:, :, 0].sum(dim=1), torch.tensor([3.0, 3.0]))
+    torch.testing.assert_close(
+        statistics[:, :, 1].sum(dim=1),
+        torch.tensor([6.0, 6.0]),
+    )
+
+
+def test_layerwise_metrics_detect_information_hidden_in_one_layer() -> None:
+    # Layout: routing count, selection total, two probability sums, and two
+    # selection counts. Layer 0 is task-specialized while layer 1 is uniform.
+    statistics = torch.tensor(
+        [
+            [[10, 10, 10, 0, 10, 0], [10, 10, 0, 10, 0, 10]],
+            [[10, 10, 5, 5, 5, 5], [10, 10, 5, 5, 5, 5]],
+        ],
+        dtype=torch.float32,
+    )
+
+    aggregate = gse_task_router_metrics_from_tensor(statistics)
+    layerwise = gse_layerwise_task_router_metrics(
+        statistics, informative_nmi_threshold=0.5
+    )
+
+    assert aggregate["gse/task_router/prob_nmi"] > 0
+    assert layerwise["gse/task_router/layerwise_nmi_max"] == pytest.approx(1.0)
+    assert layerwise["gse/task_router/layerwise_nmi_top_layer"] == 0
+    assert layerwise[
+        "gse/task_router/layerwise_adjusted_cramers_v_max"
+    ] == pytest.approx(1.0)
+    assert layerwise["gse/task_router/layerwise_informative_fraction"] == pytest.approx(
+        0.5
+    )
 
 
 def test_task_router_metrics_detect_complete_task_specialization() -> None:
@@ -327,18 +377,21 @@ def test_task_router_metrics_detect_complete_task_specialization() -> None:
         1.0
     )
     assert metrics["gse/task_router/mean_js_divergence"] > 0
-    assert metrics["gse/task_router/nmi"] == metrics[
-        "gse/task_router/normalized_mutual_information"
-    ]
-    assert metrics["gse/task_router/js"] == metrics[
-        "gse/task_router/mean_js_divergence"
-    ]
-    assert metrics["gse/task_router/prob_std"] == metrics[
-        "gse/task_router/mean_probability_std_across_tasks"
-    ]
-    assert metrics["gse/task_router/select_std"] == metrics[
-        "gse/task_router/mean_selection_std_across_tasks"
-    ]
+    assert (
+        metrics["gse/task_router/nmi"]
+        == metrics["gse/task_router/normalized_mutual_information"]
+    )
+    assert (
+        metrics["gse/task_router/js"] == metrics["gse/task_router/mean_js_divergence"]
+    )
+    assert (
+        metrics["gse/task_router/prob_std"]
+        == metrics["gse/task_router/mean_probability_std_across_tasks"]
+    )
+    assert (
+        metrics["gse/task_router/select_std"]
+        == metrics["gse/task_router/mean_selection_std_across_tasks"]
+    )
     assert metrics["gse/task_router/task_00/dominant_expert"] == 0
     assert metrics["gse/task_router/task_01/dominant_expert"] == 1
 

@@ -21,6 +21,11 @@ from typing import Any, Optional
 import numpy as np
 import torch
 
+from rlinf.algorithms.advantage_normalization import (
+    normalize_advantages_per_task,
+    task_advantage_normalization_metrics,
+    task_advantage_stats,
+)
 from rlinf.algorithms.registry import calculate_adv_and_returns, policy_loss
 from rlinf.config import SupportedModel
 from rlinf.data.embodied_io_struct import Trajectory, convert_trajectories_to_batch
@@ -192,6 +197,7 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
             "reward_type": self.cfg.algorithm.reward_type,
             "loss_mask": self.rollout_batch.get("loss_mask", None),
             "loss_mask_sum": self.rollout_batch.get("loss_mask_sum", None),
+            "normalize_advantages": self.advantage_normalization.mode == "global",
         }
 
         adv_and_ret = calculate_adv_and_returns(**kwargs)
@@ -284,10 +290,40 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
                 self.rollout_batch, shuffle_id
             )
 
-        if self.cfg.algorithm.normalize_advantages:
+        normalization_metrics = {}
+        if self.advantage_normalization.mode == "global":
             self.rollout_batch["advantages"] = masked_normalization(
                 self.rollout_batch["advantages"],
                 self.rollout_batch.get("loss_mask", None),
+            )
+        elif self.advantage_normalization.mode == "per_task":
+            forward_inputs = self.rollout_batch.get("forward_inputs", {}) or {}
+            task_ids = forward_inputs.get("task_ids")
+            if not isinstance(task_ids, torch.Tensor):
+                raise ValueError(
+                    "Per-task advantage normalization requires "
+                    "rollout_batch.forward_inputs.task_ids"
+                )
+            stats = task_advantage_stats(
+                self.rollout_batch["advantages"],
+                task_ids,
+                num_tasks=int(self.advantage_normalization.num_tasks),
+                loss_mask=self.rollout_batch.get("loss_mask"),
+            ).to(self.device)
+            if torch.distributed.is_initialized():
+                torch.distributed.all_reduce(stats, op=torch.distributed.ReduceOp.SUM)
+            self.rollout_batch["advantages"] = normalize_advantages_per_task(
+                self.rollout_batch["advantages"],
+                task_ids,
+                stats,
+                min_count=self.advantage_normalization.min_count,
+                eps=self.advantage_normalization.eps,
+                fallback=self.advantage_normalization.fallback,
+            )
+            normalization_metrics = task_advantage_normalization_metrics(
+                stats,
+                min_count=self.advantage_normalization.min_count,
+                eps=self.advantage_normalization.eps,
             )
 
         self.model.train()
@@ -479,4 +515,5 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
             mean_metric_dict,
             op=torch.distributed.ReduceOp.AVG,
         )
+        mean_metric_dict.update(normalization_metrics)
         return mean_metric_dict

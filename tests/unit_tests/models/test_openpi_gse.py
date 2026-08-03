@@ -199,9 +199,7 @@ def test_configure_openpi_gse_adds_last_layer_vlm_adapters() -> None:
         GSELinear,
     )
     assert isinstance(
-        model.paligemma_with_expert.paligemma.language_model.layers[
-            0
-        ].self_attn.q_proj,
+        model.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj,
         nn.Linear,
     )
     wrapped_action = model.paligemma_with_expert.gemma_expert.model.layers[
@@ -321,3 +319,21 @@ def test_openpi_gse_accepts_ppo_auxiliary_configuration() -> None:
     )
 
     assert len(report.injected_module_names) == 14
+
+
+def test_layerwise_task_metrics_enable_router_assignment_recording() -> None:
+    model = ToyOpenPi()
+    configure_openpi_gse(
+        model,
+        make_integration_config(
+            log_layerwise_task_router_metrics=True,
+            task_router_num_tasks=50,
+            task_router_informative_nmi_threshold=0.02,
+        ),
+    )
+
+    wrapped_layers = [
+        module for module in model.modules() if isinstance(module, GSELinear)
+    ]
+    assert wrapped_layers
+    assert all(layer.config.record_routing_assignments for layer in wrapped_layers)

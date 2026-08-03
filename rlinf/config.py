@@ -24,6 +24,9 @@ import torch.nn.functional as F
 from omegaconf import OmegaConf, open_dict
 from omegaconf.dictconfig import DictConfig
 
+from rlinf.algorithms.advantage_normalization import (
+    resolve_advantage_normalization_config,
+)
 from rlinf.envs import SupportedEnvType
 from rlinf.scheduler.cluster import Cluster
 from rlinf.utils.placement import (
@@ -845,6 +848,8 @@ def validate_embodied_cfg(cfg):
     )
     model_cfg = cfg.rollout.model if only_eval else cfg.actor.model
     algorithm_cfg = cfg.get("algorithm", {}) or {}
+    if not only_eval:
+        resolve_advantage_normalization_config(algorithm_cfg)
     model_type = SupportedModel(model_cfg.model_type)
     assert model_type in EMBODIED_MODEL, (
         f"Model type: '{model_cfg.model_type}' is not an embodied model. "
@@ -976,9 +981,7 @@ def validate_embodied_cfg(cfg):
         assert cfg.env.eval.total_num_envs % env_world_size % stage_num == 0, (
             "Total number of parallel environments for evaluation must be divisible by the number of environment processes and the number of pipeline stages"
         )
-        assert (
-            cfg.env.eval.total_num_envs // stage_num % rollout_world_size == 0
-        ), (
+        assert cfg.env.eval.total_num_envs // stage_num % rollout_world_size == 0, (
             "env.eval.total_num_envs // rollout.pipeline_stage_num must be "
             "divisible by the number of rollout processes"
         )
@@ -1010,9 +1013,7 @@ def validate_embodied_cfg(cfg):
         assert cfg.env.train.total_num_envs % env_world_size % stage_num == 0, (
             "Total number of parallel environments for training must be divisible by the number of environment processes and the number of pipeline stages"
         )
-        assert (
-            cfg.env.train.total_num_envs // stage_num % rollout_world_size == 0
-        ), (
+        assert cfg.env.train.total_num_envs // stage_num % rollout_world_size == 0, (
             "env.train.total_num_envs // rollout.pipeline_stage_num must be "
             "divisible by the number of rollout processes"
         )

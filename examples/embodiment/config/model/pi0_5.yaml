@@ -44,7 +44,10 @@ gse:
   orthogonality_loss_coef: 0.0
   log_router_metrics: True
   log_task_router_metrics: False
+  # Report both aggregate and per-GSE-layer task/router association.
+  log_layerwise_task_router_metrics: False
   task_router_num_tasks: null
+  task_router_informative_nmi_threshold: 0.01
   log_orthogonality: True
   target_modules:
     - "q_proj"

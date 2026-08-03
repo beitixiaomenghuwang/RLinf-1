@@ -21,6 +21,11 @@ import numpy as np
 import torch
 from omegaconf import DictConfig, OmegaConf
 
+from rlinf.algorithms.advantage_normalization import (
+    normalize_advantages_per_task,
+    resolve_advantage_normalization_config,
+    task_advantage_stats,
+)
 from rlinf.algorithms.registry import calculate_adv_and_returns
 from rlinf.algorithms.rlt.transition import update_rlt_transitions
 from rlinf.data.embodied_io_struct import (
@@ -99,6 +104,9 @@ class EnvWorker(Worker):
 
         # Env configurations
         self.use_training_pipeline = self.cfg.runner.get("use_training_pipeline", False)
+        self.advantage_normalization = resolve_advantage_normalization_config(
+            cfg.get("algorithm", {}) or {}
+        )
         self.only_eval = getattr(self.cfg.runner, "only_eval", False)
         self.model_cfg = (
             self.cfg.rollout.model if self.only_eval else self.cfg.actor.model
@@ -1371,7 +1379,7 @@ class EnvWorker(Worker):
             "reward_type": self.cfg.algorithm.reward_type,
             "loss_mask": rollout_batch.get("loss_mask", None),
             "loss_mask_sum": rollout_batch.get("loss_mask_sum", None),
-            "normalize_advantages": self.cfg.algorithm.get("normalize_advantages", True)
+            "normalize_advantages": self.advantage_normalization.mode == "global"
             and not self.use_training_pipeline,
         }
         advantages_and_returns = calculate_adv_and_returns(**kwargs)
@@ -1439,25 +1447,63 @@ class EnvWorker(Worker):
                     pending_batches.append((actor_rank, batch))
                     batches_by_actor_rank[actor_rank].append(batch)
 
-            if self.cfg.algorithm.get("normalize_advantages", True):
+            if self.advantage_normalization.mode != "none":
                 for actor_rank, batches in sorted(batches_by_actor_rank.items()):
-                    local_adv_stats = sum(
-                        masked_stats(batch["advantages"], batch.get("loss_mask"))
-                        for batch in batches
-                    )
+                    if self.advantage_normalization.mode == "global":
+                        local_stats = sum(
+                            masked_stats(batch["advantages"], batch.get("loss_mask"))
+                            for batch in batches
+                        )
+                    else:
+                        task_stats = []
+                        for batch in batches:
+                            task_ids = batch.get("forward_inputs", {}).get("task_ids")
+                            if not isinstance(task_ids, torch.Tensor):
+                                raise ValueError(
+                                    "Per-task advantage normalization requires "
+                                    "forward_inputs.task_ids in pipeline batches"
+                                )
+                            task_stats.append(
+                                task_advantage_stats(
+                                    batch["advantages"],
+                                    task_ids,
+                                    num_tasks=int(
+                                        self.advantage_normalization.num_tasks
+                                    ),
+                                    loss_mask=batch.get("loss_mask"),
+                                )
+                            )
+                        local_stats = sum(task_stats)
+
                     env_ranks = self.pipeline_actor_env_ranks[actor_rank]
-                    global_adv_stats = sum(
+                    global_stats = sum(
                         self.broadcast(
-                            local_adv_stats if self._rank == src_rank else None,
+                            local_stats if self._rank == src_rank else None,
                             groups=[(self._group_name, env_ranks)],
                             src=(self._group_name, src_rank),
                         )
                         for src_rank in env_ranks
                     )
                     for batch in batches:
-                        batch["advantages"] = normalize_from_stats(
-                            batch["advantages"], global_adv_stats
-                        )
+                        if self.advantage_normalization.mode == "global":
+                            batch["advantages"] = normalize_from_stats(
+                                batch["advantages"], global_stats
+                            )
+                        else:
+                            task_ids = batch.get("forward_inputs", {}).get("task_ids")
+                            if not isinstance(task_ids, torch.Tensor):
+                                raise ValueError(
+                                    "Per-task advantage normalization requires "
+                                    "forward_inputs.task_ids in pipeline batches"
+                                )
+                            batch["advantages"] = normalize_advantages_per_task(
+                                batch["advantages"],
+                                task_ids,
+                                global_stats,
+                                min_count=self.advantage_normalization.min_count,
+                                eps=self.advantage_normalization.eps,
+                                fallback=self.advantage_normalization.fallback,
+                            )
 
             for actor_rank, batch in pending_batches:
                 for micro_batch in self.pack_pipeline_micro_batches(batch, actor_rank):

@@ -45,8 +45,8 @@ actor:
   optim:
     # Decay over the complete global-step horizon so the final checkpoints can
     # converge. Add warmup only as a separate early-stability ablation.
-    lr: 1.0e-5
-    value_lr: 5.0e-5
+    lr: 5.0e-6
+    value_lr: 1.0e-4
     total_training_steps: ${runner.max_epochs}
     lr_warmup_steps: 0
     lr_scheduler: "cosine"

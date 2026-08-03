@@ -852,7 +852,6 @@ python examples/embodiment/train_embodied_agent.py \
   env.eval.total_num_envs=512 \
   env.eval.use_fixed_reset_state_ids=True \
   env.eval.is_eval=True \
-  actor.optim.lr=5e-5 \
   actor.optim.total_training_steps=6400 \
   actor.seed=42 \
   rollout.seed=42 \
@@ -1292,7 +1291,6 @@ python examples/embodiment/train_embodied_agent.py \
   env.eval.total_num_envs=448 \
   env.eval.use_fixed_reset_state_ids=True \
   env.eval.is_eval=True \
-  actor.optim.lr=5e-5 \
   actor.optim.total_training_steps=6400 \
   actor.seed=42 \
   rollout.seed=42 \
@@ -1350,17 +1348,18 @@ python examples/embodiment/train_embodied_agent.py \
   2>&1 | tee "$EVAL_DIR/console.log"
 ```
 
-### 9.13 Three parallel from-SFT GSE experiments
+### 9.13 Four parallel from-SFT GSE experiments
 
-Three experiments using two reusable Hydra profiles cover the next comparison.
-All three load the original Pi0.5 MT50 SFT checkpoint, set
+Four experiments using three reusable Hydra profiles cover the next comparison.
+All four load the original Pi0.5 MT50 SFT checkpoint, set
 `runner.resume_dir=null`, inject zero-output GSE, and train the selected adapters
 from step 0. Do not point any of these runs at the action-GSE step-180
 checkpoint.
 
 | Experiment | Config | Trainable GSE surface | Initial actor micro batch |
 |---|---|---|---|
-| Action-only rank 32 | `metaworld_50_ppo_openpi_pi05_gse` | All 18 action blocks, total rank 32 | 16 |
+| Action-only rank 32 | `metaworld_50_ppo_openpi_pi05_gse_action_r32` | All 18 action blocks, total rank 32 | 16 |
+| Action-only rank 32 + per-task advantage | `metaworld_50_ppo_openpi_pi05_gse_action_r32_per_task_adv` | Same action-only rank-32 surface with per-task GAE normalization | 16 |
 | Joint action + VLM last 4 | `metaworld_50_ppo_openpi_pi05_gse_joint_vlm` | All action blocks plus VLM language blocks 14-17, rank 64 | 16 |
 | Joint action + all VLM layers | `metaworld_50_ppo_openpi_pi05_gse_joint_vlm` | All action blocks plus all 18 VLM language blocks, rank 64 | 16 |
 
@@ -1404,16 +1403,13 @@ mkdir -p "$RUN_DIR"
 
 python examples/embodiment/train_embodied_agent.py \
   --config-path /workspace/RLinf/examples/embodiment/config \
-  --config-name metaworld_50_ppo_openpi_pi05_gse \
+  --config-name metaworld_50_ppo_openpi_pi05_gse_action_r32 \
   env.train.total_num_envs=128 \
   env.train.rollout_epoch=2 \
   actor.micro_batch_size=16 \
   actor.global_batch_size=1024 \
   actor.model.model_path="$SFT_MODEL" \
   rollout.model.model_path="$SFT_MODEL" \
-  actor.model.gse.total_rank=32 \
-  actor.model.gse.lora_alpha=32.0 \
-  +actor.model.gse.train_action_adapters=True \
   runner.resume_dir=null \
   runner.logger.log_path="$RUN_DIR" \
   runner.logger.experiment_name="$EXP_NAME" \
@@ -1422,16 +1418,27 @@ python examples/embodiment/train_embodied_agent.py \
   runner.val_check_interval=20 \
   runner.max_checkpoints_to_keep=4 \
   env.eval.total_num_envs=512 \
-  actor.optim.lr=5e-5 \
-  'actor.optim.total_training_steps=${runner.max_epochs}' \
-  actor.optim.lr_warmup_steps=0 \
-  actor.optim.lr_scheduler=cosine \
-  actor.optim.num_cycles=0.5 \
   actor.seed=42 \
   rollout.seed=42 \
   "${WANDB_OVERRIDES[@]}" \
   2>&1 | tee "$RUN_DIR/console.log"
 ```
+
+The matched Per-task advantage ablation uses the same command and hardware
+settings, with only these run-specific substitutions:
+
+```bash
+--config-name metaworld_50_ppo_openpi_pi05_gse_action_r32_per_task_adv
+runner.logger.experiment_name=gse_action_r32_per_task_seed42
+```
+
+Both profiles keep the default action learning rate (`5e-6`) and value learning
+rate (`1e-4`). The Per-task profile normalizes GAE advantages independently for
+the 50 MetaWorld tasks, with global-statistics fallback for sparse or
+zero-variance tasks. It also logs aggregate and per-router-layer task
+information metrics; use ``gse/task_router/adjusted_cramers_v``,
+``gse/task_router/prob_nmi``, and the ``layerwise_*_max`` metrics to distinguish
+true absence of detectable task information from cancellation across layers.
 
 Joint action + VLM-last4 from SFT:
 
@@ -1462,8 +1469,6 @@ python examples/embodiment/train_embodied_agent.py \
   runner.val_check_interval=20 \
   runner.max_checkpoints_to_keep=4 \
   env.eval.total_num_envs=512 \
-  actor.optim.lr=1e-5 \
-  actor.optim.value_lr=5e-5 \
   'actor.optim.total_training_steps=${runner.max_epochs}' \
   actor.optim.lr_warmup_steps=0 \
   actor.optim.lr_scheduler=cosine \
@@ -1503,8 +1508,6 @@ python examples/embodiment/train_embodied_agent.py \
   runner.val_check_interval=20 \
   runner.max_checkpoints_to_keep=4 \
   env.eval.total_num_envs=512 \
-  actor.optim.lr=1e-5 \
-  actor.optim.value_lr=5e-5 \
   'actor.optim.total_training_steps=${runner.max_epochs}' \
   actor.optim.lr_warmup_steps=0 \
   actor.optim.lr_scheduler=cosine \

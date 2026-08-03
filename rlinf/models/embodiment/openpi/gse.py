@@ -52,7 +52,9 @@ _INTEGRATION_FIELDS = {
     "orthogonality_loss_coef",
     "log_router_metrics",
     "log_task_router_metrics",
+    "log_layerwise_task_router_metrics",
     "task_router_num_tasks",
+    "task_router_informative_nmi_threshold",
     "log_orthogonality",
     "vlm",
 }
@@ -90,6 +92,7 @@ def _build_core_config(config: Mapping[str, Any]) -> GSEConfig:
     }
     values["record_routing_assignments"] = bool(
         config.get("log_task_router_metrics", False)
+        or config.get("log_layerwise_task_router_metrics", False)
     )
     return GSEConfig(**values)
 
@@ -124,7 +127,9 @@ def _resolve_layer_indices(transformer: nn.Module, configured: Any) -> tuple[int
     try:
         num_layers = len(transformer.layers)
     except (AttributeError, TypeError) as error:
-        raise ValueError("OpenPI VLM transformer must expose a layers sequence") from error
+        raise ValueError(
+            "OpenPI VLM transformer must expose a layers sequence"
+        ) from error
     raw_indices = (-1,) if configured is None else configured
     if isinstance(raw_indices, int):
         raw_indices = (raw_indices,)
@@ -271,9 +276,7 @@ def configure_openpi_gse(
     mark_only_gse_as_trainable(model)
     if not bool(config.get("train_action_adapters", True)):
         if vlm_report is None:
-            raise ValueError(
-                "train_action_adapters=false requires an enabled VLM GSE"
-            )
+            raise ValueError("train_action_adapters=false requires an enabled VLM GSE")
         for _, layer in iter_gse_layers(action_expert):
             layer.requires_grad_(False)
     if bool(config.get("train_value_head", True)) and hasattr(model, "value_head"):

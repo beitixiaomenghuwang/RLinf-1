@@ -93,6 +93,7 @@ class PipelineEmbodiedFSDPActor(EmbodiedFSDPActor):
         self.model.train()
 
         metrics: dict[str, list[float]] = {}
+        task_router_statistics: dict[str, torch.Tensor] = {}
         global_batches: dict[int, deque[GlobalBatchState]] = defaultdict(deque)
         current_global_batch: list[dict[str, torch.Tensor]] = []
         pending_global_batch: deque[dict[str, torch.Tensor]] = deque()
@@ -116,6 +117,7 @@ class PipelineEmbodiedFSDPActor(EmbodiedFSDPActor):
                     micro_batch=micro_batch,
                     metrics=metrics,
                     is_last=is_last_micro_batch,
+                    task_router_statistics=task_router_statistics,
                 )
                 current_global_batch.append(micro_batch)
                 if is_last_micro_batch:
@@ -144,6 +146,7 @@ class PipelineEmbodiedFSDPActor(EmbodiedFSDPActor):
                     micro_batch=micro_batch,
                     metrics=metrics,
                     is_last=is_last_micro_batch,
+                    task_router_statistics=task_router_statistics,
                 )
 
             self.finish_global_batch(metrics)
@@ -172,6 +175,7 @@ class PipelineEmbodiedFSDPActor(EmbodiedFSDPActor):
         mean_metric_dict = all_reduce_dict(
             mean_metric_dict, op=torch.distributed.ReduceOp.AVG
         )
+        mean_metric_dict.update(self.reduce_task_router_metrics(task_router_statistics))
         return {
             "rollout_metrics": rollout_metrics,
             "training_metrics": mean_metric_dict,

@@ -1,0 +1,16 @@
+defaults:
+  - metaworld_50_ppo_openpi_pi05_gse_action_r32
+  - _self_
+
+# This ablation changes only advantage normalization relative to action_r32.
+runner:
+  logger:
+    experiment_name: "metaworld_50_pi05_gse_action_r32_per_task_adv"
+
+algorithm:
+  advantage_normalization_mode: "per_task"
+  advantage_normalization_num_tasks: 50
+  advantage_normalization_min_count: 2
+  advantage_normalization_eps: 1.0e-5
+  advantage_normalization_fallback: "global"
+

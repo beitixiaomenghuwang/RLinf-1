@@ -24,6 +24,12 @@ from torch.distributed.tensor import DTensor
 from torch.multiprocessing.reductions import reduce_tensor
 
 import rlinf.algorithms  # noqa: F401
+from rlinf.algorithms.advantage_normalization import (
+    normalize_advantages_per_task,
+    resolve_advantage_normalization_config,
+    task_advantage_normalization_metrics,
+    task_advantage_stats,
+)
 from rlinf.algorithms.registry import calculate_adv_and_returns, policy_loss
 from rlinf.algorithms.utils import (
     kl_penalty,
@@ -44,8 +50,9 @@ from rlinf.models import get_model
 from rlinf.models.embodiment.base_policy import ForwardType
 from rlinf.models.peft.gse import (
     gse_auxiliary_loss,
-    gse_task_router_metrics,
-    gse_task_router_statistics,
+    gse_layerwise_task_router_metrics,
+    gse_layerwise_task_router_statistics,
+    gse_task_router_metrics_from_tensor,
     reset_gse_auxiliary_state,
 )
 from rlinf.scheduler import Channel, Cluster, Worker
@@ -1040,6 +1047,9 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         self.gse_enabled = bool(
             self.gse_cfg is not None and self.gse_cfg.get("enabled", False)
         )
+        self.advantage_normalization = resolve_advantage_normalization_config(
+            cfg.algorithm
+        )
 
         self.enable_sft_co_train = cfg.actor.get("enable_sft_co_train", False)
         self.version = 0
@@ -1268,6 +1278,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             "reward_type": self.cfg.algorithm.reward_type,
             "loss_mask": self.rollout_batch.get("loss_mask", None),
             "loss_mask_sum": self.rollout_batch.get("loss_mask_sum", None),
+            "normalize_advantages": self.advantage_normalization.mode == "global",
         }
 
         advantages_and_returns = calculate_adv_and_returns(**kwargs)
@@ -1278,7 +1289,39 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         if kwargs["loss_mask_sum"] is not None:
             self.rollout_batch.update({"loss_mask_sum": kwargs["loss_mask_sum"]})
 
+        normalization_metrics = {}
+        if self.advantage_normalization.mode == "per_task":
+            forward_inputs = self.rollout_batch.get("forward_inputs", {}) or {}
+            task_ids = forward_inputs.get("task_ids")
+            if not isinstance(task_ids, torch.Tensor):
+                raise ValueError(
+                    "Per-task advantage normalization requires "
+                    "rollout_batch.forward_inputs.task_ids"
+                )
+            stats = task_advantage_stats(
+                self.rollout_batch["advantages"],
+                task_ids,
+                num_tasks=int(self.advantage_normalization.num_tasks),
+                loss_mask=self.rollout_batch.get("loss_mask"),
+            ).to(Worker.torch_platform.current_device())
+            if torch.distributed.is_initialized():
+                torch.distributed.all_reduce(stats, op=torch.distributed.ReduceOp.SUM)
+            self.rollout_batch["advantages"] = normalize_advantages_per_task(
+                self.rollout_batch["advantages"],
+                task_ids,
+                stats,
+                min_count=self.advantage_normalization.min_count,
+                eps=self.advantage_normalization.eps,
+                fallback=self.advantage_normalization.fallback,
+            )
+            normalization_metrics = task_advantage_normalization_metrics(
+                stats,
+                min_count=self.advantage_normalization.min_count,
+                eps=self.advantage_normalization.eps,
+            )
+
         rollout_metrics = compute_rollout_metrics(self.rollout_batch)
+        rollout_metrics.update(normalization_metrics)
         if self.cfg.algorithm.get("log_task_advantage_metrics", False):
             num_tasks = self.cfg.algorithm.get("task_advantage_num_tasks")
             if num_tasks is None:
@@ -1400,7 +1443,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             f"{rollout_size} is not divisible by {batch_size_per_rank}"
         )
         metrics = {}
-        task_router_statistics: dict[str, float] = {}
+        task_router_statistics: dict[str, torch.Tensor] = {}
         update_epoch = self.cfg.algorithm.get("update_epoch", 1)
         for _ in range(update_epoch):
             rollout_dataloader_iter = split_dict_to_chunk(
@@ -1454,20 +1497,31 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         mean_metric_dict = all_reduce_dict(
             mean_metric_dict, op=torch.distributed.ReduceOp.AVG
         )
-        if task_router_statistics:
-            reduced_statistics = all_reduce_dict(
-                task_router_statistics, op=torch.distributed.ReduceOp.SUM
-            )
-            mean_metric_dict.update(
-                gse_task_router_metrics(
-                    reduced_statistics,
-                    num_tasks=int(self.gse_cfg.get("task_router_num_tasks")),
-                    num_experts=int(self.gse_cfg.get("num_experts", 8))
-                    - int(self.gse_cfg.get("num_generalized_experts", 2)),
-                )
-            )
+        mean_metric_dict.update(self.reduce_task_router_metrics(task_router_statistics))
 
         return mean_metric_dict
+
+    def reduce_task_router_metrics(
+        self, task_router_statistics: dict[str, torch.Tensor]
+    ) -> dict[str, float]:
+        """All-reduce packed task/router statistics and finalize diagnostics."""
+        if not task_router_statistics:
+            return {}
+        reduced_statistics = task_router_statistics["packed"]
+        torch.distributed.all_reduce(
+            reduced_statistics, op=torch.distributed.ReduceOp.SUM
+        )
+        metrics = gse_task_router_metrics_from_tensor(reduced_statistics)
+        if bool(self.gse_cfg.get("log_layerwise_task_router_metrics", False)):
+            metrics.update(
+                gse_layerwise_task_router_metrics(
+                    reduced_statistics,
+                    informative_nmi_threshold=float(
+                        self.gse_cfg.get("task_router_informative_nmi_threshold", 0.01)
+                    ),
+                )
+            )
+        return metrics
 
     def train_micro_batch(
         self,
@@ -1475,7 +1529,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         metrics: dict[str, list[float]],
         *,
         is_last: bool,
-        task_router_statistics: dict[str, float] | None = None,
+        task_router_statistics: dict[str, torch.Tensor] | None = None,
     ) -> None:
         micro_batch = put_tensor_device(micro_batch, self.device)
         backward_ctx = self.before_micro_batch(self.model, is_last_micro_batch=is_last)
@@ -1588,15 +1642,18 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 orthogonality_coefficient=float(
                     self.gse_cfg.get("orthogonality_loss_coef", 0.0)
                 ),
-                log_orthogonality=bool(
-                    self.gse_cfg.get("log_orthogonality", True)
-                ),
+                log_orthogonality=bool(self.gse_cfg.get("log_orthogonality", True)),
             )
             loss += auxiliary_loss
             if bool(self.gse_cfg.get("log_router_metrics", True)):
                 metrics_data.update(scalar_metrics_to_python(gse_metrics))
             if (
-                bool(self.gse_cfg.get("log_task_router_metrics", False))
+                (
+                    bool(self.gse_cfg.get("log_task_router_metrics", False))
+                    or bool(
+                        self.gse_cfg.get("log_layerwise_task_router_metrics", False)
+                    )
+                )
                 and task_router_statistics is not None
                 and isinstance(task_ids, torch.Tensor)
             ):
@@ -1606,7 +1663,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         "actor.model.gse.task_router_num_tasks is required when "
                         "task-conditioned router metrics are enabled"
                     )
-                micro_statistics = gse_task_router_statistics(
+                micro_statistics = gse_layerwise_task_router_statistics(
                     self.model,
                     task_ids,
                     num_tasks=int(num_tasks),
@@ -1616,10 +1673,11 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         else None
                     ),
                 )
-                for name, value in micro_statistics.items():
-                    task_router_statistics[name] = task_router_statistics.get(
-                        name, 0.0
-                    ) + float(value.item())
+                if micro_statistics.numel() > 0:
+                    if "packed" not in task_router_statistics:
+                        task_router_statistics["packed"] = micro_statistics.clone()
+                    else:
+                        task_router_statistics["packed"].add_(micro_statistics)
 
         loss /= self.gradient_accumulation
         with backward_ctx:

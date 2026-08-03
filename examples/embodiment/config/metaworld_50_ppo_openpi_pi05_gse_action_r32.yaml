@@ -1,0 +1,48 @@
+defaults:
+  - metaworld_50_ppo_openpi_pi05_gse
+  - _self_
+
+# Eight-GPU action-only rank-32 reference. The four-GPU launcher overrides only
+# parallelism-related fields while preserving the global rollout/batch protocol.
+runner:
+  logger:
+    experiment_name: "metaworld_50_pi05_gse_action_r32"
+  max_epochs: 320
+  val_check_interval: 20
+  save_interval: 20
+  max_checkpoints_to_keep: 4
+  resume_dir: null
+
+algorithm:
+  normalize_advantages: True
+  advantage_normalization_mode: "global"
+
+env:
+  train:
+    total_num_envs: 128
+    rollout_epoch: 2
+  eval:
+    total_num_envs: 512
+    rollout_epoch: 1
+
+actor:
+  micro_batch_size: 16
+  global_batch_size: 1024
+  model:
+    gse:
+      total_rank: 32
+      lora_alpha: 32.0
+      train_action_adapters: True
+      log_task_router_metrics: True
+      log_layerwise_task_router_metrics: True
+      task_router_num_tasks: 50
+      task_router_informative_nmi_threshold: 0.01
+  optim:
+    # Keep the OpenPI default actor/value learning rates; experiment launchers
+    # must not override them for this comparison.
+    lr: 5.0e-6
+    value_lr: 1.0e-4
+    total_training_steps: ${runner.max_epochs}
+    lr_warmup_steps: 0
+    lr_scheduler: "cosine"
+    num_cycles: 0.5

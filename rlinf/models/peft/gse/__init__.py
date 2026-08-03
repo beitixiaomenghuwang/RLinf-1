@@ -11,10 +11,13 @@ from .injector import (
 from .layer import GSEAdapter, GSEExpert, GSELinear
 from .losses import (
     gse_auxiliary_loss,
+    gse_layerwise_task_router_metrics,
+    gse_layerwise_task_router_statistics,
     gse_load_balancing_loss,
     gse_orthogonality_loss,
     gse_router_metrics,
     gse_task_router_metrics,
+    gse_task_router_metrics_from_tensor,
     gse_task_router_statistics,
     reset_gse_auxiliary_state,
 )
@@ -27,10 +30,13 @@ __all__ = [
     "GSEInjectionReport",
     "GSELinear",
     "gse_auxiliary_loss",
+    "gse_layerwise_task_router_metrics",
+    "gse_layerwise_task_router_statistics",
     "gse_load_balancing_loss",
     "gse_orthogonality_loss",
     "gse_router_metrics",
     "gse_task_router_metrics",
+    "gse_task_router_metrics_from_tensor",
     "gse_task_router_statistics",
     "gse_state_dict",
     "inject_gse",

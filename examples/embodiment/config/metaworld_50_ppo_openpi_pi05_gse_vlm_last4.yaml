@@ -186,8 +186,8 @@ actor:
       value_after_vlm: True
 
   optim:
-    lr: 1.0e-5
-    value_lr: 5.0e-5
+    lr: 5.0e-6
+    value_lr: 1.0e-4
     adam_beta1: 0.9
     adam_beta2: 0.95
     adam_eps: 1.0e-08
