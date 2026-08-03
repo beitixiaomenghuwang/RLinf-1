@@ -457,11 +457,13 @@ class EmbodiedRunner:
             run_time_exceeded=False,
         )
         marker = Path(resume_dir) / _EVALUATION_COMPLETE_METADATA
-        return run_val and not marker.is_file()
+        force_evaluation = self.cfg.runner.get("force_eval_on_resume", False)
+        return run_val and (force_evaluation or not marker.is_file())
 
     def _evaluate_resumed_checkpoint(self) -> None:
         if not self._resume_needs_evaluation():
             return
+        evaluation_start_time = time.time()
         self.logger.info(
             "Evaluating resumed checkpoint at step %d before continuing training.",
             self.global_step,
@@ -469,21 +471,38 @@ class EmbodiedRunner:
         with self.timer("eval"):
             self.update_rollout_weights()
             eval_metrics = self.evaluate()
-            eval_metrics = {f"eval/{key}": value for key, value in eval_metrics.items()}
-            self.metric_logger.log(data=eval_metrics, step=self.global_step)
-            self._maybe_save_best_macro_mean(eval_metrics)
-            self._mark_evaluation_complete(eval_metrics)
+        eval_metrics = {f"eval/{key}": value for key, value in eval_metrics.items()}
+        self.metric_logger.log(data=eval_metrics, step=self.global_step)
+        time_metrics = {
+            f"time/{key}": value
+            for key, value in self.timer.consume_durations().items()
+        }
+        self.metric_logger.log(data=time_metrics, step=self.global_step)
+        # metrics.log and metrics.jsonl are written by the table logger rather
+        # than MetricLogger. Write synchronously before the completion marker so
+        # a crash cannot leave a "complete" evaluation missing from local logs.
+        completed_step_index = max(self.global_step - 1, 0)
+        print_metrics_table(
+            completed_step_index,
+            self.max_steps,
+            evaluation_start_time,
+            {**time_metrics, **eval_metrics},
+            completed_step_index,
+            self.metric_logger.log_path,
+        )
+        self._maybe_save_best_macro_mean(eval_metrics)
+        self._mark_evaluation_complete(eval_metrics)
 
     def _mark_evaluation_complete(self, eval_metrics: dict) -> None:
         metadata = {
             "global_step": int(self.global_step),
-            "task_success_macro_mean": eval_metrics.get(
-                "eval/task_success/macro_mean"
+            "num_trajectories": eval_metrics.get("eval/num_trajectories"),
+            "task_success_covered_tasks": eval_metrics.get(
+                "eval/task_success/covered_tasks"
             ),
+            "task_success_macro_mean": eval_metrics.get("eval/task_success/macro_mean"),
         }
-        checkpoint_paths = {
-            self._checkpoints_dir() / f"global_step_{self.global_step}"
-        }
+        checkpoint_paths = {self._checkpoints_dir() / f"global_step_{self.global_step}"}
         resume_dir = self.cfg.runner.get("resume_dir", None)
         if resume_dir is not None:
             resume_path = Path(resume_dir)

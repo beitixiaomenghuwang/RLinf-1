@@ -1,6 +1,77 @@
+# Copyright 2025 The RLinf Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Dependency-free reset-state scheduling for MetaWorld benchmarks."""
 
 import numpy as np
+
+
+def required_reset_states_per_process(
+    num_group: int,
+    rollout_epoch: int,
+    *,
+    is_eval: bool,
+) -> int:
+    """Return the reset-state capacity required by one environment process.
+
+    Multi-round evaluation must reserve one distinct batch for every rollout
+    epoch. Training only needs the next batch because its shuffled pool can be
+    regenerated after exhaustion.
+    """
+    if num_group <= 0:
+        raise ValueError(f"num_group must be positive, got {num_group}")
+    if rollout_epoch <= 0:
+        raise ValueError(f"rollout_epoch must be positive, got {rollout_epoch}")
+    return num_group * rollout_epoch if is_eval else num_group
+
+
+def should_advance_fixed_eval_reset_states(
+    *,
+    is_eval: bool,
+    use_fixed_reset_state_ids: bool,
+    dones: np.ndarray,
+) -> bool:
+    """Return whether a completed eval batch should advance its reset IDs."""
+    dones = np.asarray(dones, dtype=bool)
+    return (
+        is_eval and use_fixed_reset_state_ids and dones.size > 0 and bool(dones.all())
+    )
+
+
+def resolve_egl_device_id(
+    seed_offset: int,
+    accelerator_rank: int | None,
+    device_count: int,
+) -> int:
+    """Map a logical environment process to a visible EGL device.
+
+    Pipeline stages increase ``seed_offset`` beyond the number of physical
+    GPUs. Rendering must remain on the EnvWorker's assigned accelerator while
+    the full seed offset continues to partition reset states.
+
+    Args:
+        seed_offset: Logical environment-process offset used for sampling.
+        accelerator_rank: Physical accelerator rank assigned to the EnvWorker.
+        device_count: Number of CUDA devices visible in the worker process.
+
+    Returns:
+        A valid zero-based EGL device index.
+    """
+    if device_count <= 0:
+        return 0
+    candidate = seed_offset if accelerator_rank is None else accelerator_rank
+    return int(candidate) % device_count
 
 
 def build_balanced_reset_state_matrix(
@@ -30,9 +101,7 @@ def build_balanced_reset_state_matrix(
             reset_state_ids.append(task_start + trial_id)
 
     reset_state_ids = np.asarray(reset_state_ids, dtype=np.int64)
-    divisible_size = len(reset_state_ids) - (
-        len(reset_state_ids) % total_num_processes
-    )
+    divisible_size = len(reset_state_ids) - (len(reset_state_ids) % total_num_processes)
     required_size = minimum_states_per_process * total_num_processes
     valid_size = max(divisible_size, required_size)
     if valid_size > len(reset_state_ids):

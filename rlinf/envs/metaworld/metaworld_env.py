@@ -25,7 +25,12 @@ import numpy as np
 import torch
 
 from rlinf.envs.metaworld import MetaWorldBenchmark
-from rlinf.envs.metaworld.sampling import build_balanced_reset_state_matrix
+from rlinf.envs.metaworld.sampling import (
+    build_balanced_reset_state_matrix,
+    required_reset_states_per_process,
+    resolve_egl_device_id,
+    should_advance_fixed_eval_reset_states,
+)
 from rlinf.envs.metaworld.venv import ReconfigureSubprocEnv
 from rlinf.envs.utils import list_of_dict_to_dict_of_list, to_tensor
 
@@ -44,6 +49,13 @@ class MetaWorldEnv(gym.Env):
         self.cfg = cfg
         self.total_num_processes = total_num_processes
         self.worker_info = worker_info
+        self.egl_device_id = resolve_egl_device_id(
+            seed_offset=seed_offset,
+            accelerator_rank=(
+                None if worker_info is None else worker_info.accelerator_rank
+            ),
+            device_count=torch.cuda.device_count(),
+        )
         self.seed = self.cfg.seed + seed_offset
         self._is_start = True
         self.num_envs = num_envs
@@ -97,7 +109,7 @@ class MetaWorldEnv(gym.Env):
         for env_fn_param in env_fn_params:
 
             def env_fn(param=env_fn_param):
-                os.environ["MUJOCO_EGL_DEVICE_ID"] = str(self.seed_offset)
+                os.environ["MUJOCO_EGL_DEVICE_ID"] = str(self.egl_device_id)
                 env_name = param["env_name"]
                 env = gym.make(
                     "Meta-World/MT1",
@@ -167,7 +179,11 @@ class MetaWorldEnv(gym.Env):
             self.total_num_processes,
             generator=self._generator_ordered,
             shuffle=not self.is_eval,
-            minimum_states_per_process=self.num_group,
+            minimum_states_per_process=required_reset_states_per_process(
+                self.num_group,
+                int(self.cfg.get("rollout_epoch", 1)),
+                is_eval=self.is_eval,
+            ),
         )
 
     def _get_ordered_reset_state_ids(self, num_reset_states):
@@ -444,6 +460,16 @@ class MetaWorldEnv(gym.Env):
 
     def _handle_auto_reset(self, dones, _final_obs, infos):
         final_obs = copy.deepcopy(_final_obs)
+        if should_advance_fixed_eval_reset_states(
+            is_eval=self.is_eval,
+            use_fixed_reset_state_ids=self.use_fixed_reset_state_ids,
+            dones=dones,
+        ):
+            # Evaluation ignores task terminations, so all environments reach
+            # the horizon together. Advance the ordered reset-state batch
+            # before auto-resetting instead of replaying the same states in
+            # every eval rollout epoch.
+            self.update_reset_state_ids()
         env_idx = np.arange(0, self.num_envs)[dones]
         final_info = copy.deepcopy(infos)
         obs, infos = self.reset(
