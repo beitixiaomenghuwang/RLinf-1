@@ -109,6 +109,26 @@ def test_resume_evaluates_pending_checkpoint_before_training(tmp_path) -> None:
     assert not runner._resume_needs_evaluation()
 
 
+def test_resume_force_evaluation_ignores_existing_completion_marker(tmp_path) -> None:
+    resume_dir = tmp_path / "global_step_20"
+    resume_dir.mkdir()
+    (resume_dir / "evaluation_complete.json").write_text("{}\n")
+    runner = EmbodiedRunner.__new__(EmbodiedRunner)
+    runner.cfg = SimpleNamespace(
+        runner=ConfigNamespace(
+            resume_dir=str(resume_dir),
+            eval_on_resume=True,
+            force_eval_on_resume=True,
+            val_check_interval=20,
+            save_interval=20,
+        )
+    )
+    runner.global_step = 20
+    runner.max_steps = 320
+
+    assert runner._resume_needs_evaluation()
+
+
 def test_resume_does_not_evaluate_between_intervals(tmp_path) -> None:
     resume_dir = tmp_path / "global_step_21"
     resume_dir.mkdir()
@@ -125,6 +145,78 @@ def test_resume_does_not_evaluate_between_intervals(tmp_path) -> None:
     runner.max_steps = 320
 
     assert not runner._resume_needs_evaluation()
+
+
+def test_resumed_checkpoint_evaluation_is_written_to_local_metrics(
+    tmp_path, monkeypatch
+) -> None:
+    resume_dir = tmp_path / "global_step_20"
+    resume_dir.mkdir()
+    runner = EmbodiedRunner.__new__(EmbodiedRunner)
+    runner.cfg = SimpleNamespace(
+        runner=ConfigNamespace(
+            resume_dir=str(resume_dir),
+            eval_on_resume=True,
+            val_check_interval=20,
+            save_interval=20,
+        )
+    )
+    runner.global_step = 20
+    runner.max_steps = 320
+    runner.logger = SimpleNamespace(info=lambda *_args: None)
+    runner.timer = lambda _name: nullcontext()
+    runner.timer.consume_durations = lambda: {"eval": 12.5}
+    runner.update_rollout_weights = lambda: None
+    runner.evaluate = lambda: {
+        "task_success/macro_mean": 0.75,
+        "num_trajectories": 512,
+    }
+    logged = []
+    runner.metric_logger = SimpleNamespace(
+        log=lambda **kwargs: logged.append(("backend", kwargs)),
+        log_path=str(tmp_path),
+    )
+    monkeypatch.setattr(
+        "rlinf.runners.embodied_runner.print_metrics_table",
+        lambda *args: logged.append(("local", args)),
+    )
+    runner._maybe_save_best_macro_mean = lambda metrics: logged.append(
+        ("best", metrics)
+    )
+    runner._mark_evaluation_complete = lambda metrics: logged.append(("mark", metrics))
+
+    runner._evaluate_resumed_checkpoint()
+
+    assert logged[0] == (
+        "backend",
+        {
+            "data": {
+                "eval/task_success/macro_mean": 0.75,
+                "eval/num_trajectories": 512,
+            },
+            "step": 20,
+        },
+    )
+    assert logged[1] == (
+        "backend",
+        {"data": {"time/eval": 12.5}, "step": 20},
+    )
+    assert logged[2][0] == "local"
+    table_args = logged[2][1]
+    assert table_args[0:2] == (19, 320)
+    assert table_args[3] == {
+        "time/eval": 12.5,
+        "eval/task_success/macro_mean": 0.75,
+        "eval/num_trajectories": 512,
+    }
+    assert table_args[4] == 19
+    assert [entry[0] for entry in logged] == [
+        "backend",
+        "backend",
+        "local",
+        "best",
+        "mark",
+    ]
 
 
 def test_best_macro_checkpoint_is_independent_of_retention(tmp_path) -> None:

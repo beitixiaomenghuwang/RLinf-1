@@ -100,17 +100,6 @@ outputs under `/DATA/disk0/xueyang/model/pi05-gse`.
 | Joint action + VLM-last4 from-SFT run | `/workspace/output/gse-joint-vlm-last4-seed42` |
 | Joint action + all-VLM-layers from-SFT run | `/workspace/output/gse-joint-vlm-all-seed42` |
 
-For every new training run with `runner.save_best_macro_mean=True`, the selected
-checkpoint is retained at:
-
-```text
-$RUN_DIR/$EXP_NAME/checkpoints/best_macro_mean
-```
-
-Its `best_metric.json` records the selected `task_success/macro_mean` and global
-step. This directory is an independent snapshot and is not pruned by
-`runner.max_checkpoints_to_keep`.
-
 For any path above, replace the `/workspace/output` prefix with
 `/DATA/disk0/xueyang/model/pi05-gse` to obtain its host path. Checkpoints and
 raw `metrics.jsonl` files are the source of truth; this document summarizes them
@@ -204,7 +193,6 @@ Implemented:
 - balanced train reset sampling and fixed balanced eval reset sampling;
 - CUDA-safe metric reduction;
 - checkpoint retention;
-- automatic retention of the best fixed-reset task-success macro checkpoint;
 - eval-only runner support.
 
 The selected action-GSE run used monitoring-only auxiliary losses. Keep
@@ -720,10 +708,8 @@ RLINF_RAY_OBJECT_SPILL_DIR=/workspace/ray/spill
 TMPDIR=/workspace/ray/tmp
 ```
 
-The GSE config also disables unnecessary video output. Ordinary
-`global_step_*` checkpoint retention is bounded, while the optional
-`best_macro_mean` snapshot is retained independently. Monitor the host-backed
-directory with:
+The GSE config also disables unnecessary video output, and checkpoint retention
+is bounded to the latest two checkpoints. Monitor the host-backed directory with:
 
 ```bash
 du -sh "$RAY_SCRATCH"/*
@@ -863,7 +849,6 @@ python examples/embodiment/train_embodied_agent.py \
   runner.save_interval=20 \
   runner.val_check_interval=20 \
   runner.max_checkpoints_to_keep=4 \
-  +runner.save_best_macro_mean=True \
   env.eval.total_num_envs=512 \
   env.eval.use_fixed_reset_state_ids=True \
   env.eval.is_eval=True \
@@ -894,9 +879,8 @@ test -d "$CKPT/actor"
 ```
 
 Do not change `total_training_steps`, GSE architecture, optimizer, batch sizes,
-or seed when resuming. With `runner.save_best_macro_mean=True`, the runner reads
-the existing `best_macro_mean/best_metric.json` and continues to retain the best
-strictly improved macro checkpoint independently of ordinary retention.
+or seed when resuming. With four retained checkpoints, archive any checkpoint
+selected as a candidate before later saves prune it.
 
 ### 9.4 Live monitoring
 
@@ -946,22 +930,12 @@ for line in path.open():
 PY
 ```
 
-The historical action-GSE run predates automatic best-checkpoint retention, so
-its manually archived step-180 checkpoint remains:
+For the current run, preserve the best checkpoint before checkpoint retention
+prunes it:
 
 ```bash
 export BEST_CKPT=/workspace/output/gse-formal-seed42/gse_formal_seed42/checkpoints/global_step_180
 cp -a "$BEST_CKPT" /workspace/output/gse-formal-seed42/best_global_step_180
-```
-
-For every new run with `runner.save_best_macro_mean=True`, use the automatically
-retained snapshot instead; no manual copy is needed:
-
-```bash
-export BEST_CKPT="$RUN_DIR/$EXP_NAME/checkpoints/best_macro_mean"
-test -f "$BEST_CKPT/best_metric.json"
-test -f "$BEST_CKPT/actor/model_state_dict/full_weights.pt"
-cat "$BEST_CKPT/best_metric.json"
 ```
 
 Run fixed-reset evaluation on this checkpoint with three rollout seeds (`42`,
@@ -1264,7 +1238,6 @@ python examples/embodiment/train_embodied_agent.py \
   runner.save_interval=10 \
   runner.val_check_interval=10 \
   runner.max_checkpoints_to_keep=4 \
-  +runner.save_best_macro_mean=True \
   actor.seed=42 \
   rollout.seed=42 \
   "${WANDB_OVERRIDES[@]}" \
@@ -1316,7 +1289,6 @@ python examples/embodiment/train_embodied_agent.py \
   runner.save_interval=20 \
   runner.val_check_interval=20 \
   runner.max_checkpoints_to_keep=6 \
-  +runner.save_best_macro_mean=True \
   env.eval.total_num_envs=448 \
   env.eval.use_fixed_reset_state_ids=True \
   env.eval.is_eval=True \
@@ -1449,7 +1421,6 @@ python examples/embodiment/train_embodied_agent.py \
   runner.save_interval=20 \
   runner.val_check_interval=20 \
   runner.max_checkpoints_to_keep=4 \
-  +runner.save_best_macro_mean=True \
   env.eval.total_num_envs=512 \
   actor.optim.lr=5e-5 \
   'actor.optim.total_training_steps=${runner.max_epochs}' \
@@ -1490,7 +1461,6 @@ python examples/embodiment/train_embodied_agent.py \
   runner.save_interval=20 \
   runner.val_check_interval=20 \
   runner.max_checkpoints_to_keep=4 \
-  +runner.save_best_macro_mean=True \
   env.eval.total_num_envs=512 \
   actor.optim.lr=1e-5 \
   actor.optim.value_lr=5e-5 \
@@ -1532,7 +1502,6 @@ python examples/embodiment/train_embodied_agent.py \
   runner.save_interval=20 \
   runner.val_check_interval=20 \
   runner.max_checkpoints_to_keep=4 \
-  +runner.save_best_macro_mean=True \
   env.eval.total_num_envs=512 \
   actor.optim.lr=1e-5 \
   actor.optim.value_lr=5e-5 \
@@ -1558,10 +1527,7 @@ adapter trainable counts are both nonzero, the first two PPO updates have finite
 loss/gradient values, and the initial residual remains zero before committing a
 long run. Keep the same 128 environments x 2 rollout epochs, 1,024 global batch,
 fixed 512-trajectory evaluation, PPO settings, seeds, and checkpoint selection
-protocol when comparing the three methods. At every validation, the runner saves
-the completed `global_step_*` checkpoint before evaluation; if
-`eval/task_success/macro_mean` strictly improves, it promotes that checkpoint to
-`checkpoints/best_macro_mean` and records the metric in `best_metric.json`.
+protocol when comparing the three methods.
 
 ## 10. Development cautions
 
