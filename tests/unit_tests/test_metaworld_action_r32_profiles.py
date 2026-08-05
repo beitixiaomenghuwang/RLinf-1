@@ -24,17 +24,23 @@ CONFIG_DIR = Path(__file__).parents[2] / "examples" / "embodiment" / "config"
 
 
 @pytest.mark.parametrize(
-    ("config_name", "normalization_mode"),
+    ("config_name", "normalization_mode", "num_generalized_experts"),
     [
-        ("metaworld_50_ppo_openpi_pi05_gse_action_r32", "global"),
+        ("metaworld_50_ppo_openpi_pi05_gse_action_r32", "global", 2),
         (
             "metaworld_50_ppo_openpi_pi05_gse_action_r32_per_task_adv",
             "per_task",
+            2,
+        ),
+        (
+            "metaworld_50_ppo_openpi_pi05_gse_action_r32_per_task_adv_1g7s",
+            "per_task",
+            1,
         ),
     ],
 )
 def test_action_r32_profile_composition(
-    config_name: str, normalization_mode: str
+    config_name: str, normalization_mode: str, num_generalized_experts: int
 ) -> None:
     with initialize_config_dir(version_base=None, config_dir=str(CONFIG_DIR)):
         cfg = compose(config_name=config_name)
@@ -43,10 +49,35 @@ def test_action_r32_profile_composition(
     assert cfg.algorithm.advantage_normalization_mode == normalization_mode
     assert cfg.actor.optim.lr == 5.0e-6
     assert cfg.actor.optim.value_lr == 1.0e-4
-    assert cfg.actor.optim.total_training_steps == cfg.runner.max_epochs == 320
+    assert cfg.actor.optim.total_training_steps == cfg.runner.max_epochs == 240
     assert cfg.actor.model.gse.total_rank == 32
     assert cfg.actor.model.gse.lora_alpha == 32.0
+    assert cfg.actor.model.gse.num_experts == 8
+    assert cfg.actor.model.gse.num_generalized_experts == num_generalized_experts
+    assert cfg.actor.model.gse.top_k == 2
     assert cfg.actor.model.gse.log_task_router_metrics is True
     assert cfg.actor.model.gse.log_layerwise_task_router_metrics is True
     assert cfg.env.train.total_num_envs * cfg.env.train.rollout_epoch == 256
     assert cfg.actor.global_batch_size == 1024
+
+
+@pytest.mark.parametrize(
+    "config_name",
+    [
+        "metaworld_50_ppo_openpi_pi05_gse_joint_vlm",
+        "metaworld_50_ppo_openpi_pi05_gse_vlm_last4",
+    ],
+)
+def test_vlm_gse_router_defaults(
+    config_name: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("EMBODIED_PATH", str(CONFIG_DIR.parent))
+    with initialize_config_dir(version_base=None, config_dir=str(CONFIG_DIR)):
+        cfg = compose(config_name=config_name)
+    OmegaConf.resolve(cfg)
+
+    vlm_cfg = cfg.actor.model.gse.vlm
+    assert vlm_cfg.num_experts == 8
+    assert vlm_cfg.num_generalized_experts == 1
+    assert vlm_cfg.top_k == 2
+    assert vlm_cfg.routing_granularity == "token"

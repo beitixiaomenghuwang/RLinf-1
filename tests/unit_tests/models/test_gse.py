@@ -324,6 +324,10 @@ def test_layerwise_task_router_statistics_are_compact_and_count_preserving() -> 
         statistics[:, :, 1].sum(dim=1),
         torch.tensor([6.0, 6.0]),
     )
+    torch.testing.assert_close(
+        statistics[:, :, 2 + config.num_specialized_experts :].sum(dim=(1, 2)),
+        statistics[:, :, 1].sum(dim=1),
+    )
 
 
 def test_layerwise_metrics_detect_information_hidden_in_one_layer() -> None:

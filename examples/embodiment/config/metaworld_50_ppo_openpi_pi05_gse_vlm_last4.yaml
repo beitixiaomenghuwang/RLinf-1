@@ -176,9 +176,10 @@ actor:
         # single-layer ablation and the action expert.
         total_rank: 64
         lora_alpha: 64.0
-        num_experts: 4
+        num_experts: 8
         num_generalized_experts: 1
         top_k: 2
+        routing_granularity: token
         init_seed: 4200
     openpi:
       config_name: "pi05_metaworld"

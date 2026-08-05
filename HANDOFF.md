@@ -1160,10 +1160,10 @@ splits to rank 4 per expert (`16 / 4`) — about 0.2% of the VLM's
 the method rather than insufficient capacity. This config instead uses
 `total_rank=64`/`lora_alpha=64.0`, matching the action expert's own GSE
 capacity (the action expert relies on the unmodified `GSEConfig` defaults of
-the same values), keeping `num_experts=4`/`num_generalized_experts=1`/`top_k=2`
-unchanged. That splits to rank 16 per expert; with the always-active
+the same values), with `num_experts=8`/`num_generalized_experts=1`/`top_k=2`
+and token-level routing. That splits to rank 8 per expert; with the always-active
 generalized expert plus the two routed specialized experts selected by
-`top_k=2`, the effective active rank in any one forward pass is `3 * 16 = 48`
+`top_k=2`, the effective active rank in any one forward pass is `3 * 8 = 24`
 out of a rank-64 capacity pool. `lora_alpha` scales with `total_rank` so
 `scaling = lora_alpha / total_rank = 1.0` stays the same ratio as the
 single-block ablation and the action expert, rather than implicitly
@@ -1360,6 +1360,7 @@ checkpoint.
 |---|---|---|---|
 | Action-only rank 32 | `metaworld_50_ppo_openpi_pi05_gse_action_r32` | All 18 action blocks, total rank 32 | 16 |
 | Action-only rank 32 + per-task advantage | `metaworld_50_ppo_openpi_pi05_gse_action_r32_per_task_adv` | Same action-only rank-32 surface with per-task GAE normalization | 16 |
+| Action-only rank 32 + per-task + 1G/7S | `metaworld_50_ppo_openpi_pi05_gse_action_r32_per_task_adv_1g7s` | Same surface, one generalized and seven specialized experts | 16 |
 | Joint action + VLM last 4 | `metaworld_50_ppo_openpi_pi05_gse_joint_vlm` | All action blocks plus VLM language blocks 14-17, rank 64 | 16 |
 | Joint action + all VLM layers | `metaworld_50_ppo_openpi_pi05_gse_joint_vlm` | All action blocks plus all 18 VLM language blocks, rank 64 | 16 |
 
@@ -1413,7 +1414,7 @@ python examples/embodiment/train_embodied_agent.py \
   runner.resume_dir=null \
   runner.logger.log_path="$RUN_DIR" \
   runner.logger.experiment_name="$EXP_NAME" \
-  runner.max_epochs=320 \
+  runner.max_epochs=240 \
   runner.save_interval=20 \
   runner.val_check_interval=20 \
   runner.max_checkpoints_to_keep=4 \
@@ -1433,12 +1434,18 @@ runner.logger.experiment_name=gse_action_r32_per_task_seed42
 ```
 
 Both profiles keep the default action learning rate (`5e-6`) and value learning
-rate (`1e-4`). The Per-task profile normalizes GAE advantages independently for
-the 50 MetaWorld tasks, with global-statistics fallback for sparse or
-zero-variance tasks. It also logs aggregate and per-router-layer task
-information metrics; use ``gse/task_router/adjusted_cramers_v``,
+rate (`1e-4`) and use a 240-step cosine horizon. The Per-task profile normalizes
+GAE advantages independently for the 50 MetaWorld tasks, with global-statistics
+fallback for sparse or zero-variance tasks. It also logs aggregate and
+per-router-layer task information metrics; use
+``gse/task_router/adjusted_cramers_v``,
 ``gse/task_router/prob_nmi``, and the ``layerwise_*_max`` metrics to distinguish
 true absence of detectable task information from cancellation across layers.
+
+The fixed-rank 1G/7S action ablation uses the same command with
+`--config-name metaworld_50_ppo_openpi_pi05_gse_action_r32_per_task_adv_1g7s`.
+It remains a 240-step run with the same learning rates and per-task
+normalization; only the generalized/specialized expert split changes.
 
 Joint action + VLM-last4 from SFT:
 

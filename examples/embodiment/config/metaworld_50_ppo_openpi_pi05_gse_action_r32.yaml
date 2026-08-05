@@ -7,7 +7,7 @@ defaults:
 runner:
   logger:
     experiment_name: "metaworld_50_pi05_gse_action_r32"
-  max_epochs: 320
+  max_epochs: 240
   val_check_interval: 20
   save_interval: 20
   max_checkpoints_to_keep: 4

@@ -38,9 +38,10 @@ actor:
           [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
         total_rank: 64
         lora_alpha: 64.0
-        num_experts: 4
+        num_experts: 8
         num_generalized_experts: 1
         top_k: 2
+        routing_granularity: token
         init_seed: 4200
   optim:
     # Decay over the complete global-step horizon so the final checkpoints can

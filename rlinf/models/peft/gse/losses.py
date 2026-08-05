@@ -309,11 +309,10 @@ def gse_layerwise_task_router_statistics(
         )
         flat_tasks = expanded_task_ids[:, None].expand_as(selected_experts).reshape(-1)
         flat_experts = selected_experts.reshape(-1)
-        flat_indices = flat_tasks * num_experts + flat_experts
-        layer_packed[:, 2 + num_experts :].reshape(-1).index_add_(
-            0,
-            flat_indices,
-            torch.ones_like(flat_indices, dtype=torch.float32),
+        layer_packed[:, 2 + num_experts :].index_put_(
+            (flat_tasks, flat_experts),
+            torch.ones_like(flat_tasks, dtype=torch.float32),
+            accumulate=True,
         )
     return packed.detach()
 
