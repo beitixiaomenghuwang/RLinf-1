@@ -1,0 +1,29 @@
+defaults:
+  - metaworld_50_ppo_openpi_pi05_gse_action_r32
+  - _self_
+
+# Action-only MoORE rank-32 comparison. All PPO, environment, batch, optimizer,
+# checkpoint, and FSDP settings come from the GSE rank-32 reference above.
+runner:
+  logger:
+    experiment_name: "metaworld_50_pi05_moore_action_r32"
+
+actor:
+  model:
+    gse:
+      enabled: False
+    moore:
+      enabled: True
+      rank: 32
+      num_experts: 8
+      lora_alpha: 32.0
+      lora_dropout: 0.0
+      routing_granularity: "sequence"
+      sequence_pooling: "mean"
+      initialization: "svd"
+      router_bias: False
+      freeze_base: True
+      init_seed: 42
+      train_action_adapters: True
+      train_value_head: True
+      require_pi05: True

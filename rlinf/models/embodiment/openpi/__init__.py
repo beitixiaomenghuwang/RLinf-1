@@ -40,6 +40,11 @@ def get_model(cfg: DictConfig, torch_dtype=None):
         is_action_lora_enabled,
         state_dict_contains_action_lora,
     )
+    from rlinf.models.embodiment.openpi.moore import (
+        configure_openpi_moore,
+        is_moore_enabled,
+        state_dict_contains_moore,
+    )
     from rlinf.models.embodiment.openpi.openpi_action_model import (
         OpenPi0Config,
         OpenPi0ForRLActionPrediction,
@@ -61,9 +66,13 @@ def get_model(cfg: DictConfig, torch_dtype=None):
 
     gse_config = cfg.get("gse", None)
     gse_enabled = is_gse_enabled(gse_config)
+    moore_config = cfg.get("moore", None)
+    moore_enabled = is_moore_enabled(moore_config)
+    if gse_enabled and moore_enabled:
+        raise ValueError("OpenPI GSE and MoORE cannot be enabled at the same time")
     action_lora_enabled = is_action_lora_enabled(cfg)
-    if gse_enabled and cfg.get("is_lora", False):
-        raise ValueError("OpenPI GSE and LoRA cannot be enabled at the same time")
+    if (gse_enabled or moore_enabled) and cfg.get("is_lora", False):
+        raise ValueError("OpenPI GSE/MoORE and LoRA cannot be enabled at the same time")
 
     # load model
     checkpoint_dir = download.maybe_download(str(cfg.model_path))
@@ -104,14 +113,23 @@ def get_model(cfg: DictConfig, torch_dtype=None):
             model_state_dict.update(state_dict)
 
     checkpoint_has_gse = state_dict_contains_gse(model_state_dict)
+    checkpoint_has_moore = state_dict_contains_moore(model_state_dict)
+    if checkpoint_has_gse and checkpoint_has_moore:
+        raise ValueError("The checkpoint cannot contain both GSE and MoORE parameters")
     checkpoint_has_vlm_gse = state_dict_contains_vlm_gse(model_state_dict)
     checkpoint_has_action_lora = state_dict_contains_action_lora(model_state_dict)
     if checkpoint_has_gse and checkpoint_has_action_lora:
         raise ValueError("The checkpoint cannot contain both GSE and action LoRA")
+    if checkpoint_has_moore and checkpoint_has_action_lora:
+        raise ValueError("The checkpoint cannot contain both MoORE and action LoRA")
     if checkpoint_has_action_lora and not action_lora_enabled:
         raise ValueError(
             "The checkpoint contains action LoRA parameters, but "
             "is_lora=true and lora_target=action_expert are not configured"
+        )
+    if checkpoint_has_moore and not moore_enabled:
+        raise ValueError(
+            "The checkpoint contains MoORE parameters, but model.moore.enabled is false"
         )
     vlm_gse_enabled = is_gse_enabled(
         gse_config.get("vlm", None) if gse_config is not None else None
@@ -136,6 +154,8 @@ def get_model(cfg: DictConfig, torch_dtype=None):
             configure_openpi_gse(model, action_only_config)
         else:
             configure_openpi_gse(model, gse_config)
+    elif checkpoint_has_moore:
+        configure_openpi_moore(model, moore_config)
     elif checkpoint_has_action_lora:
         configure_openpi_action_lora(model, cfg)
 
@@ -152,6 +172,8 @@ def get_model(cfg: DictConfig, torch_dtype=None):
     model.paligemma_with_expert.to_bfloat16_for_selected_params("bfloat16")
     if gse_enabled and not checkpoint_has_gse:
         configure_openpi_gse(model, gse_config)
+    if moore_enabled and not checkpoint_has_moore:
+        configure_openpi_moore(model, moore_config)
     if action_lora_enabled and not checkpoint_has_action_lora:
         configure_openpi_action_lora(model, cfg)
     # fsdp replace
