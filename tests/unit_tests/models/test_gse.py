@@ -81,6 +81,71 @@ def test_orthogonal_zero_initialization_preserves_base_output() -> None:
         assert torch.count_nonzero(expert.lora_b.weight) == 0
 
 
+def test_svd_initialization_uses_full_factors_and_preserves_output() -> None:
+    torch.manual_seed(8)
+    base_layer = nn.Linear(12, 7, bias=False)
+    original = deepcopy(base_layer)
+    layer = GSELinear(
+        base_layer,
+        make_config(
+            initialization="svd",
+            total_rank=4,
+            num_experts=2,
+            num_generalized_experts=1,
+            top_k=1,
+            normalize_topk=False,
+        ),
+    )
+    left, singular_values, right = torch.linalg.svd(
+        base_layer.weight.detach().float(), full_matrices=False
+    )
+    joint_a = joint_lora_a(layer.all_experts).float()
+    joint_b = torch.cat(
+        [expert.lora_b.weight for expert in layer.all_experts], dim=1
+    ).float()
+    inputs = torch.randn(2, 12)
+
+    identity = torch.eye(4)
+    torch.testing.assert_close(joint_a @ joint_a.mT, identity)
+    torch.testing.assert_close(
+        joint_a.mT @ joint_a,
+        right[:4].mT @ right[:4],
+    )
+    torch.testing.assert_close(
+        joint_b @ joint_a,
+        (left[:, :4] * singular_values[:4].unsqueeze(0)) @ right[:4],
+    )
+    assert torch.equal(layer(inputs), original(inputs))
+
+
+def test_svd_initialization_trains_both_factors_from_step_zero() -> None:
+    layer = GSELinear(
+        nn.Linear(12, 7),
+        make_config(
+            initialization="svd",
+            total_rank=4,
+            num_experts=2,
+            num_generalized_experts=1,
+            top_k=1,
+            normalize_topk=False,
+        ),
+    )
+    inputs = torch.randn(3, 5, 12)
+
+    layer(inputs).square().mean().backward()
+
+    assert all(
+        expert.lora_a.weight.grad is not None
+        and torch.count_nonzero(expert.lora_a.weight.grad) > 0
+        for expert in layer.all_experts
+    )
+    assert all(
+        expert.lora_b.weight.grad is not None
+        and torch.count_nonzero(expert.lora_b.weight.grad) > 0
+        for expert in layer.all_experts
+    )
+
+
 def test_sequence_router_makes_one_decision_per_batch_item() -> None:
     inputs = torch.randn(3, 5, 12)
     sequence_layer = GSELinear(

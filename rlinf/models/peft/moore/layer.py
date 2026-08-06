@@ -54,8 +54,12 @@ class MoOREAdapter(nn.Module):
         dtype = base_weight.dtype
 
         with torch.no_grad():
+            compute_device = base_weight.device
+            if compute_device.type == "cpu" and torch.cuda.is_available():
+                compute_device = torch.device("cuda", torch.cuda.current_device())
             u, singular_values, vh = torch.linalg.svd(
-                base_weight.detach().float(), full_matrices=False
+                base_weight.detach().to(device=compute_device, dtype=torch.float32),
+                full_matrices=False,
             )
             # SVD vectors are sign-ambiguous. Canonicalize each right vector so
             # actor and rollout reconstruct identical non-persistent buffers.

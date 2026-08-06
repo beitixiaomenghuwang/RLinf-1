@@ -1,0 +1,23 @@
+defaults:
+  - metaworld_50_ppo_openpi_pi05_gse_action_r32
+  - _self_
+
+# Action-only rank-32 GSE with full SVD factors and a frozen initial baseline.
+# Subtracting that baseline preserves the SFT policy at initialization while
+# all rank-32 A/B factors remain trainable. The total rank is split across two
+# generalized and six specialized experts.
+runner:
+  logger:
+    experiment_name: "metaworld_50_pi05_gse_action_r32_svd_2g6s"
+  max_epochs: 240
+  val_check_interval: 20
+  save_interval: 20
+
+actor:
+  model:
+    gse:
+      initialization: "svd"
+      num_experts: 8
+      num_generalized_experts: 2
+      top_k: 2
+      init_seed: 42

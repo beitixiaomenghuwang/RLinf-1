@@ -148,9 +148,17 @@ Default GSE architecture:
 - 8 experts: 2 generalized and 6 specialized;
 - specialized top-k 2;
 - sequence-level mean-pooled routing;
-- orthogonal A subspaces and zero-initialized B matrices;
+- orthogonal A subspaces and zero-initialized B matrices (the default GSE
+  initialization);
 - generalized experts are always active;
 - specialized experts use a learned sparse router.
+
+The rank-32 SVD ablation uses a separate policy-preserving parameterization:
+each frozen linear weight is decomposed with a complete float32 SVD, all
+leading rank-32 A/B factors are trainable, and a non-persistent frozen copy of
+those initial factors is subtracted in the residual forward. This follows the
+MoORE dynamic-minus-baseline construction, so the initial policy remains
+exactly the loaded SFT policy while both factor matrices train from step 0.
 
 The main action-GSE result injects GSE only into the 18-layer Pi0.5 action
 expert. The seven wrapped projections per layer are `q_proj`, `k_proj`,

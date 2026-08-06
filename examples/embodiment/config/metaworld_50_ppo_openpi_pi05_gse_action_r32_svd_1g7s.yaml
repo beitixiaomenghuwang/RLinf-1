@@ -1,0 +1,16 @@
+defaults:
+  - metaworld_50_ppo_openpi_pi05_gse_action_r32_svd
+  - _self_
+
+# Same policy-preserving full-SVD rank-32 GSE experiment with one generalized
+# and seven specialized experts.
+runner:
+  logger:
+    experiment_name: "metaworld_50_pi05_gse_action_r32_svd_1g7s"
+
+actor:
+  model:
+    gse:
+      num_experts: 8
+      num_generalized_experts: 1
+      top_k: 2

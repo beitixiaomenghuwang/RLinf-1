@@ -20,17 +20,43 @@ class GSEExpert(nn.Module):
         rank: int,
         dropout: float,
         scaling: float,
+        preserve_initial_output: bool,
     ) -> None:
         super().__init__()
         self.lora_a = nn.Linear(in_features, rank, bias=False)
         self.lora_b = nn.Linear(rank, out_features, bias=False)
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+        self.preserve_initial_output = preserve_initial_output
+        if preserve_initial_output:
+            self.register_buffer(
+                "initial_lora_a",
+                torch.empty_like(self.lora_a.weight),
+                persistent=False,
+            )
+            self.register_buffer(
+                "initial_lora_b",
+                torch.empty_like(self.lora_b.weight),
+                persistent=False,
+            )
         self.register_buffer("scaling", torch.tensor(float(scaling)))
+
+    @torch.no_grad()
+    def capture_initial_factors(self) -> None:
+        """Capture the immutable SVD factors used as the zero-output baseline."""
+        if self.preserve_initial_output:
+            self.initial_lora_a.copy_(self.lora_a.weight)
+            self.initial_lora_b.copy_(self.lora_b.weight)
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         """Apply the low-rank residual transformation."""
         adapter_inputs = inputs.to(self.lora_a.weight.dtype)
-        outputs = self.lora_b(self.lora_a(self.dropout(adapter_inputs)))
+        adapter_inputs = self.dropout(adapter_inputs)
+        outputs = self.lora_b(self.lora_a(adapter_inputs))
+        if self.preserve_initial_output:
+            initial_outputs = F.linear(
+                F.linear(adapter_inputs, self.initial_lora_a), self.initial_lora_b
+            )
+            outputs = outputs - initial_outputs
         return outputs * self.scaling
 
 
@@ -45,6 +71,7 @@ class GSEAdapter(nn.Module):
         out_features: int,
         config: GSEConfig,
         *,
+        base_weight: torch.Tensor,
         device: torch.device,
         dtype: torch.dtype,
     ) -> None:
@@ -63,6 +90,7 @@ class GSEAdapter(nn.Module):
                 rank,
                 config.lora_dropout,
                 config.scaling_for_rank(rank),
+                config.initialization == "svd",
             )
             for rank in ranks
         ]
@@ -81,7 +109,10 @@ class GSEAdapter(nn.Module):
             method=config.initialization,
             seed=config.init_seed,
             orthogonal_gain=config.orthogonal_gain,
+            base_weight=base_weight,
         )
+        for expert in experts:
+            expert.capture_initial_factors()
         router_seed = None if config.init_seed is None else config.init_seed + 1
         initialize_router(
             self.router,
@@ -240,7 +271,7 @@ class GSELinear(nn.Module):
         super().__init__()
         if not isinstance(base_layer, nn.Linear):
             raise TypeError("GSELinear only supports torch.nn.Linear")
-        config.validate_for_layer(base_layer.in_features)
+        config.validate_for_layer(base_layer.in_features, base_layer.out_features)
 
         self.base_layer = base_layer
         self.config = config
@@ -250,6 +281,7 @@ class GSELinear(nn.Module):
             self.in_features,
             self.out_features,
             config,
+            base_weight=base_layer.weight,
             device=base_layer.weight.device,
             dtype=base_layer.weight.dtype,
         )

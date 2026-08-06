@@ -16,6 +16,38 @@ def _cpu_generator(seed: int | None) -> torch.Generator | None:
 
 
 @torch.no_grad()
+def _full_svd_factors(
+    weight: torch.Tensor, rank: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return sign-canonicalized leading factors from a full float32 SVD.
+
+    As in MoORE, the complete reduced SVD is computed on the visible CUDA
+    device when the base model is still on CPU. The GSE rank only determines
+    how many exact singular triplets are retained as trainable factors; it does
+    not switch to a randomized low-rank approximation.
+    """
+    compute_device = weight.device
+    if compute_device.type == "cpu" and torch.cuda.is_available():
+        compute_device = torch.device("cuda", torch.cuda.current_device())
+    matrix = weight.detach().to(device=compute_device, dtype=torch.float32)
+    left, singular_values, right = torch.linalg.svd(
+        matrix, full_matrices=False
+    )
+    left = left[:, :rank]
+    singular_values = singular_values[:rank]
+    right = right[:rank]
+    pivot = right.abs().argmax(dim=1)
+    row_indices = torch.arange(rank, device=right.device)
+    signs = torch.sign(right[row_indices, pivot])
+    signs = torch.where(signs == 0, torch.ones_like(signs), signs)
+    return (
+        left * signs.unsqueeze(0),
+        singular_values,
+        right * signs.unsqueeze(1),
+    )
+
+
+@torch.no_grad()
 def initialize_expert_factors(
     lora_a_layers: Sequence[nn.Linear],
     lora_b_layers: Sequence[nn.Linear],
@@ -23,8 +55,15 @@ def initialize_expert_factors(
     method: str,
     seed: int | None,
     orthogonal_gain: float,
+    base_weight: torch.Tensor | None = None,
 ) -> None:
-    """Initialize expert factors without modifying the base model weight."""
+    """Initialize expert factors from a random basis or a full SVD.
+
+    ``svd`` initializes every retained A/B parameter from exact leading
+    singular triplets. GSEAdapter freezes a copy of these factors and subtracts
+    their initial output, preserving the base policy while both trainable
+    factors receive gradients from the first update.
+    """
     if len(lora_a_layers) != len(lora_b_layers):
         raise ValueError("A and B layer counts must match")
     if not lora_a_layers:
@@ -32,8 +71,10 @@ def initialize_expert_factors(
 
     generator = _cpu_generator(seed)
     in_features = lora_a_layers[0].in_features
+    out_features = lora_b_layers[0].out_features
     total_rank = sum(layer.out_features for layer in lora_a_layers)
 
+    joint_b: torch.Tensor | None = None
     if method == "orthogonal_zero":
         random_matrix = torch.randn(
             in_features,
@@ -48,6 +89,25 @@ def initialize_expert_factors(
         bound = 1.0 / math.sqrt(in_features)
         joint_a = torch.empty(total_rank, in_features, dtype=torch.float32)
         joint_a.uniform_(-bound, bound, generator=generator)
+    elif method == "svd":
+        if base_weight is None:
+            raise ValueError(
+                f"{method} initialization requires the wrapped base weight"
+            )
+        if base_weight.shape != (out_features, in_features):
+            raise ValueError(
+                "base_weight shape must match the wrapped linear layer, got "
+                f"{tuple(base_weight.shape)} != {(out_features, in_features)}"
+            )
+        if total_rank > min(base_weight.shape):
+            raise ValueError(
+                "svd initialization requires total rank no larger than the base "
+                f"weight rank, got {total_rank} > {min(base_weight.shape)}"
+            )
+        left, singular_values, joint_a = _full_svd_factors(
+            base_weight, total_rank
+        )
+        joint_b = (left * singular_values.unsqueeze(0)).contiguous()
     else:
         raise ValueError(f"Unsupported GSE initialization: {method}")
 
@@ -61,8 +121,21 @@ def initialize_expert_factors(
             )
         )
         offset += rank
-    for lora_b in lora_b_layers:
-        lora_b.weight.zero_()
+    if method == "svd":
+        offset = 0
+        assert joint_b is not None
+        for lora_b in lora_b_layers:
+            rank = lora_b.in_features
+            lora_b.weight.copy_(
+                joint_b[:, offset : offset + rank].to(
+                    device=lora_b.weight.device,
+                    dtype=lora_b.weight.dtype,
+                )
+            )
+            offset += rank
+    else:
+        for lora_b in lora_b_layers:
+            lora_b.weight.zero_()
 
 
 @torch.no_grad()

@@ -5,7 +5,7 @@ from typing import Literal
 
 RoutingGranularity = Literal["sequence", "token"]
 SequencePooling = Literal["mean", "first", "last"]
-Initialization = Literal["orthogonal_zero", "kaiming_zero"]
+Initialization = Literal["orthogonal_zero", "kaiming_zero", "svd"]
 ScalingMode = Literal["total_rank", "expert_rank"]
 
 
@@ -41,7 +41,7 @@ class GSEConfig:
             "routing_granularity": ({"sequence", "token"}, self.routing_granularity),
             "sequence_pooling": ({"mean", "first", "last"}, self.sequence_pooling),
             "initialization": (
-                {"orthogonal_zero", "kaiming_zero"},
+                {"orthogonal_zero", "kaiming_zero", "svd"},
                 self.initialization,
             ),
             "scaling_mode": ({"total_rank", "expert_rank"}, self.scaling_mode),
@@ -95,10 +95,19 @@ class GSEConfig:
         )
         return self.lora_alpha / denominator
 
-    def validate_for_layer(self, in_features: int) -> None:
+    def validate_for_layer(
+        self, in_features: int, out_features: int | None = None
+    ) -> None:
         """Validate constraints that depend on the wrapped linear layer."""
         if self.initialization == "orthogonal_zero" and self.total_rank > in_features:
             raise ValueError(
                 "orthogonal_zero requires total_rank <= in_features, got "
                 f"{self.total_rank} > {in_features}"
             )
+        if self.initialization == "svd" and out_features is not None:
+            max_rank = min(in_features, out_features)
+            if self.total_rank > max_rank:
+                raise ValueError(
+                    "svd initialization requires total_rank <= min(in_features, "
+                    f"out_features), got {self.total_rank} > {max_rank}"
+                )
