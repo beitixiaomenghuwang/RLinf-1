@@ -106,4 +106,14 @@ def get_model(cfg: DictConfig, torch_dtype=torch.bfloat16):
     model_config, input_processor = get_model_config_and_input_processor(cfg)
     model.setup_config_and_processor(model_config, input_processor)
 
+    # The LIBERO-90 SFT-LoRA checkpoint is already merged into the base model.
+    # GSE is the only adapter added at RL time and is injected across the LLM.
+    gse_config = cfg.get("gse", None)
+    if gse_config is not None and bool(gse_config.get("enabled", False)):
+        from rlinf.models.embodiment.openvla_oft.rlinf.gse import (
+            configure_openvla_gse,
+        )
+
+        configure_openvla_gse(model, gse_config)
+
     return model

@@ -867,6 +867,10 @@ class FSDPActor(FSDPModelManager, Worker):
 
         mean_metric_dict["actor/grad_norm"] = float(grad_norm)
         mean_metric_dict["actor/lr"] = lr_list[0]
+        if len(lr_list) > 1 and self.gse_enabled and self.cfg.actor.optim.get(
+            "gse_lr", None
+        ) is not None:
+            mean_metric_dict["actor/gse_lr"] = lr_list[1]
         return mean_metric_dict
 
     def run_training_pipeline(self, input_channel: Channel) -> tuple[dict, list]:
@@ -1487,7 +1491,14 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     "actor/lr": lr_list[0],
                 }
                 if len(lr_list) > 1:
-                    data["critic/lr"] = lr_list[1]
+                    if self.gse_enabled and self.cfg.actor.optim.get(
+                        "gse_lr", None
+                    ) is not None:
+                        data["actor/gse_lr"] = lr_list[1]
+                    else:
+                        data["critic/lr"] = lr_list[1]
+                if len(lr_list) > 2:
+                    data["critic/lr"] = lr_list[2]
                 append_to_dict(metrics, data)
         # put LR scheduler step here
         self.lr_scheduler.step()
@@ -1705,5 +1716,12 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             "actor/lr": lr_list[0],
         }
         if len(lr_list) > 1:
-            metric_data["critic/lr"] = lr_list[1]
+            if self.gse_enabled and self.cfg.actor.optim.get(
+                "gse_lr", None
+            ) is not None:
+                metric_data["actor/gse_lr"] = lr_list[1]
+            else:
+                metric_data["critic/lr"] = lr_list[1]
+        if len(lr_list) > 2:
+            metric_data["critic/lr"] = lr_list[2]
         append_to_dict(metrics, metric_data)

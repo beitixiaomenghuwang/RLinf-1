@@ -35,7 +35,15 @@ from rlinf.data.embodied_io_struct import (
 from rlinf.hybrid_engines.weight_syncer import WeightSyncer
 from rlinf.models import get_model
 from rlinf.models.embodiment.base_policy import BasePolicy
-from rlinf.scheduler import Channel, Cluster, Worker, split_channel_message
+from rlinf.scheduler import (
+    Channel,
+    Cluster,
+    Worker,
+    infer_batch_size,
+    merge_batches,
+    split_batch,
+    split_channel_message,
+)
 from rlinf.utils.placement import HybridComponentPlacement
 from rlinf.utils.utils import seed_everything
 
@@ -110,6 +118,9 @@ class MultiStepRolloutWorker(Worker):
         )
 
         self.enable_cuda_graph = cfg.rollout.get("enable_cuda_graph", False)
+        self.inference_micro_batch_size = cfg.rollout.get(
+            "micro_batch_size", None
+        )
 
         self.n_train_chunk_steps = (
             cfg.env.train.max_steps_per_rollout_epoch
@@ -533,15 +544,13 @@ class MultiStepRolloutWorker(Worker):
             expert_label_flag = False
             # Decide which model to act via use_expert
             if use_expert:
-                actions, result = self.expert_model.predict_action_batch(
-                    env_obs=env_obs,
-                    **kwargs,
+                actions, result = self._predict_action_batch(
+                    self.expert_model, env_obs, kwargs
                 )
                 expert_label_flag = True
             else:
-                actions, result = self.hf_model.predict_action_batch(
-                    env_obs=env_obs,
-                    **kwargs,
+                actions, result = self._predict_action_batch(
+                    self.hf_model, env_obs, kwargs
                 )
 
             # Decide re-label or not
@@ -551,9 +560,8 @@ class MultiStepRolloutWorker(Worker):
                 and self.expert_model is not None  # only re-label if expert exists
                 and mode == "train"  # only re-label in train mode
             ):
-                _, expert_result = self.expert_model.predict_action_batch(
-                    env_obs=env_obs,
-                    **kwargs,
+                _, expert_result = self._predict_action_batch(
+                    self.expert_model, env_obs, kwargs
                 )
                 expert_forward_inputs = expert_result["forward_inputs"]
                 expert_target = expert_forward_inputs["model_action"]
@@ -568,6 +576,47 @@ class MultiStepRolloutWorker(Worker):
 
         result["expert_label_flag"] = bool(expert_label_flag)
         return actions, result
+
+    def _predict_action_batch(
+        self,
+        model: BasePolicy,
+        env_obs: dict[str, Any],
+        kwargs: dict[str, Any],
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        """Run policy inference in bounded chunks and merge batch outputs.
+
+        OpenVLA-OFT GSE inference retains both the base projection and routed
+        expert residual.  Chunking only the policy call bounds those temporary
+        activations while preserving the original environment batch and output
+        ordering.
+        """
+        micro_batch_size = self.inference_micro_batch_size
+        batch_size = infer_batch_size(env_obs)
+        if micro_batch_size is None or micro_batch_size >= batch_size:
+            return model.predict_action_batch(env_obs=env_obs, **kwargs)
+
+        micro_batch_size = int(micro_batch_size)
+        if micro_batch_size <= 0:
+            raise ValueError(
+                "rollout.micro_batch_size must be positive when configured"
+            )
+        split_sizes = [
+            micro_batch_size
+            for _ in range(batch_size // micro_batch_size)
+        ]
+        remainder = batch_size % micro_batch_size
+        if remainder:
+            split_sizes.append(remainder)
+
+        action_batches = []
+        result_batches = []
+        for env_obs_micro in split_batch(env_obs, split_sizes):
+            actions, result = model.predict_action_batch(
+                env_obs=env_obs_micro, **kwargs
+            )
+            action_batches.append(actions)
+            result_batches.append(result)
+        return merge_batches(action_batches), merge_batches(result_batches)
 
     def _predict_rollout_actions(
         self,
