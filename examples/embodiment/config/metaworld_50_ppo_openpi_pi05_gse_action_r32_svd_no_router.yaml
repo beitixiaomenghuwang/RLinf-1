@@ -1,0 +1,22 @@
+defaults:
+  - metaworld_50_ppo_openpi_pi05_gse_action_r32_svd
+  - _self_
+
+# Matched multi-expert ablation: all eight experts are always active and
+# uniformly averaged, so no router is used.
+runner:
+  logger:
+    experiment_name: "metaworld_50_pi05_gse_action_r32_svd_no_router"
+  max_epochs: 160
+  val_check_interval: 20
+  save_interval: 20
+
+actor:
+  model:
+    gse:
+      routing_mode: "uniform"
+      num_generalized_experts: 8
+      top_k: 1
+      log_router_metrics: false
+      log_task_router_metrics: false
+      log_layerwise_task_router_metrics: false

@@ -1,0 +1,17 @@
+defaults:
+  - metaworld_50_ppo_openpi_pi05_gse_action_r32_svd
+  - _self_
+
+# Matched initialization ablation: replace SVD factors with random A and
+# zero-initialized B while preserving the same expert split and rank.
+runner:
+  logger:
+    experiment_name: "metaworld_50_pi05_gse_action_r32_svd_random0"
+  max_epochs: 160
+  val_check_interval: 20
+  save_interval: 20
+
+actor:
+  model:
+    gse:
+      initialization: "kaiming_zero"

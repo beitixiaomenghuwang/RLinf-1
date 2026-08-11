@@ -1,0 +1,16 @@
+defaults:
+  - metaworld_50_ppo_openpi_pi05_gse_action_r32_svd_only_specialized
+  - _self_
+
+# Rank-granularity ablation: split total rank 32 into 32 rank-1 specialized
+# experts and weight every expert output with its router probability.
+runner:
+  logger:
+    experiment_name: "metaworld_50_pi05_gse_action_r32_svd_rank1_32_specialized"
+
+actor:
+  model:
+    gse:
+      num_experts: 32
+      num_generalized_experts: 0
+      top_k: 32
