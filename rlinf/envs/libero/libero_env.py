@@ -643,6 +643,9 @@ class LiberoEnv(gym.Env):
             "wrist_images": wrist_image_tensor,
             "states": states,
             "task_descriptions": self.task_descriptions,
+            # Preserve the task identity alongside the instruction so
+            # task-conditioned GSE diagnostics can aggregate router behavior.
+            "task_ids": torch.as_tensor(self.task_ids, dtype=torch.long),
         }
         return obs
 

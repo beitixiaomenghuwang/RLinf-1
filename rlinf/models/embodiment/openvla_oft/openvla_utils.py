@@ -21,8 +21,8 @@ import torch
 from omegaconf import DictConfig
 from prismatic.vla.constants import (
     ACTION_PROPRIO_NORMALIZATION_TYPE,
+    NormalizationType,
 )
-from prismatic.vla.datasets.rlds.utils.data_utils import NormalizationType
 
 
 def normalize_proprio(proprio: np.ndarray, norm_stats: dict[str, Any]) -> np.ndarray:

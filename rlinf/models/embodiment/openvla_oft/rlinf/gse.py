@@ -45,6 +45,14 @@ _INTEGRATION_FIELDS = {
     "target_modules",
     "exclude_modules",
     "train_value_head",
+    "load_balancing_loss_coef",
+    "orthogonality_loss_coef",
+    "log_router_metrics",
+    "log_task_router_metrics",
+    "log_layerwise_task_router_metrics",
+    "task_router_num_tasks",
+    "task_router_informative_nmi_threshold",
+    "log_orthogonality",
 }
 _GSE_CONFIG_FIELDS = {field.name for field in fields(GSEConfig)}
 
@@ -63,6 +71,13 @@ def _build_core_config(config: Mapping[str, Any]) -> GSEConfig:
         for name in _GSE_CONFIG_FIELDS
         if name in config and config[name] is not None
     }
+    # Task-conditioned diagnostics need the per-token routing assignments.
+    # Keep this derived from the public logging switches so OpenVLA-OFT has the
+    # same behavior as the OpenPI GSE integration.
+    values["record_routing_assignments"] = bool(
+        config.get("log_task_router_metrics", False)
+        or config.get("log_layerwise_task_router_metrics", False)
+    )
     return GSEConfig(**values)
 
 
@@ -106,18 +121,16 @@ def configure_openvla_gse(
 ) -> GSEInjectionReport:
     """Inject GSE into the complete LLM and keep non-LLM OFT weights trainable.
 
-    The merged SFT-LoRA checkpoint is loaded by ``from_pretrained`` as ordinary
-    model weights. This function only adds the new RL adapter and never loads or
-    merges a PEFT adapter.
+    The official dense SFT checkpoint is loaded by ``from_pretrained`` as
+    ordinary model weights. This function only adds the new RL adapter and
+    never loads or merges the repository's attached PEFT adapter.
     """
     if not is_gse_enabled(config):
         raise ValueError("configure_openvla_gse requires enabled=true")
 
     core_config = _build_core_config(config)
     language_model = get_language_model(model)
-    target_modules = tuple(
-        config.get("target_modules", DEFAULT_LLM_TARGET_MODULES)
-    )
+    target_modules = tuple(config.get("target_modules", DEFAULT_LLM_TARGET_MODULES))
     exclude_modules = tuple(config.get("exclude_modules", ()))
     if already_injected:
         report = _existing_gse_report(language_model)

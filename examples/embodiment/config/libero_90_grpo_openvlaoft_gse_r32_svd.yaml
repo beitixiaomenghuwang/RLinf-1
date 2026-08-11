@@ -31,8 +31,8 @@ runner:
   max_steps: 160
 
   only_eval: False
-  val_check_interval: 20
-  save_interval: 20
+  val_check_interval: 10
+  save_interval: 10
   save_best_macro_mean: True
 
   resume_dir: null
@@ -79,11 +79,11 @@ env:
     group_size: ${algorithm.group_size}
     reset_gripper_open: False
   eval:
-    # Standard unseen-task LIBERO-10 evaluation: 64 simulators x 8 episode
+    # Standard unseen-task LIBERO-10 evaluation: 32 simulators x 16 episode
     # windows cover all 500 ordered reset states once; exhausted slots are
     # masked by the LIBERO eval sentinel instead of wrapping the pool.
-    rollout_epoch: 8
-    total_num_envs: 64
+    rollout_epoch: 16
+    total_num_envs: 32
     auto_reset: True
     ignore_terminations: True
     max_episode_steps: 520
@@ -101,7 +101,8 @@ rollout:
   sampling_params:
     do_sample: True
     temperature_train: 1.6
-    temperature_eval: 1.6
+    # Periodic LIBERO-10 validation uses the formal deterministic protocol.
+    temperature_eval: -1
     top_k: -1
     top_p: 1.0
     repetition_penalty: 1.0
@@ -120,10 +121,9 @@ rollout:
 actor:
   group_name: "ActorGroup"
   training_backend: "fsdp"
-  # GSE keeps the base output and routed expert residual alive during the
-  # actor log-prob forward. Keep the effective batch unchanged while reducing
-  # per-forward activation memory on the colocated actor/rollout GPU.
-  micro_batch_size: 8
+  # The largest stable value measured with the formal 1024-sample batch on
+  # four 40-GiB A100s. A value of 32 OOMs in the first actor forward pass.
+  micro_batch_size: 16
   global_batch_size: 1024
   seed: 1234
   enable_offload: True
@@ -146,7 +146,18 @@ actor:
       initialization: "svd"
       init_seed: 42
       freeze_base: True
+      # Match the MetaWorld GSE diagnostic surface: aggregate and layerwise
+      # task/router statistics are emitted under train/gse/*.
+      log_router_metrics: True
+      log_task_router_metrics: True
+      log_layerwise_task_router_metrics: True
+      task_router_num_tasks: 90
+      task_router_informative_nmi_threshold: 0.01
       train_value_head: False
+      # With FSDP full_shard/use_orig_params=False, original parameter views
+      # cannot be inspected safely outside forward. Measure A-factor
+      # orthogonality offline from saved checkpoints instead.
+      log_orthogonality: False
 
   optim:
     # Base learning rate applies to fully-trained visual/OFT weights;

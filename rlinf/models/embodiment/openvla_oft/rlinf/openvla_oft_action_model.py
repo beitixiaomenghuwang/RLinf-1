@@ -287,6 +287,8 @@ class OpenVLAOFTForRLActionPrediction(OpenVLAOFTForActionPrediction, BasePolicy)
             "attention_mask": attention_mask,
             "pixel_values": pixel_values,
         }
+        if env_obs is not None and env_obs.get("task_ids") is not None:
+            forward_inputs["task_ids"] = env_obs["task_ids"]
 
         # assert first token is 1
         assert torch.all(input_ids[:, 0] == 1)

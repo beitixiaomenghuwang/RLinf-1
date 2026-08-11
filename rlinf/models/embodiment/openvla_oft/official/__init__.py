@@ -85,6 +85,7 @@ def get_model(cfg: DictConfig, torch_dtype=torch.bfloat16):
         cfg.model_path,
         config=model_config,
         torch_dtype=torch_dtype,
+        low_cpu_mem_usage=cfg.get("low_cpu_mem_usage", True),
         trust_remote_code=True,
     )
 

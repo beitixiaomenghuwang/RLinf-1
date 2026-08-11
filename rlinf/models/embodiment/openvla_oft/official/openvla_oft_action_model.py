@@ -436,6 +436,8 @@ class OpenVLAOFTForRLActionPrediction(OpenVLAOFTForActionPrediction, BasePolicy)
             "pixel_values": pixel_values,
             "proprio": proprio,
         }
+        if env_obs is not None and env_obs.get("task_ids") is not None:
+            forward_inputs["task_ids"] = env_obs["task_ids"]
 
         # last token is space ` `
         assert torch.all(input_ids[:, -1] == 29871)

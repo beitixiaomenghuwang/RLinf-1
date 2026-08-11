@@ -1,5 +1,20 @@
+# Copyright 2026 The RLinf Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Integration tests for whole-language-model OpenVLA-OFT GSE."""
 
+import pytest
 import torch
 from torch import nn
 
@@ -80,3 +95,45 @@ def test_openvla_gse_injects_every_llm_projection_and_keeps_oft_trainable() -> N
         and ".specialized_experts." not in name
         and ".router." not in name
     )
+
+
+def test_openvla_gse_accepts_training_diagnostic_fields() -> None:
+    config = make_config()
+    config.update(
+        {
+            "load_balancing_loss_coef": 0.0,
+            "orthogonality_loss_coef": 0.0,
+            "log_router_metrics": True,
+            "log_orthogonality": False,
+        }
+    )
+
+    configure_openvla_gse(ToyOpenVLA(), config)
+
+
+def test_openvla_task_router_diagnostics_record_assignments() -> None:
+    config = make_config()
+    config.update(
+        {
+            "log_task_router_metrics": True,
+            "log_layerwise_task_router_metrics": True,
+            "task_router_num_tasks": 90,
+        }
+    )
+
+    model = ToyOpenVLA()
+    configure_openvla_gse(model, config)
+
+    wrapped_layers = [
+        module for module in model.modules() if isinstance(module, GSELinear)
+    ]
+    assert wrapped_layers
+    assert all(layer.config.record_routing_assignments for layer in wrapped_layers)
+
+
+def test_openvla_gse_rejects_unknown_fields() -> None:
+    config = make_config()
+    config["log_orthogonalty"] = False
+
+    with pytest.raises(ValueError, match="log_orthogonalty"):
+        configure_openvla_gse(ToyOpenVLA(), config)

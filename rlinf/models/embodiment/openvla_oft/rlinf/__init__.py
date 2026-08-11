@@ -89,7 +89,8 @@ def get_model(cfg: DictConfig, torch_dtype=torch.bfloat16):
     model = OpenVLAOFTForRLActionPrediction.from_pretrained(
         pretrained_model_name_or_path=cfg.model_path,
         torch_dtype=torch_dtype,
-        # attn_implementation="flash_attention_2",
+        low_cpu_mem_usage=cfg.get("low_cpu_mem_usage", True),
+        attn_implementation=cfg.attn_implementation,
         config=actor_model_config,
         action_dim=cfg.action_dim,
         num_action_chunks=cfg.num_action_chunks,
@@ -106,8 +107,9 @@ def get_model(cfg: DictConfig, torch_dtype=torch.bfloat16):
     model_config, input_processor = get_model_config_and_input_processor(cfg)
     model.setup_config_and_processor(model_config, input_processor)
 
-    # The LIBERO-90 SFT-LoRA checkpoint is already merged into the base model.
-    # GSE is the only adapter added at RL time and is injected across the LLM.
+    # The official LIBERO-90 dense shards are already the SFT policy. Its
+    # attached lora_adapter must not be applied again; GSE is the only adapter
+    # injected for this RL experiment.
     gse_config = cfg.get("gse", None)
     if gse_config is not None and bool(gse_config.get("enabled", False)):
         from rlinf.models.embodiment.openvla_oft.rlinf.gse import (
