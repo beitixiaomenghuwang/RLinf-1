@@ -97,10 +97,20 @@ class GSEAdapter(nn.Module):
         split = config.num_generalized_experts
         self.generalized_experts = nn.ModuleList(experts[:split])
         self.specialized_experts = nn.ModuleList(experts[split:])
-        self.router = nn.Linear(
-            in_features,
-            config.num_specialized_experts,
-            bias=config.router_bias,
+        rank_expert_indices = torch.repeat_interleave(
+            torch.arange(len(experts)), torch.tensor(ranks)
+        )
+        self.register_buffer(
+            "_rank_expert_indices", rank_expert_indices, persistent=False
+        )
+        self.router = (
+            nn.Linear(
+                in_features,
+                config.num_specialized_experts,
+                bias=config.router_bias,
+            )
+            if config.num_specialized_experts > 0
+            else nn.Identity()
         )
 
         initialize_expert_factors(
@@ -113,12 +123,15 @@ class GSEAdapter(nn.Module):
         )
         for expert in experts:
             expert.capture_initial_factors()
-        router_seed = None if config.init_seed is None else config.init_seed + 1
-        initialize_router(
-            self.router,
-            standard_deviation=config.router_init_std,
-            seed=router_seed,
-        )
+        if config.num_specialized_experts > 0:
+            router_seed = None if config.init_seed is None else config.init_seed + 1
+            initialize_router(
+                self.router,
+                standard_deviation=config.router_init_std,
+                seed=router_seed,
+            )
+            if config.routing_mode == "uniform":
+                self.router.requires_grad_(False)
         self.to(device=device, dtype=dtype)
 
     @property
@@ -162,18 +175,109 @@ class GSEAdapter(nn.Module):
         logits = self.router(routing_inputs.to(self.router.weight.dtype))
         return F.softmax(logits.float(), dim=-1)
 
+    def _uniform_residual(self, inputs: torch.Tensor) -> torch.Tensor:
+        """Average every expert without consulting a router."""
+        if self._can_fuse_experts(self.all_experts):
+            weights = inputs.new_full(
+                (len(self.all_experts),), 1.0 / len(self.all_experts)
+            )
+            return self._fused_expert_residual(
+                inputs,
+                self.all_experts,
+                weights,
+                self._rank_expert_indices,
+            )
+        residual = sum(expert(inputs) for expert in self.all_experts)
+        return residual / len(self.all_experts)
+
     def _select_experts(
         self, probabilities: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        weights, indices = torch.topk(
-            probabilities,
-            k=self.config.top_k,
-            dim=-1,
-        )
-        if self.config.normalize_topk:
-            weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+        if self.config.routing_mode == "all":
+            weights = probabilities
+            indices = torch.arange(
+                probabilities.shape[-1], device=probabilities.device
+            ).expand_as(probabilities)
+        else:
+            weights, indices = torch.topk(
+                probabilities,
+                k=self.config.top_k,
+                dim=-1,
+            )
+            if self.config.normalize_topk:
+                weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(1e-12)
         self._record_routing(probabilities, indices)
         return weights, indices
+
+    def _can_fuse_experts(self, experts: Any) -> bool:
+        return bool(experts) and self.config.lora_dropout == 0
+
+    def _fused_expert_residual(
+        self,
+        inputs: torch.Tensor,
+        experts: tuple[GSEExpert, ...],
+        expert_weights: torch.Tensor,
+        rank_expert_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """Evaluate weighted experts with two fused low-rank projections."""
+        lora_a = torch.cat([expert.lora_a.weight for expert in experts], dim=0)
+        lora_b = torch.cat([expert.lora_b.weight for expert in experts], dim=1)
+        adapter_inputs = inputs.to(lora_a.dtype)
+        hidden = F.linear(adapter_inputs, lora_a)
+
+        rank_weights = expert_weights.to(hidden.dtype).index_select(
+            -1, rank_expert_indices
+        )
+        while rank_weights.ndim < hidden.ndim:
+            rank_weights = rank_weights.unsqueeze(-2)
+        rank_scaling = torch.stack([expert.scaling for expert in experts]).index_select(
+            0, rank_expert_indices
+        )
+        weighted_hidden = hidden * rank_weights * rank_scaling
+        residual = F.linear(weighted_hidden, lora_b)
+
+        if experts[0].preserve_initial_output:
+            initial_lora_a = torch.cat(
+                [expert.initial_lora_a for expert in experts], dim=0
+            )
+            initial_lora_b = torch.cat(
+                [expert.initial_lora_b for expert in experts], dim=1
+            )
+            initial_hidden = F.linear(adapter_inputs, initial_lora_a)
+            weighted_initial_hidden = initial_hidden * rank_weights * rank_scaling
+            initial_residual = F.linear(weighted_initial_hidden, initial_lora_b)
+            residual = residual - initial_residual
+        return residual
+
+    def _fused_routed_residual(
+        self,
+        inputs: torch.Tensor,
+        weights: torch.Tensor,
+        indices: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.config.routing_mode == "all":
+            specialized_weights = weights
+        else:
+            specialized_weights = weights.new_zeros(
+                weights.shape[0], len(self.specialized_experts)
+            )
+            specialized_weights.scatter_(-1, indices, weights)
+        if self.generalized_experts:
+            generalized_weights = weights.new_full(
+                (weights.shape[0], len(self.generalized_experts)),
+                1.0 / len(self.generalized_experts),
+            )
+            expert_weights = torch.cat(
+                (generalized_weights, specialized_weights), dim=-1
+            )
+        else:
+            expert_weights = specialized_weights
+        return self._fused_expert_residual(
+            inputs,
+            self.all_experts,
+            expert_weights,
+            self._rank_expert_indices,
+        )
 
     def _record_routing(
         self,
@@ -210,6 +314,11 @@ class GSEAdapter(nn.Module):
         flattened = inputs.reshape(-1, self.in_features)
         probabilities = self._routing_probabilities(flattened)
         weights, indices = self._select_experts(probabilities)
+        if self._can_fuse_experts(self.all_experts):
+            residual = self._fused_routed_residual(flattened, weights, indices)
+            return residual.to(inputs.dtype).reshape(
+                *inputs.shape[:-1], self.out_features
+            )
         residual = flattened.new_zeros(flattened.shape[0], self.out_features)
 
         for expert_index, expert in enumerate(self.specialized_experts):
@@ -220,7 +329,8 @@ class GSEAdapter(nn.Module):
             residual[item_indices] += (
                 weights[item_indices, slots, None].to(residual.dtype) * expert_outputs
             )
-        return residual.reshape(*inputs.shape[:-1], self.out_features)
+        specialized = residual.reshape(*inputs.shape[:-1], self.out_features)
+        return self._generalized_residual(inputs).to(inputs.dtype) + specialized
 
     def _sequence_context(self, inputs: torch.Tensor) -> torch.Tensor:
         if inputs.ndim <= 2:
@@ -236,6 +346,12 @@ class GSEAdapter(nn.Module):
         context = self._sequence_context(inputs)
         probabilities = self._routing_probabilities(context)
         weights, indices = self._select_experts(probabilities)
+        if self._can_fuse_experts(self.all_experts):
+            fused_inputs = inputs if inputs.ndim > 1 else inputs.unsqueeze(0)
+            fused_residual = self._fused_routed_residual(
+                fused_inputs, weights, indices
+            ).to(inputs.dtype)
+            return fused_residual if inputs.ndim > 1 else fused_residual.squeeze(0)
         residual = inputs.new_zeros(*inputs.shape[:-1], self.out_features)
 
         routed_inputs = inputs if inputs.ndim > 1 else inputs.unsqueeze(0)
@@ -252,16 +368,16 @@ class GSEAdapter(nn.Module):
             routed_residual[sequence_indices] += (
                 selected_weights.to(routed_residual.dtype) * expert_outputs
             )
-        return routed_residual if inputs.ndim > 1 else routed_residual.squeeze(0)
+        specialized = routed_residual if inputs.ndim > 1 else routed_residual.squeeze(0)
+        return self._generalized_residual(inputs).to(inputs.dtype) + specialized
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         """Compute the generalized plus routed specialized residual."""
-        generalized = self._generalized_residual(inputs).to(inputs.dtype)
+        if self.config.routing_mode == "uniform":
+            return self._uniform_residual(inputs).to(inputs.dtype)
         if self.config.routing_granularity == "token":
-            specialized = self._token_routed_residual(inputs)
-        else:
-            specialized = self._sequence_routed_residual(inputs)
-        return generalized + specialized.to(inputs.dtype)
+            return self._token_routed_residual(inputs).to(inputs.dtype)
+        return self._sequence_routed_residual(inputs).to(inputs.dtype)
 
 
 class GSELinear(nn.Module):
