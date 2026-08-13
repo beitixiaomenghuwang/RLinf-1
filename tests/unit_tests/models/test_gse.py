@@ -81,6 +81,107 @@ def test_orthogonal_zero_initialization_preserves_base_output() -> None:
         assert torch.count_nonzero(expert.lora_b.weight) == 0
 
 
+def test_uniform_routing_averages_all_experts_without_router() -> None:
+    layer = GSELinear(
+        nn.Linear(12, 7),
+        make_config(
+            routing_mode="uniform",
+            num_experts=4,
+            num_generalized_experts=4,
+            top_k=1,
+        ),
+    )
+    with torch.no_grad():
+        for expert in layer.all_experts:
+            expert.lora_b.weight.normal_(std=0.01)
+    inputs = torch.randn(3, 5, 12)
+
+    output = layer(inputs) - layer.base_layer(inputs)
+    expected = sum(expert(inputs) for expert in layer.all_experts) / 4
+
+    torch.testing.assert_close(output, expected)
+    assert not list(layer.router.parameters())
+
+
+def test_only_specialized_experts_can_use_all_experts_for_topk() -> None:
+    config = make_config(num_generalized_experts=0, num_experts=4, top_k=2)
+
+    assert config.num_specialized_experts == 4
+
+
+@pytest.mark.parametrize(
+    ("routing_granularity", "routing_mode", "top_k", "total_rank"),
+    [
+        ("sequence", "topk", 2, 7),
+        ("token", "topk", 2, 7),
+        ("sequence", "all", 2, 4),
+        ("token", "all", 2, 4),
+    ],
+)
+def test_fused_expert_path_matches_sparse_path(
+    routing_granularity: str,
+    routing_mode: str,
+    top_k: int,
+    total_rank: int,
+) -> None:
+    torch.manual_seed(9)
+    config = make_config(
+        initialization="svd",
+        total_rank=total_rank,
+        num_experts=4,
+        num_generalized_experts=0 if routing_mode == "all" else 1,
+        top_k=top_k,
+        routing_granularity=routing_granularity,
+        routing_mode=routing_mode,
+    )
+    fused = GSELinear(nn.Linear(12, 7), config)
+    sparse = deepcopy(fused)
+    sparse.adapter._can_fuse_experts = lambda experts: False
+    fused_inputs = torch.randn(3, 5, 12, requires_grad=True)
+    sparse_inputs = fused_inputs.detach().clone().requires_grad_(True)
+
+    fused_output = fused(fused_inputs)
+    sparse_output = sparse(sparse_inputs)
+    fused_output.square().mean().backward()
+    sparse_output.square().mean().backward()
+
+    torch.testing.assert_close(fused_output, sparse_output)
+    torch.testing.assert_close(fused_inputs.grad, sparse_inputs.grad)
+    for (fused_name, fused_parameter), (sparse_name, sparse_parameter) in zip(
+        fused.named_parameters(), sparse.named_parameters(), strict=True
+    ):
+        assert fused_name == sparse_name
+        fused_grad = (
+            torch.zeros_like(fused_parameter)
+            if fused_parameter.grad is None
+            else fused_parameter.grad
+        )
+        sparse_grad = (
+            torch.zeros_like(sparse_parameter)
+            if sparse_parameter.grad is None
+            else sparse_parameter.grad
+        )
+        torch.testing.assert_close(fused_grad, sparse_grad)
+
+
+def test_all_routing_ignores_inherited_topk_and_selects_every_expert() -> None:
+    layer = GSELinear(
+        nn.Linear(12, 7),
+        make_config(
+            routing_mode="all",
+            num_generalized_experts=0,
+            top_k=2,
+            record_routing_assignments=True,
+        ),
+    )
+
+    layer(torch.randn(3, 5, 12))
+
+    selected = layer.router_stats["selected_experts"]
+    assert selected.shape == (3, 4)
+    assert torch.equal(selected, torch.arange(4).expand(3, 4))
+
+
 def test_svd_initialization_uses_full_factors_and_preserves_output() -> None:
     torch.manual_seed(8)
     base_layer = nn.Linear(12, 7, bias=False)

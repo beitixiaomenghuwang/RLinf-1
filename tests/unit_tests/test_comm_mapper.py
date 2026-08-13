@@ -268,6 +268,30 @@ def test_rollout_result_split_merge_invariant():
     assert torch.equal(merged.versions, rollout_result.versions)
 
 
+def test_rollout_policy_inference_micro_batch_preserves_order():
+    class FakePolicy:
+        def predict_action_batch(self, *, env_obs, **kwargs):
+            states = env_obs["states"]
+            actions = states[:, :1].clone()
+            return actions, {
+                "prev_logprobs": states[:, :1].clone(),
+                "prev_values": states[:, :1].clone(),
+                "forward_inputs": {"states": states.clone()},
+            }
+
+    worker = object.__new__(MultiStepRolloutWorker)
+    worker.inference_micro_batch_size = 4
+    actions, result = worker._predict_action_batch(
+        FakePolicy(), _make_obs(0, 6), {"do_sample": True}
+    )
+
+    assert torch.equal(actions[:, 0], torch.arange(0, 12, 2, dtype=torch.float32))
+    assert torch.equal(
+        result["forward_inputs"]["states"],
+        torch.arange(0, 12, dtype=torch.float32).view(6, 2),
+    )
+
+
 def test_merge_env_outputs_with_partial_optional_fields():
     env_output_0 = EnvOutput(
         obs=_make_obs(0, 2),

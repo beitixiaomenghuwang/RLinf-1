@@ -7,6 +7,7 @@ RoutingGranularity = Literal["sequence", "token"]
 SequencePooling = Literal["mean", "first", "last"]
 Initialization = Literal["orthogonal_zero", "kaiming_zero", "svd"]
 ScalingMode = Literal["total_rank", "expert_rank"]
+RoutingMode = Literal["topk", "all", "uniform"]
 
 
 @dataclass(frozen=True)
@@ -25,6 +26,7 @@ class GSEConfig:
     lora_dropout: float = 0.0
     routing_granularity: RoutingGranularity = "sequence"
     sequence_pooling: SequencePooling = "mean"
+    routing_mode: RoutingMode = "topk"
     initialization: Initialization = "orthogonal_zero"
     scaling_mode: ScalingMode = "total_rank"
     normalize_topk: bool = True
@@ -45,6 +47,7 @@ class GSEConfig:
                 self.initialization,
             ),
             "scaling_mode": ({"total_rank", "expert_rank"}, self.scaling_mode),
+            "routing_mode": ({"topk", "all", "uniform"}, self.routing_mode),
         }
         for field_name, (choices, value) in valid_values.items():
             if value not in choices:
@@ -55,13 +58,18 @@ class GSEConfig:
             raise ValueError("total_rank must be positive")
         if self.num_experts <= 0:
             raise ValueError("num_experts must be positive")
-        if not 0 <= self.num_generalized_experts < self.num_experts:
+        if not 0 <= self.num_generalized_experts <= self.num_experts or (
+            self.routing_mode != "uniform"
+            and self.num_generalized_experts == self.num_experts
+        ):
             raise ValueError("num_generalized_experts must be in [0, num_experts)")
         if self.total_rank < self.num_experts:
             raise ValueError("total_rank must allocate at least rank 1 per expert")
-        if not 1 <= self.top_k <= self.num_specialized_experts:
+        if self.routing_mode == "topk" and not (
+            1 <= self.top_k <= self.num_specialized_experts
+        ):
             raise ValueError("top_k must be in [1, num_specialized_experts]")
-        if self.top_k == 1 and self.normalize_topk:
+        if self.routing_mode == "topk" and self.top_k == 1 and self.normalize_topk:
             raise ValueError(
                 "normalize_topk must be False when top_k=1 so the task loss can "
                 "train the router"
