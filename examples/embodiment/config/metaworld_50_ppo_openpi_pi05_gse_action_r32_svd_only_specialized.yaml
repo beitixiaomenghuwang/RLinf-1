@@ -15,4 +15,4 @@ actor:
   model:
     gse:
       num_generalized_experts: 0
-      top_k: 8
+      routing_mode: "all"

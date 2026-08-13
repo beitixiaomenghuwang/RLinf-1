@@ -13,4 +13,3 @@ actor:
     gse:
       num_experts: 32
       num_generalized_experts: 0
-      top_k: 32

@@ -16,7 +16,6 @@ actor:
     gse:
       routing_mode: "uniform"
       num_generalized_experts: 8
-      top_k: 1
       log_router_metrics: false
       log_task_router_metrics: false
       log_layerwise_task_router_metrics: false

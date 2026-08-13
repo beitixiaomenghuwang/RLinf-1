@@ -28,6 +28,7 @@ gse:
   lora_dropout: 0.0
   routing_granularity: "sequence"
   sequence_pooling: "mean"
+  routing_mode: "topk"
   initialization: "orthogonal_zero"
   scaling_mode: "total_rank"
   normalize_topk: True
