@@ -1,6 +1,6 @@
 defaults:
   - env/libero_90@env.train
-  - env/libero_10@env.eval
+  - env/libero_90@env.eval
   - model/openvla_oft@actor.model
   - hybrid_engines/fsdp@actor.fsdp_config
   - weight_syncer/patch_syncer@weight_syncer
@@ -28,7 +28,7 @@ runner:
     logger_backends: ["tensorboard"]
 
   max_epochs: 1000
-  max_steps: 160
+  max_steps: 120
 
   only_eval: False
   val_check_interval: 10
@@ -79,15 +79,16 @@ env:
     group_size: ${algorithm.group_size}
     reset_gripper_open: False
   eval:
-    # Standard unseen-task LIBERO-10 evaluation: 32 simulators x 16 episode
-    # windows cover all 500 ordered reset states once; exhausted slots are
-    # masked by the LIBERO eval sentinel instead of wrapping the pool.
+    # Seen-task LIBERO-90 validation: 32 simulators x 16 episode windows give
+    # 512 fixed interleaved reset states, covering all 90 tasks with 5-6
+    # trials each on four 40-GiB A100s. Unseen-task LIBERO-10 remains a
+    # separate standalone evaluation and is not run during training.
     rollout_epoch: 16
     total_num_envs: 32
     auto_reset: True
     ignore_terminations: True
-    max_episode_steps: 520
-    max_steps_per_rollout_epoch: 520
+    max_episode_steps: 512
+    max_steps_per_rollout_epoch: 512
     group_size: 1
     use_fixed_reset_state_ids: True
     use_ordered_reset_state_ids: True
@@ -101,7 +102,7 @@ rollout:
   sampling_params:
     do_sample: True
     temperature_train: 1.6
-    # Periodic LIBERO-10 validation uses the formal deterministic protocol.
+    # Periodic LIBERO-90 validation uses the formal deterministic protocol.
     temperature_eval: -1
     top_k: -1
     top_p: 1.0
@@ -141,7 +142,8 @@ actor:
       total_rank: 32
       lora_alpha: 32.0
       num_experts: 8
-      num_generalized_experts: 2
+      num_generalized_experts: 1
+      # The selected experts are evaluated together by the fused GSE path.
       top_k: 2
       initialization: "svd"
       init_seed: 42

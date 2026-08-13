@@ -592,6 +592,9 @@ class LiberoEnv(gym.Env):
             ]
 
         self.success_once = self.success_once | terminations
+        # Pair every episode with its task so the shared evaluate aggregator
+        # can emit eval/task_success/* (macro mean, covered tasks, worst-k).
+        episode_info["task_id"] = self.task_ids.copy()
         episode_info["success_once"] = self.success_once.copy()
         episode_info["return"] = self.returns.copy()
         episode_info["episode_len"] = self.elapsed_steps.copy()
