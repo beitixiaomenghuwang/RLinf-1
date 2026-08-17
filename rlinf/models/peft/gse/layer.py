@@ -371,13 +371,21 @@ class GSEAdapter(nn.Module):
         specialized = routed_residual if inputs.ndim > 1 else routed_residual.squeeze(0)
         return self._generalized_residual(inputs).to(inputs.dtype) + specialized
 
-    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        """Compute the generalized plus routed specialized residual."""
+    def forward(self, inputs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Compute the residual and expose its differentiable auxiliary loss.
+
+        Returning the load-balancing loss is required for FSDP. FSDP only
+        installs its pre-backward unshard hook on tensors returned by the
+        wrapped module; keeping this loss solely as module state leaves its
+        router-parameter branch outside that boundary.
+        """
         if self.config.routing_mode == "uniform":
-            return self._uniform_residual(inputs).to(inputs.dtype)
-        if self.config.routing_granularity == "token":
-            return self._token_routed_residual(inputs).to(inputs.dtype)
-        return self._sequence_routed_residual(inputs).to(inputs.dtype)
+            residual = self._uniform_residual(inputs)
+        elif self.config.routing_granularity == "token":
+            residual = self._token_routed_residual(inputs)
+        else:
+            residual = self._sequence_routed_residual(inputs)
+        return residual.to(inputs.dtype), self._load_balancing_loss
 
 
 class GSELinear(nn.Module):
@@ -393,6 +401,7 @@ class GSELinear(nn.Module):
         self.config = config
         self.in_features = base_layer.in_features
         self.out_features = base_layer.out_features
+        self._load_balancing_loss: torch.Tensor | None = None
         self.adapter = GSEAdapter(
             self.in_features,
             self.out_features,
@@ -437,7 +446,7 @@ class GSELinear(nn.Module):
     @property
     def load_balancing_loss(self) -> torch.Tensor | None:
         """Return the load-balancing loss from the most recent forward pass."""
-        return self.adapter.load_balancing_loss
+        return self._load_balancing_loss
 
     @property
     def router_stats(self) -> dict[str, torch.Tensor]:
@@ -446,6 +455,7 @@ class GSELinear(nn.Module):
 
     def reset_auxiliary_state(self) -> None:
         """Discard losses and diagnostics saved by the latest forward pass."""
+        self._load_balancing_loss = None
         self.adapter.reset_auxiliary_state()
 
     def orthogonality_loss(self) -> torch.Tensor:
@@ -455,4 +465,5 @@ class GSELinear(nn.Module):
     def forward(self, inputs: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
         """Apply the frozen base layer plus a GSE residual update."""
         base_outputs = self.base_layer(inputs, *args, **kwargs)
-        return base_outputs + self.adapter(inputs).to(base_outputs.dtype)
+        residual, self._load_balancing_loss = self.adapter(inputs)
+        return base_outputs + residual.to(base_outputs.dtype)

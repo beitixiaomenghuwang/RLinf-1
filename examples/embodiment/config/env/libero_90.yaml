@@ -14,6 +14,9 @@ reward_coef: 1.0
 # RLinf LiberoEnv specific settings
 reset_gripper_open: True
 is_eval: False
+# Match the JPEG, Lanczos resize, and center-crop path used to report the
+# released OpenVLA-OFT LIBERO-90 checkpoints.
+official_image_preprocess: True
 
 seed: 0
 group_size: 1

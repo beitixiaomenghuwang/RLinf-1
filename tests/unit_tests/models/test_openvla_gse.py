@@ -19,7 +19,9 @@ import torch
 from torch import nn
 
 from rlinf.models.embodiment.openvla_oft.rlinf.gse import (
+    ALL_LINEAR_TARGET_MODULES,
     DEFAULT_LLM_TARGET_MODULES,
+    WHOLE_MODEL_SCOPE,
     configure_openvla_gse,
 )
 from rlinf.models.peft.gse import GSELinear
@@ -94,6 +96,33 @@ def test_openvla_gse_injects_every_llm_projection_and_keeps_oft_trainable() -> N
         and ".generalized_experts." not in name
         and ".specialized_experts." not in name
         and ".router." not in name
+    )
+
+
+def test_openvla_gse_injects_every_linear_in_whole_model_scope() -> None:
+    model = ToyOpenVLA()
+    config = make_config()
+    config.update(
+        {
+            "scope": WHOLE_MODEL_SCOPE,
+            "target_modules": ALL_LINEAR_TARGET_MODULES,
+        }
+    )
+
+    report = configure_openvla_gse(model, config)
+
+    assert len(report.injected_module_names) == 2 * 7 + 3
+    assert isinstance(model.vision_backbone, GSELinear)
+    assert isinstance(model.projector, GSELinear)
+    assert isinstance(model.language_model.lm_head, GSELinear)
+    assert model.vision_backbone.gse_domain == "vision"
+    assert model.projector.gse_domain == "projector"
+    assert model.language_model.lm_head.gse_domain == "llm"
+    assert report.trainable_parameters == report.adapter_parameters
+    assert all(
+        not layer.base_layer.weight.requires_grad
+        for layer in model.modules()
+        if isinstance(layer, GSELinear)
     )
 
 

@@ -24,6 +24,7 @@ import numpy as np
 import torch
 from omegaconf.omegaconf import OmegaConf
 
+from rlinf.envs.libero.seed_utils import build_libero_env_seeds
 from rlinf.envs.libero.utils import (
     build_interleaved_eval_reset_state_ids,
     distribute_reset_state_ids_round_robin,
@@ -150,6 +151,17 @@ class LiberoEnv(gym.Env):
         env_fns = self.get_env_fns()
         self.env = ReconfigureSubprocEnv(env_fns)
 
+    def _get_simulator_seeds(self, env_idx) -> list[int]:
+        """Return simulator seeds that do not depend on reset batch size."""
+        return build_libero_env_seeds(
+            base_seed=self.cfg.seed,
+            seed_offset=self.seed_offset,
+            num_envs=self.num_envs,
+            group_size=self.group_size,
+            env_idx=env_idx,
+            is_eval=self.is_eval,
+        )
+
     def get_env_fns(self):
         env_fn_params = self.get_env_fn_params()
         env_fns = []
@@ -243,6 +255,10 @@ class LiberoEnv(gym.Env):
         task_descriptions = []
         if env_idx is None:
             env_idx = np.arange(self.num_envs)
+        env_idx = np.asarray(env_idx, dtype=np.int64).reshape(-1)
+        simulator_seeds = dict(
+            zip(env_idx.tolist(), self._get_simulator_seeds(env_idx))
+        )
 
         for env_id in range(self.num_envs):
             if env_id not in env_idx:
@@ -384,7 +400,7 @@ class LiberoEnv(gym.Env):
                 {
                     **base_env_args,
                     "bddl_file_name": final_path,
-                    "seed": self.seed,
+                    "seed": simulator_seeds[env_id],
                 }
             )
             task_descriptions.append(task.language)
@@ -610,9 +626,16 @@ class LiberoEnv(gym.Env):
         return infos
 
     def _extract_image_and_state(self, obs):
+        full_image = get_libero_image(obs)
+        wrist_image = get_libero_wrist_image(obs)
+        if self.cfg.get("official_image_preprocess", False):
+            from rlinf.envs.libero.utils import preprocess_openvla_oft_image
+
+            full_image = preprocess_openvla_oft_image(full_image)
+            wrist_image = preprocess_openvla_oft_image(wrist_image)
         return {
-            "full_image": get_libero_image(obs),
-            "wrist_image": get_libero_wrist_image(obs),
+            "full_image": full_image,
+            "wrist_image": wrist_image,
             "state": np.concatenate(
                 [
                     obs["robot0_eef_pos"],
@@ -666,7 +689,8 @@ class LiberoEnv(gym.Env):
         if reconfig_env_idx:
             env_fn_params = self.get_env_fn_params(reconfig_env_idx)
             self.env.reconfigure_env_fns(env_fn_params, reconfig_env_idx)
-        self.env.seed(self.seed * len(env_idx))
+        simulator_seeds = self._get_simulator_seeds(env_idx)
+        self.env.seed(simulator_seeds, id=env_idx)
         self.env.reset(id=env_idx)
         variant = os.environ.get(
             "LIBERO_TYPE",
@@ -704,7 +728,7 @@ class LiberoEnv(gym.Env):
             reset_state_ids = self._get_random_reset_state_ids(num_reset_states)
 
         self._reconfigure(reset_state_ids, env_idx)
-        for _ in range(15):
+        for _ in range(self.cfg.get("num_steps_wait", 15)):
             zero_actions = np.zeros((len(env_idx), 7))
             if self.cfg.reset_gripper_open:
                 zero_actions[:, -1] = -1

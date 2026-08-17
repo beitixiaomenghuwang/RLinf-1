@@ -354,6 +354,24 @@ def test_auxiliary_losses_are_finite_and_differentiable() -> None:
     assert orthogonality.requires_grad
 
 
+def test_load_balancing_loss_is_exposed_as_adapter_forward_output() -> None:
+    layer = GSELinear(nn.Linear(12, 7), make_config())
+    adapter_outputs: list[tuple[torch.Tensor, torch.Tensor | None]] = []
+    hook = layer.adapter.register_forward_hook(
+        lambda _module, _inputs, output: adapter_outputs.append(output)
+    )
+
+    layer(torch.randn(3, 5, 12))
+    hook.remove()
+
+    assert len(adapter_outputs) == 1
+    residual, load_balancing_loss = adapter_outputs[0]
+    assert residual.shape == (3, 5, 7)
+    assert load_balancing_loss is layer.load_balancing_loss
+    assert load_balancing_loss is not None
+    assert load_balancing_loss.requires_grad
+
+
 def test_router_metrics_aggregate_expert_utilization() -> None:
     model = ToyModel()
     inject_gse(

@@ -24,7 +24,7 @@ runner:
   logger:
     log_path: "../results"
     project_name: rlinf
-    experiment_name: "libero_90_grpo_openvlaoft_gse_r32_svd"
+    experiment_name: "libero90_gse_whole_model_r32_svd_8gpu_seed1234"
     logger_backends: ["tensorboard"]
 
   max_epochs: 1000
@@ -75,6 +75,8 @@ env:
     total_num_envs: 64
     max_episode_steps: 512
     max_steps_per_rollout_epoch: 512
+    # Use the same raw-image path for training and evaluation.
+    official_image_preprocess: False
     reward_coef: ${algorithm.reward_coef}
     group_size: ${algorithm.group_size}
     reset_gripper_open: False
@@ -90,6 +92,7 @@ env:
     max_episode_steps: 512
     max_steps_per_rollout_epoch: 512
     group_size: 1
+    official_image_preprocess: False
     use_fixed_reset_state_ids: True
     use_ordered_reset_state_ids: True
     reset_gripper_open: False
@@ -102,8 +105,9 @@ rollout:
   sampling_params:
     do_sample: True
     temperature_train: 1.6
-    # Periodic LIBERO-90 validation uses the formal deterministic protocol.
-    temperature_eval: -1
+    # The released LIBERO-90 GRPO policy is evaluated stochastically with
+    # temperature 1.6; greedy evaluation underreports it by about 20 points.
+    temperature_eval: 1.6
     top_k: -1
     top_p: 1.0
     repetition_penalty: 1.0
@@ -111,8 +115,8 @@ rollout:
   group_name: "RolloutGroup"
   generation_backend: "huggingface"
   enable_offload: True
-  # Bound GSE inference activations while retaining 64 parallel envs.
-  micro_batch_size: 4
+  # Match the validated 8-GPU formal rollout configuration.
+  micro_batch_size: 8
   pipeline_stage_num: 1
 
   model:
@@ -122,23 +126,28 @@ rollout:
 actor:
   group_name: "ActorGroup"
   training_backend: "fsdp"
-  # The largest stable value measured with the formal 1024-sample batch on
-  # four 40-GiB A100s. A value of 32 OOMs in the first actor forward pass.
-  micro_batch_size: 16
-  global_batch_size: 1024
+  # Match the official 8-GPU batch configuration used by the formal run.
+  micro_batch_size: 32
+  global_batch_size: 16384
   seed: 1234
   enable_offload: True
 
   model:
     model_path: "${oc.env:REPO_PATH}/model/RLinf-OpenVLAOFT-LIBERO-90-Base-Lora/"
     model_type: "openvla_oft"
+    # flash_attention_2 (the model-group default) is behaviorally broken for
+    # OpenVLA-OFT inference on every platform tested (x86 and ARM: official
+    # GRPO greedy collapses to 2-4%). See HANDOFF.md 12.5b; never revert.
+    attn_implementation: "sdpa"
     unnorm_key: libero_90_no_noops_trajall
     max_prompt_length: 128
     is_lora: False
     gse:
       enabled: True
-      target_modules:
-        [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj, lm_head]
+      # Paper protocol: inject GSE into every Linear in the vision backbone,
+      # multimodal projector, and language model; freeze all original weights.
+      scope: whole_model
+      target_modules: all-linear
       total_rank: 32
       lora_alpha: 32.0
       num_experts: 8
@@ -156,16 +165,19 @@ actor:
       task_router_num_tasks: 90
       task_router_informative_nmi_threshold: 0.01
       train_value_head: False
+      # Both regularizers are diagnostics only in the formal run.
+      load_balancing_loss_coef: 0.0
+      orthogonality_loss_coef: 0.0
       # With FSDP full_shard/use_orig_params=False, original parameter views
       # cannot be inspected safely outside forward. Measure A-factor
       # orthogonality offline from saved checkpoints instead.
       log_orthogonality: False
 
   optim:
-    # Base learning rate applies to fully-trained visual/OFT weights;
-    # GSE adapter parameters use the separate LLM-adapter rate below.
+    # Whole-model GSE freezes the dense base, so every trainable policy
+    # parameter belongs to the GSE optimizer group below.
     lr: 2.0e-5
-    gse_lr: 1.0e-5
+    gse_lr: 2.0e-4
     total_training_steps: ${runner.max_steps}
     lr_warmup_steps: 0
     lr_scheduler: "cosine"

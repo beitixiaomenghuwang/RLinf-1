@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import gc
 import multiprocessing
 import warnings
 from multiprocessing import connection
@@ -155,6 +156,11 @@ def _worker(
                 p.send(obs)
             elif cmd == "reconfigure":
                 env.close()
+                # robosuite/MuJoCo leave reference cycles behind close();
+                # without an explicit collect the long-lived worker process
+                # accumulates ~100 MB of host memory per task switch.
+                del env
+                gc.collect()
                 seed = data.pop("seed")
                 env = OffScreenRenderEnv(**data)
                 env.seed(seed)
@@ -190,8 +196,43 @@ class ReconfigureSubprocEnvWorker(SubprocEnvWorker):
         EnvWorker.__init__(self, env_fn)
 
     def reconfigure_env_fn(self, env_fn_param):
-        self.parent_remote.send(["reconfigure", env_fn_param])
-        return self.parent_remote.recv()
+        # Respawn the subprocess instead of rebuilding the env in place.
+        # robosuite/MuJoCo leak native memory on env.close(), so a long-lived
+        # worker grows without bound across task switches (~140 MB each); a
+        # fresh process resets RSS to baseline. start() returns immediately,
+        # so all envs of this vector rebuild in parallel and the following
+        # reset() call blocks until the new child is ready.
+        param = dict(env_fn_param)
+        self.process.terminate()
+        self.process.join(10)
+        if self.process.is_alive():
+            self.process.kill()
+            self.process.join(10)
+        self.parent_remote.close()
+
+        def env_fn(param=param):
+            import os
+
+            os.environ.setdefault("LIBERO_TYPE", get_libero_type())
+            from libero.libero.envs import OffScreenRenderEnv
+
+            seed = param.pop("seed")
+            env = OffScreenRenderEnv(**param)
+            env.seed(seed)
+            return env
+
+        ctx = multiprocessing.get_context("spawn")
+        self.parent_remote, self.child_remote = ctx.Pipe()
+        args = (
+            self.parent_remote,
+            self.child_remote,
+            CloudpickleWrapper(env_fn),
+            self.buffer,
+        )
+        self.process = ctx.Process(target=_worker, args=args, daemon=True)
+        self.process.start()
+        self.child_remote.close()
+        return None
 
 
 class ReconfigureSubprocEnv(SubprocVectorEnv):
@@ -209,3 +250,31 @@ class ReconfigureSubprocEnv(SubprocVectorEnv):
 
         for j, i in enumerate(id):
             self.workers[i].reconfigure_env_fn(env_fns[j])
+
+    def seed(self, seed=None, id=None):
+        """Seed only the selected subprocess environments.
+
+        ``BaseVectorEnv.seed`` always starts at worker zero, which makes a
+        partial LIBERO auto-reset reseed unrelated environments. This variant
+        keeps the seed list aligned with the explicitly selected worker IDs.
+        """
+        self._assert_is_not_closed()
+        id = self._wrap_id(id)
+        if self.is_async:
+            self._assert_id(id)
+
+        if seed is None:
+            seed_list = [None] * len(id)
+        elif isinstance(seed, (int, np.integer)):
+            seed_list = [int(seed) + i for i in range(len(id))]
+        else:
+            seed_list = list(seed)
+
+        if len(seed_list) != len(id):
+            raise ValueError(
+                f"Expected {len(id)} seeds for environment IDs {list(id)}, "
+                f"got {len(seed_list)}"
+            )
+        return [
+            self.workers[env_id].seed(value) for env_id, value in zip(id, seed_list)
+        ]
