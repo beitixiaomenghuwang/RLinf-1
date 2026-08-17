@@ -1,6 +1,8 @@
 # Pi0.5 Multi-Task Parameter-Efficient RL Handoff
 
-Last updated: 2026-07-30
+Last updated: 2026-08-14 (Section 12.5d: corrected official LIBERO-90 image and
+sampling protocol; whole-model OpenVLA-OFT GSE formal run started from Base;
+all OpenVLA-OFT runs use SDPA)
 
 This document is the complete handoff for the Pi0.5 MetaWorld MT50 project. It
 retains validated experiments, output/checkpoint paths, reproducible commands,
@@ -1669,3 +1671,517 @@ staged `gse-action180-vlm-last4-seed42` result if it arrives. Keep the two
 protocols separate, select checkpoints without treating health-check evaluations
 as paper evidence, and keep auxiliary losses disabled until matched results show
 that router skew is persistent and harmful.
+
+## 12. LIBERO-90 OpenVLA-OFT GSE 八卡训练(2026-08-13)
+
+本节是 [PARALLEL_SERVER_HANDOFF.md](PARALLEL_SERVER_HANDOFF.md) 第 14 节
+"LIBERO-90 OpenVLA-OFT GSE 四卡训练"在本机(8×A100-SXM4-80GB,主机内存
+1 TB)上的对应最大训练指令。四卡文档记录的是 4×A100-PCIE-40GB 上实测的
+最大稳定配置。本节的并行度配置**已在本机实测定稿**(2026-08-13):最初按
+"GPU 数翻倍、单卡显存翻倍"外推的若干值在实测中被推翻,表中记录的是最终
+实测值与被否决的候选值,不要再按纸面外推调整。2026-08-13 的吞吐/显存
+测量来自旧 LLM-only GSE；12.5d 切换 whole-model GSE 后，最终性能基线以
+12.6 和修复后正式 run 为准。
+
+实测定稿:`128 env × 2 epoch` 训练、`64 env × 8 epoch` 评估、
+`rollout.micro_batch_size=8`、`actor.micro_batch_size=32`、allocator 仅设
+`max_split_size_mb:128`。这些 batch/并行度在 whole-model 正式 step 0 已
+再次通过；当前整步 1107.184 s（rollout 674.054 s、actor 396.259 s、
+权重同步 36.800 s），显存峰值约 57 GiB/卡。按首步保守外推，140 步纯
+训练至少约 43 小时，尚未计入每 10 步的 checkpoint 和 512 条周期评估。
+
+### 12.1 入口与资产
+
+| 项目 | 值 |
+|---|---|
+| Hydra 配置 | `examples/embodiment/config/libero_90_grpo_openvlaoft_gse_r32_svd.yaml` |
+| Docker 镜像 | `rlinf/rlinf:agentic-rlinf0.3-maniskill_libero`(本机已存在) |
+| 容器内环境 | `source switch_env openvla-oft` |
+| base SFT 权重 | 宿主 `/DATA/disk0/xueyang/model/RLinf-OpenVLAOFT-LIBERO-90-Base-Lora/`(本地 NVMe),以只读方式挂载到容器内 `${REPO_PATH}/model/RLinf-OpenVLAOFT-LIBERO-90-Base-Lora/`,使 YAML 中的 `${oc.env:REPO_PATH}` 模型路径无需覆盖即可解析 |
+| 本机 GPU / 内存 | 8×A100-SXM4-80GB(81,920 MiB/卡)/ 1007 GiB RAM |
+
+启动前必须先确认宿主模型目录中的 `model.safetensors.index.json` 与四个
+`model-0000X-of-00004.safetensors` 分片存在。这些分片是完整权重,训练必须
+保持 `actor.model.is_lora=false`,不得再次合并或加载 `lora_adapter`(与四卡
+协议一致)。GSE 结构保持 YAML 默认:8 专家(1 generalized + 7 specialized)、
+`top_k=2`、total rank 32、SVD 初始化。
+
+**模型权重必须放在本地磁盘,严禁直接挂载 `/ks3` 对象存储目录。**
+2026-08-13 首次启动曾把 `/ks3/guoxueyang/model/...`(`fuse.ks3fs` 挂载)直接
+bind 进容器:`from_pretrained` 以 mmap 方式读取 safetensors 分片,ks3fs 的
+缺页读取失败使全部 8 个 rollout worker 在模型加载中同时收到 SIGBUS
+(`Fatal Python error: Bus error`),并伴随 raylet 因内存压力 OOM-kill 2 个
+worker,训练在 step 0 之前退出。权重已用 `rsync` 复制到上表的本地 NVMe
+路径;后续任何从 `/ks3` 新下载的模型都必须先复制到本地再挂载。
+
+### 12.2 八卡最大训练配置(与四卡实测对照)
+
+| 项目 | 四卡 40G 实测值 | 八卡 80G 实测定稿 | 状态 |
+|---|---:|---:|---|
+| 训练并行度 | `64 env × 4 rollout epoch` | `128 env × 2 rollout epoch` | 协议等价(均为 256 条轨迹/step、32 个 group)。**`256 env × 1` 已被实测否决**:32 env/GPU 时 env worker 初始化即 `EGL_NOT_INITIALIZED`;16 env/GPU 是本机 EGL 上限 |
+| LIBERO-90 周期评估 | `32 env × 16 epoch` | `64 env × 8 epoch` | 总量同为 512 个 fixed 窗口。同理不能用 `512 env × 1`(EGL 上限);必须显式设 `env.eval.rollout_epoch=8`,否则 YAML 默认 16 会使每次评估跑 8192 条轨迹 |
+| actor micro / global batch | `16 / 1024` | `32 / 1024` | whole-model 正式 step 0 已通过。micro 64 的 +92 s 退化来自旧 LLM-only 调优，当前 run 不再重做吞吐消融 |
+| rollout micro batch | `4` | `8` | whole-model 正式 step 0 已通过。408→346 s 的提速来自旧 LLM-only 调优；当前 whole-model rollout 实测为 674.054 s |
+| actor backend | FSDP + gradient checkpointing | 同左 | 沿用 |
+| actor / rollout offload | 均开启 | 均开启 | 沿用；whole-model 正式 backward 峰值约 57 GiB/卡，关闭 offload 尚未消融，不得在当前 run 中途改动 |
+| PyTorch allocator | `max_split_size_mb:128,garbage_collection_threshold:0.8` | **仅** `max_split_size_mb:128` | **必须删掉 `garbage_collection_threshold:0.8`**:本机带该项时 rollout worker 在生成中 `SIGSEGV`(GC 回收与 offload 的段释放竞争),移除后连续多步无异常。`expandable_segments` 未实测,不要默认打开 |
+| 训练步数 / 保存 / 评估 | `120 / 10 / 10` | `140 / 10 / 10` | 步数延长为 140,必须通过 `runner.max_steps=140` 设置(runner 取 `max_epochs` 换算值与 `max_steps` 的较小者,YAML 中 `max_steps: 120` 不覆盖则 120 步即停);cosine horizon 经 `total_training_steps=${runner.max_steps}` 自动跟随为 140 |
+
+八卡与四卡每个 global step 的轨迹数(256)、GRPO group 结构(32 组 × 8)
+和 global batch(1024)完全一致,只有硬件并行度不同;训练步数从 120 延长
+为 140,scheduler horizon 随之变为 140,与四卡 120 步曲线比较时按 step
+对齐前 120 步即可。
+
+### 12.3 Docker 启动
+
+在宿主 shell 中(沿用第 7 节的 W&B 约定,不要把 API key 写入仓库):
+
+```bash
+export RLINF_REPO=/home/xueyang/RLinf
+# 必须是本地磁盘路径;不要指向 /ks3(FUSE 对象存储,mmap 读取会 SIGBUS)。
+export OFT_MODEL=/DATA/disk0/xueyang/model/RLinf-OpenVLAOFT-LIBERO-90-Base-Lora
+export OFT_OUTPUT=/DATA/disk0/xueyang/model/openvlaoft-libero90-gse
+export HF_CACHE=/home/xueyang/RLinf/cache/huggingface
+export RAY_SCRATCH=/DATA/disk0/xueyang/Data/rlinf-ray
+export WANDB_ENTITY=gxy1000h-jilin-university
+export WANDB_PROJECT=pi05-multitask-peft-rl
+export WANDB_MODE=online
+test -f "$OFT_MODEL/model.safetensors.index.json"
+mkdir -p "$OFT_OUTPUT" "$HF_CACHE" "$RAY_SCRATCH/session" "$RAY_SCRATCH/spill" "$RAY_SCRATCH/tmp"
+
+docker run -it --rm --privileged \
+  --gpus all \
+  --shm-size 256g \
+  --network host \
+  --ulimit memlock=-1 \
+  --ulimit stack=67108864 \
+  --name rlinf-openvlaoft-libero90 \
+  -e CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+  -e MUJOCO_GL=egl \
+  -e PYOPENGL_PLATFORM=egl \
+  -e NCCL_DEBUG=WARN \
+  -e TORCH_NCCL_ASYNC_ERROR_HANDLING=1 \
+  -e RLINF_RAY_TEMP_DIR=/workspace/ray/session \
+  -e RLINF_RAY_OBJECT_SPILL_DIR=/workspace/ray/spill \
+  -e TMPDIR=/workspace/ray/tmp \
+  -e WANDB_API_KEY -e WANDB_ENTITY -e WANDB_PROJECT -e WANDB_MODE \
+  -v "$RLINF_REPO":/workspace/RLinf \
+  -v "$OFT_MODEL":/workspace/RLinf/model/RLinf-OpenVLAOFT-LIBERO-90-Base-Lora:ro \
+  -v "$OFT_OUTPUT":/workspace/output \
+  -v "$RAY_SCRATCH":/workspace/ray \
+  -v "$HF_CACHE":/root/.cache/huggingface \
+  -w /workspace/RLinf \
+  rlinf/rlinf:agentic-rlinf0.3-maniskill_libero \
+  bash
+```
+
+容器内初始化(注意环境是 `openvla-oft`,不是 `openpi`):
+
+```bash
+source switch_env openvla-oft
+cd /workspace/RLinf
+
+export REPO_PATH=/workspace/RLinf
+export EMBODIED_PATH=/workspace/RLinf/examples/embodiment
+export PYTHONPATH=/workspace/RLinf:${PYTHONPATH:-}
+export MUJOCO_GL=egl
+export PYOPENGL_PLATFORM=egl
+# 不要加 garbage_collection_threshold:0.8 —— 本机实测会让 rollout worker SIGSEGV。
+export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
+
+test -f "$REPO_PATH/model/RLinf-OpenVLAOFT-LIBERO-90-Base-Lora/model.safetensors"
+
+WANDB_OVERRIDES=(
+  'runner.logger.logger_backends=[tensorboard,wandb]'
+  "runner.logger.project_name=${WANDB_PROJECT}"
+  "+runner.logger.wandb_entity=${WANDB_ENTITY}"
+)
+```
+
+只用 TensorBoard 时删去 `"${WANDB_OVERRIDES[@]}"` 即可。
+
+
+### 12.5 正式最大训练指令(140 步)
+
+```bash
+export RUN_DIR=/workspace/output/libero90_gse_whole_model_r32_svd_8gpu_seed1234
+mkdir -p "$RUN_DIR"
+
+python examples/embodiment/train_embodied_agent.py \
+  --config-path "$EMBODIED_PATH/config" \
+  --config-name libero_90_grpo_openvlaoft_gse_r32_svd \
+  env.train.total_num_envs=128 \
+  env.train.rollout_epoch=2 \
+  env.eval.total_num_envs=64 \
+  env.eval.rollout_epoch=8 \
+  rollout.micro_batch_size=8 \
+  actor.micro_batch_size=32 \
+  actor.global_batch_size=1024 \
+  runner.max_steps=140 \
+  +runner.max_checkpoints_to_keep=6 \
+  runner.logger.log_path="$RUN_DIR" \
+  runner.logger.experiment_name=libero90_gse_whole_model_r32_svd_8gpu_seed1234 \
+  "${WANDB_OVERRIDES[@]}" \
+  2>&1 | tee "$RUN_DIR/console.log"
+```
+
+两个必须显式设置的覆盖不要省略:训练步数由 `runner.max_steps` 控制
+(runner 取 `max_epochs` 换算值与 `max_steps` 的较小者,只改
+`runner.max_epochs` 时 YAML 中的 `max_steps: 120` 仍会使训练在 120 步停止);
+评估必须带 `env.eval.rollout_epoch=8`,否则 YAML 默认的 16 轮会让每次评估
+执行 `64×16=1024` 条轨迹。
+
+`rollout.micro_batch_size=8` 也不能省略:YAML 默认 4 是为 40 GiB 卡设定的,
+在本机会让每 step 多花约 60 s。
+
+**推荐用自动续跑循环脚本代替裸命令**:
+[scripts/run_libero90_gse_8gpu_loop.sh](scripts/run_libero90_gse_8gpu_loop.sh)
+内置上面全部覆盖,训练异常退出时自动从最新完整 checkpoint(带 `actor/`
+目录)续跑,并设 `+runner.eval_on_resume=true` 补做落在验证间隔上的评估:
+
+```bash
+# 容器内,完成 12.3 的初始化后:
+export RUN_DIR=/workspace/output/libero90_gse_whole_model_r32_svd_8gpu_seed1234
+mkdir -p "$RUN_DIR"
+bash scripts/run_libero90_gse_8gpu_loop.sh
+```
+
+### 12.5a LIBERO env 主机内存泄漏与子进程重生补丁(2026-08-13)
+
+首次长跑在 step 8 的 rollout 中被 Ray memory monitor 杀死:主机内存从
+init 后的约 500 GB 单调涨到 964 GB(95.7% > 默认阈值 95%)。逐进程排查
+显示泄漏不在 8 个 rollout/actor 大进程(RSS 稳定),而在约 200 个 LIBERO
+env 子进程:每条轨迹结束后按新任务 reconfigure 时,旧代码在**同一个长命
+子进程内** `env.close()` 后直接重建 `OffScreenRenderEnv`,robosuite/MuJoCo
+在 close 后遗留原生内存,每次任务切换每进程涨约 100–140 MB,合计约
+30–80 GB/step。在 close 后加 `gc.collect()` 实测无效(原生泄漏,不在
+Python 堆上)。
+
+修复:`rlinf/envs/libero/venv.py` 的
+`ReconfigureSubprocEnvWorker.reconfigure_env_fn` 改为终止旧子进程并 spawn
+新进程,RSS 随进程退出归零。实测每 step 增加约 25–45 s(子进程重生开销),
+主机内存曲线由单调上升变为平稳:step 0/2 完成后均约 487–489 GB,斜率为零。
+同时将 `RAY_memory_usage_threshold=0.98` 作为兜底(1 TB 机器上 95% 阈值
+留白过大),配合 12.5 的自动续跑循环,即使再次触发保护也能从 checkpoint
+恢复而不是死掉。
+
+注意:`runner.save_interval` 必须能被 `val_check_interval` 整除的断言方向
+是 `save % val == 0`;想加密 checkpoint(如每 5 步)必须同时把两者设为 5,
+只改 save_interval 会在启动即断言失败。
+
+其余全部沿用 YAML 内已固化的正式协议:每 10 步保存并评估、
+`save_best_macro_mean=True`、GRPO `group_size=8`、温度 1.6 随机评估、
+GSE 1G+7S rank 32 SVD、全量 task-router 指标(`task_router_num_tasks: 90`)。
+中断续跑时保持全部参数不变,仅设
+`runner.resume_dir="$RUN_DIR/libero90_gse_whole_model_r32_svd_8gpu_seed1234/checkpoints/global_step_<N>"`。
+
+### 12.5b 评估低成功率根因:flash_attention_2 在本机行为级损坏(2026-08-13)
+
+> **历史诊断说明:** 本节关于 FA2 损坏的结论仍成立，但其中把 SDPA 下
+> 55.9%/71.5--75.0% 的差距归因于平台差异的结论已被 12.5d 的严格对照
+> 推翻。这些低数值使用了原始环境图像和/或 greedy，并非官方发布协议，
+> 不得进入论文结果表。
+
+训练期 greedy 周期评估在 step 10/20 恒为 3.4–3.6%,与训练 rollout 的高温
+采样成功率(3–7%)同量级,而并行文档 14.6 节记录同语义 greedy 评估在 ARM
+上为 96.3%。经过完整对照排查,根因是 **`attn_implementation:
+"flash_attention_2"`(模型组默认值)对 OpenVLA-OFT 推理是普遍性行为损坏
+——不分平台**。2026-08-14 已在 ARM 上用同一 sha256 校验过的 OFT fork
+transformers(4.40.1)复测:启用 FA2 后 greedy 同样崩到 2.34%。ARM 此前
+未暴露只因其运行时未走 FA2 路径。**结论:所有 OpenVLA-OFT 训练与评估、
+在任何机器上,都必须显式 `attn_implementation=sdpa`(或 eager),严禁
+使用模型组默认的 flash_attention_2。**两机训练/评估配置已同步改为 sdpa。
+诊断矩阵(本机、greedy、同一批 fixed 有序 reset 窗口):
+
+| 模型(权重均已 sha256 对照 HuggingFace 原版一致) | flash_attention_2 | sdpa | eager |
+|---|---:|---:|---:|
+| Base-Lora SFT(官方口径 42.67%) | 4.5%(512 条) | **55.9%**(256 条) | — |
+| GRPO RL(README 96.44%;ARM greedy 96.3%) | 4.3%(256 条) | **71.5%**(256 条) | 73.1%(256 条) |
+
+排查中同时排除的假设(全部有实证):权重损坏(两模型 8 个分片 sha256
+均与 HF 一致)、采样模式未切换(resolved config `temperature_eval: -1` 且
+worker/模型代码 greedy 分支为 argmax)、图像方向(`get_libero_image` 有
+180° 旋转)、物体未稳定(reset 后 15 步零动作)、夹爪符号(变换与
+openvla 官方评估一致)、GSE/权重同步(base 模型独立评估同样低)、
+`lora_adapter` 未合并(已由并行文档 14.6 排除,不得合并)。视频抽帧显示
+flash-attn 下策略仍是目标导向(能精准接近任务物体)但完成不了操作——
+高温采样时两机成功率一致(都被温度抹平)、greedy 相差 20 倍,正是
+attention 实现损坏的典型特征。
+
+因此本机所有 OpenVLA-OFT 训练与评估必须覆盖
+`actor.model.attn_implementation=sdpa`(sdpa 与 eager 在 256 条内等价,
+sdpa 更快;循环脚本已内置该 override)。**正式训练已于 2026-08-14 从 0
+以全程 sdpa 重启**:此前 step 0–20 在损坏的 FA2 下训练、step 21–40 为
+sdpa 的混合协议运行已整体归档为
+`libero90_gse_r32_svd_8gpu_seed1234_mixed_fa2_20steps_sdpa_40steps`
+(其 sdpa 补评曲线 base 55.9% → step-20 59.0% → step-30 61.5% →
+step-40 59.4% 说明 FA2 时代的 GSE 残差并未损害 sdpa 推理,可作探索性
+参考,但不进论文)。诊断产物保留在 `OFT_OUTPUT` 下的 `diag_*` 目录;
+官方 GRPO 模型位于 `$OFT_OUTPUT/RLinf-OpenVLAOFT-GRPO-LIBERO-90/`
+(sha256 已校验)可复用。
+
+**修复后与 ARM 仍存的 ~20–25 pp 系统性差距**(GRPO:ARM 96.3% vs 本机
+75.0%;base:ARM ~80% vs 本机 55.9%)已按六项假设逐一核对
+(2026-08-14):
+
+1. 指标口径:排除。本机报告的就是 `eval/success_once`(prompt50 run:
+   once 74.6% / at_end 68.8%,两字段均已取出),不是 at_end 误读。
+2. 采样模式:排除。resolved config `temperature_eval: -1`,worker 映射为
+   `do_sample=False` 纯 greedy。
+3. 多轮 fixed-reset 复用:排除。所有多轮评估 `covered_tasks=90`;若存在
+   首批 ID 重复 bug,64-env 轮次只能覆盖 64 任务。本仓库含 LIBERO 池推进
+   实现(并行文档 14.4 协议)。
+4. 归一化键:排除。resolved `unnorm_key=libero_90_no_noops_trajall`。
+5. 加载语义:排除。`is_lora=false`、`num_action_chunks=8`、bf16;
+   `max_prompt_length` 128→50 仅 71.5%→75.0%。
+6. 环境侧:**定位在此**。配置逐项一致(512 步、256×256、standard、
+   `reset_gripper_open=False`、EGL 正常),但 16 条 fixed-reset 严格对照
+   (task 0–15 trial 0,greedy,ARM 同协议 100%)本机只有
+   **68.75%(11/16)**,失败任务 {1, 6, 8, 11, 12} 与 256 条评估中的
+   部分失败任务完全重合——失败指纹稳定,是仿真物理/渲染栈版本差异,
+   不是统计噪声。
+
+本机容器栈为 `mujoco 3.9.0 / robosuite 1.4.1 / libero 0.1.0 /
+transformers 4.40.1 / torch 2.6.0`。**2026-08-14 已与 ARM 实际生效栈
+逐项对齐核对**:ARM 生效的是 `mujoco 3.9.0`(venv 3.11.0 被 PYTHONPATH
+前置的 libero-runtime 遮蔽)、`robosuite 1.4.1`、LIBERO 源码 commit
+`0c5e40c`、`PyOpenGL 3.1.10`——与本机全部一致;唯一版本差异 bddl
+(本机 3.6.0 被 omnigibson 带入 vs ARM 1.0.1)已实测排除:PYTHONPATH
+前置 bddl 1.0.1(`$OFT_OUTPUT/libero-runtime/`)重跑 16 条对照结果不变
+(68.75%,失败任务同为 {1,6,8,11,12})。fp32 对照 75%(12/16),失败
+集合微移,精度只是次要因素。
+
+结论:两机在软件可对齐的范围内已经一致,剩余差距来自**平台级二进制
+差异**——同版本 MuJoCo 的 x86_64 与 aarch64 build 在接触物理与渲染上
+的浮点行为不同,叠加不同 GPU/EGL 驱动的图像渲染差异;512 步接触密集
+操作会把微小差异放大成确定性的按任务成败翻转。这类差异无法跨平台对齐。
+
+2026-08-14 追加两项定界(均按外部 review 意见执行):
+
+7. 评错权重:排除。三个 GRPO 诊断 run 的 resolved config
+   `rollout.model.model_path` 均指向
+   `/workspace/output/RLinf-OpenVLAOFT-GRPO-LIBERO-90/`(分片 sha256 与
+   HF 一致),base run 指向 Base-Lora;没有把 GSE 配置默认的 SFT 路径误当
+   GRPO 评。ARM 侧同协议参考值修正为:GRPO 96.289%、base 81.836%、
+   16 条对照 GRPO 100% / base 87.5%。
+8. venv.py respawn 补丁(12.5a):排除。用 stock venv.py(git checkout
+   还原,评估含初始 reconfigure 路径)重跑 16 条对照,结果与补丁版
+   **逐位一致**(68.75%,失败任务同为 {1,6,8,11,12})。补丁只解决主机
+   内存泄漏,不改变评估行为;本机评估完全确定性,失败指纹已三次复现。
+
+由于官方也是在 x86 平台评得 96.44%,"CPU 架构差异"不能解释全部;
+三方(官方 x86 / ARM 集群 / 本机 x86)真正可能不同、且尚未排除的是:
+
+- **GPU/EGL 驱动渲染差异**(A100-PCIE vs A100-SXM、不同 driver 的
+  光栅化/光照细节)。本机 driver `535.183.06`。
+- 官方口径为 90 任务全 50 trial(4500 条),trial 子集差异可解释数个
+  百分点,不足以解释 20 pp。
+
+2026-08-14 继续排除(累计第 9–10 项):
+
+9. Pillow 版本(本机 12.2.0 vs ARM 11.0.0):排除。venv 安装 11.0.0 后
+   16 条对照仍逐位一致(68.75%,失败集 {1,6,8,11,12} 第四次复现)。
+   顺带说明观测 resize 走 tensor 路径,不经 PIL。已保留 11.0.0。
+10. transformers 来源:一致。本机 venv 的 4.40.1 就是 moojink
+    `transformers-openvla-oft` fork(`direct_url.json` commit
+    `bc339d9`),与 ARM compat 目录的 fork 同源;timm 0.9.10、
+    tokenizers 0.19.1、numpy 1.26.4 双机一致。仅 torchvision
+    (0.21.0 vs NGC 0.20.0a0)与 opencv(4.11 vs 5.0,均不在观测路径)
+    存在版本差。
+
+**跨机观测/动作探针**已就绪:
+[scripts/probe_libero_obs.py](scripts/probe_libero_obs.py)。它渲染
+LIBERO-90 固定 init state(默认 task 1 trial 0,含 15 步 settle),保存
+`obs.npy/obs.png` 并打印图像 sha256 与统计,再用 GRPO 权重跑一次 greedy
+输出动作向量;支持 `--npy` 喂入对方机器的观测以隔离模型侧。本机(x86)
+基准:image sha256 `f2166cf2775f1977`、mean 110.7331、std 72.9005,
+首 chunk greedy 动作已存 `$OFT_OUTPUT/probe_x86/`。
+
+探针跨机结果(2026-08-14):**ARM 渲染与本机基本无差异**——观测/渲染
+差异假设排除。剩余差距的候选收敛为:模型前向数值(两机 greedy 动作向量
+对比进行中)与 512 步闭环中的物理演化差异。两机绝对成功率仍不可混报。
+
+纪律不变:两机绝对成功率**不可混合比较**;同机内 base→GSE→GRPO 的
+相对比较有效(本机口径:base 55.9% < GSE step-30 61.5% < 官方 GRPO
+75.0%)。
+
+独立 greedy 评估任意权重的命令模板(在容器内、12.3 初始化后):
+
+```bash
+export EVAL_DIR=/workspace/output/<eval_name> && mkdir -p $EVAL_DIR
+python examples/embodiment/train_embodied_agent.py \
+  --config-path "$EMBODIED_PATH/config" \
+  --config-name libero_90_grpo_openvlaoft_gse_r32_svd \
+  '+model@rollout.model=openvla_oft' \
+  rollout.model.model_path=<HF 布局权重目录> \
+  rollout.model.unnorm_key=libero_90_no_noops_trajall \
+  rollout.model.max_prompt_length=128 \
+  rollout.model.attn_implementation=sdpa \
+  actor.model.gse.enabled=False \
+  runner.only_eval=True \
+  env.eval.total_num_envs=64 env.eval.rollout_epoch=8 \
+  rollout.micro_batch_size=8 \
+  runner.logger.log_path="$EVAL_DIR" \
+  runner.logger.experiment_name=<eval_name> \
+  2>&1 | tee $EVAL_DIR/console.log
+```
+
+要点:`only_eval` 模式下 worker 从 `cfg.rollout.model` 建模,必须用
+`'+model@rollout.model=openvla_oft'` 合并模型组并覆盖
+`unnorm_key`/`max_prompt_length`(组默认是 LIBERO-10 的值);评估 GSE
+checkpoint 时再加 `rollout.model.gse.*` 全套字段和
+`runner.ckpt_path=<ckpt>/actor/model_state_dict/full_weights.pt`。评估
+temperature 语义:`temperature_eval > 0` 即随机采样,greedy 必须用 `-1`
+(官方 `evaluations/libero/*_eval.yaml` 里 `do_sample: False` 配
+`temperature_eval: 1.6` 实际会走随机采样,并行文档 13.2 的 2.7% 之谜
+即源于此)。
+
+### 12.5c W&B 记录与自动重评说明(2026-08-13)
+
+- 循环脚本内置 `WANDB_OVERRIDES` 构造:shell 数组不会传入子进程,最初在
+  交互 shell 里定义数组再调脚本导致整段训练只有 TensorBoard 记录。现在只需
+  容器环境里有 `WANDB_API_KEY/WANDB_PROJECT/WANDB_ENTITY`,脚本自动启用
+  W&B,缺任一则自动回退 tensorboard-only。
+- 让续跑重做某个 checkpoint 的评估:删除该
+  `global_step_<N>/evaluation_complete.json`(容器内 root 权限)后以
+  `+runner.eval_on_resume=true`(脚本已带)续跑即可;flash-attn 时代的
+  step-10/20 评估数值(3.4–3.6%)全部无效,不得用于曲线。
+
+### 12.5d 官方评估协议与 whole-model GSE 正式训练(2026-08-14)
+
+最终同机、同权重、同 fixed-reset 窗口对照定位出此前 20--25 pp 差距的
+核心原因，不是 CPU/GPU 仿真平台差异，而是项目评估路径同时偏离官方协议:
+
+1. 环境观测缺少 OpenVLA-OFT 官方图像变换：JPEG round-trip、Lanczos
+   resize 到 224，以及 0.9 center crop。现在由
+   `env/libero_90.yaml: official_image_preprocess: true` 固化。
+2. 周期评估曾把 `temperature_eval` 设为 `-1`，实际走 greedy。官方发布
+   模型的对照协议是 `temperature_eval: 1.6`、`top_k: -1`、`top_p: 1.0`。
+3. 注意力实现必须为 SDPA；FA2 的行为级损坏是独立问题，不能启用。
+
+修复后三组 256 条 fixed-window 结果如下，均来自本八卡服务器:
+
+| 模型 | 图像/采样/attention | `eval/success_once` |
+|---|---|---:|
+| Base-SFT-Lora | 官方图像 + temperature 1.6 + SDPA | 220/256 = **85.9375%** |
+| 官方 GRPO | 官方图像 + temperature 1.6 + SDPA | 248/256 = **96.875%** |
+| 官方 GRPO | 原始图像 + greedy + SDPA（旧错误协议） | 约 71.5--75.0% |
+
+96.875% 与官方/ARM 的约 96% 对齐，证明本机 CPU 物理 + GPU EGL 渲染
+没有导致先前宣称的系统性成功率缺口。论文只允许比较同一图像预处理、
+采样温度、attention 实现、reset 窗口与轨迹数下的结果。
+
+为使方法定义严格，正式配置不再只向 LLM 注入 GSE 并全量训练视觉/OFT
+权重，而是使用:
+
+```yaml
+actor:
+  model:
+    attn_implementation: sdpa
+    gse:
+      scope: whole_model
+      target_modules: all-linear
+      total_rank: 32
+      num_experts: 8
+      num_generalized_experts: 1
+      top_k: 2
+      initialization: svd
+      freeze_base: true
+```
+
+对正式 Base checkpoint 的实际枚举为 437 个 `torch.nn.Linear`：视觉骨干
+209 层、multimodal projector 3 层、语言模型 225 层；最小输入/输出维度
+为 1024，满足 rank-32 SVD 约束。所有 dense 原始参数冻结，只有这 437 层
+的 GSE experts/router 可训练，共 121,558,592 个参数；真实 7B 模型预检
+确认没有任何非 adapter 参数保持 `requires_grad=True`。旧目录
+`libero90_gse_r32_svd_8gpu_seed1234` 属于 LLM-only/非最终评估协议诊断，
+不得续接或用于论文。
+
+正式运行身份与路径:
+
+```text
+experiment: libero90_gse_whole_model_r32_svd_8gpu_seed1234
+RUN_DIR: /workspace/output/libero90_gse_whole_model_r32_svd_8gpu_seed1234
+launcher: scripts/run_libero90_gse_8gpu_loop.sh
+tmux: rlinf-train:0
+```
+
+自动循环只会在上述新目录中寻找完整 checkpoint，因此首次启动必定从
+Base step 0 开始；后续异常退出才允许在完全相同协议下自动恢复。实际
+attempt 1 于 2026-08-14 14:05 UTC（22:05 CST）以 `resume_dir=null` 启动，
+W&B run id 为 `dkj7waye`。rollout/actor 两组均在日志中确认注入 437 层。
+
+后续确认 attempt 1--3 均不健康：step 0 rollout 完成后的首次 actor
+backward 都以相同错误退出，且未产生训练指标或 checkpoint：
+
+```text
+RuntimeError: setStorage: sizes [7, 4304], storage offset 174592, ...
+are out of bounds for storage of size 0
+```
+
+`[7, 4304]` 正是视觉塔 GSE router（7 个 specialized experts）的权重
+形状。逐项关闭 reentrant checkpointing、全部 gradient checkpointing、
+actor offload，以及启用 `use_orig_params=True` 后错误均原样复现，排除了
+这些配置项。真实根因是 `GSEAdapter` 只把 residual 作为 FSDP forward
+输出，却把可微的 router load-balancing loss 保存在模块属性中；worker
+随后在 FSDP 边界外把该 loss（即使系数为 0）加入总 loss。FSDP 看不到
+这条输出支路，因而未注册 pre-backward unshard hook，反向直接访问了
+reshard 后的 0-storage router view。
+
+修复后 `GSEAdapter.forward()` 同时返回 residual 和 load-balancing loss，
+由 `GSELinear` 解包保存；`GSELinear` 的外部接口仍只返回普通 tensor。
+这样 auxiliary 支路成为 FSDP 正式输出并获得 unshard hook。2026-08-15
+的 8 卡最小合法 GRPO 验收（16 env、group size 2、1 rollout epoch、
+64 steps、whole-model 437 层、原始 full-shard/offload/reentrant 设置）已
+完整完成 `Global Step 1/1`：`actor/run_training=45.944 s`、
+`Step Time=103.860 s`，optimizer step 与 LLM/vision/projector router
+指标全部产生，未再出现 storage 错误。正式配置把两个 auxiliary-loss
+系数显式固定为 0.0；它们仅作诊断，不参与论文主实验优化目标。旧正式
+输出只作失败诊断，禁止续接。
+
+修复后的正式 attempt 1 于 2026-08-15 00:32 CST（2026-08-14 16:32 UTC）
+从 `resume_dir=null` 重启，W&B run id 为 `kuz5sy2b`。旧目录可恢复地归档为
+`/workspace/output/libero90_gse_whole_model_r32_svd_8gpu_seed1234_failed_fsdp_aux_20260815`
+（43 MiB）；新的 canonical `RUN_DIR` 未混入旧 TensorBoard/W&B 事件。正式
+step 0 已完整落盘并继续进入 step 1 rollout：256 trajectories、
+`success_once=77.734375%`、`return=3.88671875`、`approx_kl=0.0020913`、
+`grad_norm=0.390359`、actor update 396.259 s、整步 1107.184 s。router
+active layers 为 vision 204、projector 3、LLM 225；load-balancing loss
+记录为 1.23843，但其 weighted value 为 0，符合正式配置。该 step 在原始
+full-shard、actor offload、reentrant checkpointing、micro batch 32 和
+global batch 1024 下完成，是正式规模的修复验收，不是缩容冒烟结果。
+
+### 12.6 验收与回退规则
+
+- 首次 step-10 评估必须核对:`eval/num_trajectories=512`,且逐任务字段覆盖
+  全部 90 个 LIBERO-90 任务。`64×8` 与四卡 `32×16` 总量一致且同走多轮
+  auto-reset 推进路径;若触发显存/主机内存/framebuffer 故障,回退四卡已
+  验证的 `32×16`(总量仍为 512)。不要尝试 `512×1` 或任何 >16 env/GPU 的
+  单轮形态,EGL 会在初始化阶段直接失败。**本机已实测通过**(2026-08-13,
+  重生补丁后的 attempt-1 run):512 trajectories、`covered_tasks=90`、
+  90 个逐任务字段齐全,checkpoint 的 DCP `.metadata` 与 `full_weights.pt`
+  完整,`best_macro_mean` 快照生成;含保存+评估的 step 耗时约 1519 s
+  (纯训练 step 约 727 s)。
+- 评估健康基线以 12.5d 的官方协议为准：Base-SFT 85.9375%、官方 GRPO
+  96.875%（各 256 条）。55.9%/71.5--75.0% 是旧图像/greedy 错误协议，
+  flash-attn 时代的 3.4--4.5% 同样无效，全部不得进入论文曲线。
+- 当前官方图像/temperature-1.6 协议从成功率较高的 Base-SFT 初始化，正式
+  step 0 不应再全零。本次 256 条得到 `success_once=77.734375%`、
+  `grad_norm=0.390359`；若 step 0 全零，应立即检查图像预处理、采样温度、
+  SDPA 和 reset 窗口。旧协议下“step 0 全零、step 1 为 3.125%”的记录不再
+  是当前实验的健康基线。
+- whole-model GSE 当前吞吐基线（正式 step 0）：整步 1107.184 s，其中
+  rollout 674.054 s（两个 epoch 的生成主体 648.525 s）、actor update
+  396.259 s、权重同步 36.800 s。旧 LLM-only 配置的 695--713 s/step 不可
+  用于当前回归。后续稳态可因环境成功提前终止而更快，但若显著变慢，应先
+  核对 `rollout.micro_batch_size=8` 与 `actor.micro_batch_size=32`。
+- whole-model 正式 backward 峰值约 57 GiB/卡，80 GiB A100 仍有约 23 GiB
+  余量。不要再沿用 LLM-only 的 39 GiB 峰值。actor 若在其他改动后 OOM，
+  回退 `actor.micro_batch_size=16`，且续跑必须保持相同值；变更模型、指标
+  或 batch 协议后必须重新校准。
+- 主机内存(1 TB)远高于并行服务器的 254 GiB 上限,四卡文档中的
+  Ray CPU/内存阈值限制不适用于本机;沿用第 7 节的 Ray scratch 重定向即可,
+  但仍应在首个 step 监控 `free -g` 与 `du -sh $RAY_SCRATCH`。
+- 训练数值以 `RUN_DIR` 下的 `metrics.jsonl`、TensorBoard 与 W&B 为准;
+  checkpoint 位于 `RUN_DIR/<experiment_name>/checkpoints/global_step_<N>/`,
+  最佳权重快照位于 `checkpoints/best_macro_mean/`。
