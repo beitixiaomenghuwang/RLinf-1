@@ -341,9 +341,37 @@ class FSDPModelManager:
             self.load_optimizer(self.device)
             self.is_optimizer_offloaded = False
 
+        reset_lr_scheduler = self._cfg.optim.get("reset_lr_scheduler_on_resume", False)
+        initial_lrs = None
+        if reset_lr_scheduler:
+            # The optimizer checkpoint also contains the decayed param-group LRs.
+            # Capture the configured values before loading so a warm restart can
+            # preserve Adam moments without inheriting the old LR schedule.
+            initial_lrs = [group["lr"] for group in self.optimizer.param_groups]
+
         self._strategy.load_checkpoint(
             self.model, self.optimizer, self.lr_scheduler, load_path
         )
+
+        if initial_lrs is not None:
+            if len(initial_lrs) != len(self.optimizer.param_groups):
+                raise ValueError(
+                    "Cannot reset the LR scheduler after resume because the "
+                    "optimizer param-group count changed"
+                )
+            for param_group, initial_lr in zip(
+                self.optimizer.param_groups, initial_lrs, strict=True
+            ):
+                param_group["lr"] = initial_lr
+                param_group["initial_lr"] = initial_lr
+            self.lr_scheduler = self.build_lr_scheduler(
+                optimizer=self.optimizer,
+                optim_config=self._cfg.optim,
+            )
+            self._logger.info(
+                "[FSDP] Reset LR scheduler after checkpoint resume with "
+                f"configured initial LRs: {initial_lrs}"
+            )
 
     def save_checkpoint(self, save_path: str, step: int = 0) -> None:
         """

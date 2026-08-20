@@ -23,18 +23,17 @@ runner:
   task_type: embodied
   logger:
     log_path: "../results"
-    project_name: rlinf
-    experiment_name: "libero90_gse_whole_model_r32_svd_8gpu_seed1234"
-    logger_backends: ["tensorboard"]
-
+    project_name: "pi05-multitask-peft-rl"
+    experiment_name: "libero90_gse_r32_svd_8specialized_lr5e5_official"
+    logger_backends: ["tensorboard", "wandb"]
+    wandb_entity: "gxy1000h-jilin-university"
   max_epochs: 1000
-  max_steps: 120
-
+  max_steps: 200
+  max_checkpoints_to_keep: 6
   only_eval: False
   val_check_interval: 10
   save_interval: 10
   save_best_macro_mean: True
-
   resume_dir: null
   ckpt_path: null
 
@@ -42,11 +41,9 @@ algorithm:
   normalize_advantages: True
   kl_penalty: kl
   group_size: 8
-
   reward_type: action_level
   logprob_type: token_level
   entropy_type: token_level
-
   adv_type: grpo
   loss_type: actor
   loss_agg_func: "token-mean"
@@ -57,34 +54,25 @@ algorithm:
   clip_ratio_c: 3.0
   value_clip: 0.2
   huber_delta: 10.0
-
   gamma: 0.99
   gae_lambda: 0.95
-
   reward_coef: 5.0
-
   filter_rewards: True
   rewards_lower_bound: 0.5
   rewards_upper_bound: 4.5
 
 env:
   group_name: "EnvGroup"
-
   train:
     rollout_epoch: 4
     total_num_envs: 64
     max_episode_steps: 512
     max_steps_per_rollout_epoch: 512
-    # Use the same raw-image path for training and evaluation.
-    official_image_preprocess: False
+    official_image_preprocess: True
     reward_coef: ${algorithm.reward_coef}
     group_size: ${algorithm.group_size}
     reset_gripper_open: False
   eval:
-    # Seen-task LIBERO-90 validation: 32 simulators x 16 episode windows give
-    # 512 fixed interleaved reset states, covering all 90 tasks with 5-6
-    # trials each on four 40-GiB A100s. Unseen-task LIBERO-10 remains a
-    # separate standalone evaluation and is not run during training.
     rollout_epoch: 16
     total_num_envs: 32
     auto_reset: True
@@ -92,7 +80,7 @@ env:
     max_episode_steps: 512
     max_steps_per_rollout_epoch: 512
     group_size: 1
-    official_image_preprocess: False
+    official_image_preprocess: True
     use_fixed_reset_state_ids: True
     use_ordered_reset_state_ids: True
     reset_gripper_open: False
@@ -105,20 +93,15 @@ rollout:
   sampling_params:
     do_sample: True
     temperature_train: 1.6
-    # The released LIBERO-90 GRPO policy is evaluated stochastically with
-    # temperature 1.6; greedy evaluation underreports it by about 20 points.
     temperature_eval: 1.6
     top_k: -1
     top_p: 1.0
     repetition_penalty: 1.0
-
   group_name: "RolloutGroup"
   generation_backend: "huggingface"
   enable_offload: True
-  # Match the validated 8-GPU formal rollout configuration.
   micro_batch_size: 8
   pipeline_stage_num: 1
-
   model:
     model_path: "${oc.env:REPO_PATH}/model/RLinf-OpenVLAOFT-LIBERO-90-Base-Lora/"
     precision: ${actor.model.precision}
@@ -126,56 +109,40 @@ rollout:
 actor:
   group_name: "ActorGroup"
   training_backend: "fsdp"
-  # Match the official 8-GPU batch configuration used by the formal run.
   micro_batch_size: 32
   global_batch_size: 16384
   seed: 1234
   enable_offload: True
-
   model:
     model_path: "${oc.env:REPO_PATH}/model/RLinf-OpenVLAOFT-LIBERO-90-Base-Lora/"
     model_type: "openvla_oft"
-    # flash_attention_2 (the model-group default) is behaviorally broken for
-    # OpenVLA-OFT inference on every platform tested (x86 and ARM: official
-    # GRPO greedy collapses to 2-4%). See HANDOFF.md 12.5b; never revert.
     attn_implementation: "sdpa"
     unnorm_key: libero_90_no_noops_trajall
     max_prompt_length: 128
     is_lora: False
     gse:
       enabled: True
-      # Paper protocol: inject GSE into every Linear in the vision backbone,
-      # multimodal projector, and language model; freeze all original weights.
       scope: whole_model
       target_modules: all-linear
       total_rank: 32
       lora_alpha: 32.0
       num_experts: 8
-      num_generalized_experts: 1
-      # The selected experts are evaluated together by the fused GSE path.
+      num_generalized_experts: 0
+      routing_mode: "all"
       top_k: 2
       initialization: "svd"
       init_seed: 42
       freeze_base: True
-      # Match the MetaWorld GSE diagnostic surface: aggregate and layerwise
-      # task/router statistics are emitted under train/gse/*.
       log_router_metrics: True
       log_task_router_metrics: True
       log_layerwise_task_router_metrics: True
       task_router_num_tasks: 90
       task_router_informative_nmi_threshold: 0.01
       train_value_head: False
-      # Both regularizers are diagnostics only in the formal run.
       load_balancing_loss_coef: 0.0
       orthogonality_loss_coef: 0.0
-      # With FSDP full_shard/use_orig_params=False, original parameter views
-      # cannot be inspected safely outside forward. Measure A-factor
-      # orthogonality offline from saved checkpoints instead.
       log_orthogonality: False
-
   optim:
-    # Whole-model GSE freezes the dense base, so every trainable policy
-    # parameter belongs to the GSE optimizer group below.
     lr: 2.0e-5
     gse_lr: 5e-5
     total_training_steps: ${runner.max_steps}
@@ -183,14 +150,12 @@ actor:
     lr_scheduler: "cosine"
     num_cycles: 0.5
     min_lr: 1.0e-6
-    # Warm-restart only: preserve Adam state but start a fresh LR schedule.
     reset_lr_scheduler_on_resume: False
     adam_beta1: 0.9
     adam_beta2: 0.999
     adam_eps: 1.0e-08
     weight_decay: 0.01
     clip_grad: 1.0
-
   fsdp_config:
     strategy: "fsdp"
     gradient_checkpointing: True
