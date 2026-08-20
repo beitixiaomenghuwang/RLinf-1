@@ -76,6 +76,9 @@ gym_new_venv_step_type = tuple[
 ]
 warnings.simplefilter("once", DeprecationWarning)
 
+_ENV_START_TIMEOUT_SECONDS = 180
+_ENV_CLOSE_TIMEOUT_SECONDS = 30
+
 
 def _worker(
     parent: connection.Connection,
@@ -98,6 +101,10 @@ def _worker(
 
     parent.close()
     env = env_fn_wrapper.data()
+    # The parent waits for this before starting the next environment. Besides
+    # surfacing initialization failures immediately, this avoids creating every
+    # EGL context assigned to one GPU at the same instant.
+    p.send(("ready", None))
     try:
         while True:
             try:
@@ -193,21 +200,62 @@ class ReconfigureSubprocEnvWorker(SubprocEnvWorker):
         self.process = ctx.Process(target=_worker, args=args, daemon=True)
         self.process.start()
         self.child_remote.close()
+        self._wait_until_ready()
         EnvWorker.__init__(self, env_fn)
 
-    def reconfigure_env_fn(self, env_fn_param):
-        # Respawn the subprocess instead of rebuilding the env in place.
-        # robosuite/MuJoCo leak native memory on env.close(), so a long-lived
-        # worker grows without bound across task switches (~140 MB each); a
-        # fresh process resets RSS to baseline. start() returns immediately,
-        # so all envs of this vector rebuild in parallel and the following
-        # reset() call blocks until the new child is ready.
-        param = dict(env_fn_param)
-        self.process.terminate()
-        self.process.join(10)
+    def _wait_until_ready(self) -> None:
+        """Wait until the child has created its simulator and EGL context."""
+        if not self.parent_remote.poll(_ENV_START_TIMEOUT_SECONDS):
+            self.process.terminate()
+            self.process.join(10)
+            raise TimeoutError(
+                "LIBERO environment initialization timed out after "
+                f"{_ENV_START_TIMEOUT_SECONDS}s; check the NVIDIA driver and EGL logs"
+            )
+        try:
+            message = self.parent_remote.recv()
+        except EOFError as exc:
+            self.process.join(10)
+            raise RuntimeError(
+                "LIBERO environment subprocess exited while creating its EGL context"
+            ) from exc
+        if message != ("ready", None):
+            raise RuntimeError(f"Unexpected LIBERO worker startup message: {message!r}")
+
+    def _close_process(self) -> None:
+        """Release EGL in the child before using termination as a fallback."""
+        if not self.process.is_alive():
+            self.process.join(10)
+            return
+
+        try:
+            self.parent_remote.send(["close", None])
+            if self.parent_remote.poll(_ENV_CLOSE_TIMEOUT_SECONDS):
+                try:
+                    self.parent_remote.recv()
+                except EOFError:
+                    pass
+                self.process.join(10)
+        except (BrokenPipeError, EOFError, OSError):
+            pass
+
+        if self.process.is_alive():
+            # This path is reserved for an already-broken child. Normal task
+            # switches must let robosuite destroy the EGL context cleanly.
+            self.process.terminate()
+            self.process.join(10)
         if self.process.is_alive():
             self.process.kill()
             self.process.join(10)
+
+    def reconfigure_env_fn(self, env_fn_param):
+        # Respawn the subprocess to reclaim robosuite/MuJoCo native allocations,
+        # but close it gracefully first. Sending SIGTERM to a process that owns
+        # an EGL context can leave cleanup to the NVIDIA kernel driver; repeated
+        # concurrent cleanup triggered a driver general-protection fault on the
+        # eight-GPU LIBERO run.
+        param = dict(env_fn_param)
+        self._close_process()
         self.parent_remote.close()
 
         def env_fn(param=param):
@@ -232,6 +280,7 @@ class ReconfigureSubprocEnvWorker(SubprocEnvWorker):
         self.process = ctx.Process(target=_worker, args=args, daemon=True)
         self.process.start()
         self.child_remote.close()
+        self._wait_until_ready()
         return None
 
 

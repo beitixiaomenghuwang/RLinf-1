@@ -14,6 +14,12 @@
 
 from enum import Enum
 
+from rlinf.utils.robosuite_compat import install_robosuite_egl_device_shim
+
+# Simulator subprocesses import this package before robosuite. Its 1.4.1
+# import check incorrectly assumes CUDA ids and EGL indices share a namespace.
+install_robosuite_egl_device_shim()
+
 
 class SupportedEnvType(Enum):
     MANISKILL = "maniskill"

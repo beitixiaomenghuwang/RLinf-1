@@ -15,12 +15,14 @@
 # Override Ray's NvidiaGPUAcceleratorManager
 # https://github.com/ray-project/ray/blob/161849364a784442cc659fb9780f1a6adee85fce/python/ray/_private/accelerators/nvidia_gpu.py
 
+import ctypes
 import logging
 import os
 import shlex
 import warnings
 from contextlib import contextmanager
 from dataclasses import dataclass
+from functools import cache
 from typing import TYPE_CHECKING, ClassVar, Optional
 
 from omegaconf import ListConfig
@@ -39,6 +41,82 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _nv_profiling_active: bool = False
+
+# CUDA device ids address the GPUs visible to the process, while EGL device
+# indices address the driver's global EGL enumeration. They are not guaranteed
+# to have the same order, especially in containers with a GPU subset.
+EGL_DEVICE_ID_ENV_VARS = ("MUJOCO_EGL_DEVICE_ID", "EGL_DEVICE_ID")
+
+_EGL_CUDA_DEVICE_NV = 0x323A
+_MAX_EGL_DEVICES = 64
+_CPU_RENDERING_BACKENDS = frozenset({"osmesa", "glx"})
+
+
+def _query_egl_index_by_cuda_ordinal() -> dict[int, int]:
+    """Map CUDA-visible ordinals to the driver's EGL device indices."""
+    try:
+        libegl = ctypes.CDLL("libEGL.so.1")
+    except OSError as exc:
+        raise OSError(f"libEGL.so.1 is not loadable: {exc}") from exc
+    libegl.eglGetProcAddress.argtypes = [ctypes.c_char_p]
+    libegl.eglGetProcAddress.restype = ctypes.c_void_p
+
+    device_t = ctypes.c_void_p
+    boolean_t = ctypes.c_uint
+    int_t = ctypes.c_int
+    attrib_t = ctypes.c_ssize_t
+
+    query_devices_ptr = libegl.eglGetProcAddress(b"eglQueryDevicesEXT")
+    query_attrib_ptr = libegl.eglGetProcAddress(b"eglQueryDeviceAttribEXT")
+    if not query_devices_ptr or not query_attrib_ptr:
+        raise RuntimeError(
+            "EGL_EXT_device_enumeration and EGL_EXT_device_query are required"
+        )
+    query_devices = ctypes.CFUNCTYPE(
+        boolean_t, int_t, ctypes.POINTER(device_t), ctypes.POINTER(int_t)
+    )(query_devices_ptr)
+    query_attrib = ctypes.CFUNCTYPE(
+        boolean_t, device_t, int_t, ctypes.POINTER(attrib_t)
+    )(query_attrib_ptr)
+
+    devices = (device_t * _MAX_EGL_DEVICES)()
+    device_count = int_t()
+    if not query_devices(_MAX_EGL_DEVICES, devices, ctypes.byref(device_count)):
+        raise RuntimeError("eglQueryDevicesEXT failed")
+
+    egl_index_by_cuda_ordinal = {}
+    for egl_index in range(device_count.value):
+        cuda_ordinal = attrib_t(-1)
+        queried = query_attrib(
+            devices[egl_index], _EGL_CUDA_DEVICE_NV, ctypes.byref(cuda_ordinal)
+        )
+        if queried and cuda_ordinal.value >= 0:
+            egl_index_by_cuda_ordinal[cuda_ordinal.value] = egl_index
+    return egl_index_by_cuda_ordinal
+
+
+@cache
+def _egl_index_by_cuda_device() -> dict[int, int]:
+    """Map CUDA device ids used by placement to EGL device indices."""
+    try:
+        egl_index_by_cuda_ordinal = _query_egl_index_by_cuda_ordinal()
+    except (OSError, RuntimeError) as exc:
+        logger.debug("Cannot map CUDA devices to EGL devices (%s).", exc)
+        return {}
+
+    device_ids = NvidiaGPUManager.get_visible_devices()
+    if not device_ids:
+        return egl_index_by_cuda_ordinal
+    return {
+        device_ids[ordinal]: egl_index
+        for ordinal, egl_index in egl_index_by_cuda_ordinal.items()
+        if ordinal < len(device_ids)
+    }
+
+
+def _renders_with_egl() -> bool:
+    """Report whether robosuite can select EGL for this process."""
+    return os.environ.get("MUJOCO_GL") not in _CPU_RENDERING_BACKENDS
 
 
 # ---------------------------------------------------------------------------
@@ -256,9 +334,20 @@ class NvidiaGPUManager(AcceleratorManager):
         env_vars["RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES"] = "1"
         # https://github.com/ray-project/ray/blob/161849364a784442cc659fb9780f1a6adee85fce/python/ray/_private/accelerators/nvidia_gpu.py#L95-L96
 
-        # Simulator env vars
-        if len(visible_accelerators) > 0:
-            env_vars["MUJOCO_EGL_DEVICE_ID"] = str(visible_accelerators[0])
+        # Renderers use the global EGL index, not the CUDA device id assigned by
+        # placement. Set both names used by MuJoCo/robosuite and pyrender.
+        if len(visible_accelerators) > 0 and _renders_with_egl():
+            cuda_device_id = visible_accelerators[0]
+            egl_device_id = NvidiaGPUManager.get_egl_device_id(cuda_device_id)
+            if egl_device_id is None:
+                logger.warning(
+                    "No EGL device found for CUDA device %s; falling back to "
+                    "the CUDA id",
+                    cuda_device_id,
+                )
+                egl_device_id = cuda_device_id
+            for env_var in EGL_DEVICE_ID_ENV_VARS:
+                env_vars[env_var] = str(egl_device_id)
 
         # NCCL env vars
         env_vars["NCCL_CUMEM_ENABLE"] = "0"
@@ -272,6 +361,15 @@ class NvidiaGPUManager(AcceleratorManager):
             env_vars["NCCL_CUMEM_ENABLE"] = os.environ["NCCL_CUMEM_ENABLE"]
 
         return env_vars
+
+    @staticmethod
+    def get_egl_device_id(cuda_device_id: int | str) -> Optional[int]:
+        """Return the EGL index corresponding to a CUDA device id."""
+        try:
+            cuda_device_id = int(cuda_device_id)
+        except ValueError:
+            return None
+        return _egl_index_by_cuda_device().get(cuda_device_id)
 
     @staticmethod
     def get_visible_devices():
