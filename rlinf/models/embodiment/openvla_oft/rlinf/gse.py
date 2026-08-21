@@ -48,6 +48,7 @@ _INTEGRATION_FIELDS = {
     "scope",
     "target_modules",
     "exclude_modules",
+    "freeze_vision_backbone",
     "train_value_head",
     "load_balancing_loss_coef",
     "orthogonality_loss_coef",
@@ -66,7 +67,9 @@ def is_gse_enabled(config: Mapping[str, Any] | None) -> bool:
     return config is not None and bool(config.get("enabled", False))
 
 
-def _build_core_config(config: Mapping[str, Any]) -> GSEConfig:
+def _build_core_config(
+    config: Mapping[str, Any], *, semantic_embedding_dim: int | None = None
+) -> GSEConfig:
     unknown_fields = set(config) - _INTEGRATION_FIELDS - _GSE_CONFIG_FIELDS
     if unknown_fields:
         raise ValueError(f"Unknown OpenVLA-OFT GSE fields: {sorted(unknown_fields)}")
@@ -75,6 +78,8 @@ def _build_core_config(config: Mapping[str, Any]) -> GSEConfig:
         for name in _GSE_CONFIG_FIELDS
         if name in config and config[name] is not None
     }
+    if bool(values.get("semantic_conditioning", False)):
+        values.setdefault("semantic_embedding_dim", semantic_embedding_dim)
     # Task-conditioned diagnostics need the per-token routing assignments.
     # Keep this derived from the public logging switches so OpenVLA-OFT has the
     # same behavior as the OpenPI GSE integration.
@@ -96,6 +101,7 @@ def get_language_model(model: nn.Module) -> nn.Module:
 def _tag_gse_domain(model: nn.Module, domain: str) -> None:
     for _, layer in iter_gse_layers(model):
         layer.gse_domain = domain
+        layer.adapter.gse_domain = domain
 
 
 def _tag_whole_model_gse_domains(model: nn.Module) -> None:
@@ -107,7 +113,9 @@ def _tag_whole_model_gse_domains(model: nn.Module) -> None:
     }
     for name, layer in iter_gse_layers(model):
         root = name.partition(".")[0]
-        layer.gse_domain = domain_by_root.get(root, "model")
+        domain = domain_by_root.get(root, "model")
+        layer.gse_domain = domain
+        layer.adapter.gse_domain = domain
 
 
 def _resolve_injection_scope(
@@ -127,17 +135,37 @@ def _resolve_injection_scope(
 def _resolve_target_modules(
     injection_root: nn.Module,
     config: Mapping[str, Any],
+    *,
+    excluded_roots: tuple[str, ...] = (),
 ) -> tuple[str, ...]:
     configured_targets = config.get("target_modules", DEFAULT_LLM_TARGET_MODULES)
     if configured_targets == ALL_LINEAR_TARGET_MODULES:
         return tuple(
             name
             for name, module in injection_root.named_modules()
-            if name and isinstance(module, nn.Linear)
+            if name
+            and isinstance(module, nn.Linear)
+            and not any(
+                name == root or name.startswith(f"{root}.") for root in excluded_roots
+            )
         )
-    if isinstance(configured_targets, str):
-        return (configured_targets,)
-    return tuple(configured_targets)
+    targets = (
+        (configured_targets,)
+        if isinstance(configured_targets, str)
+        else tuple(configured_targets)
+    )
+    if not excluded_roots:
+        return targets
+    return tuple(
+        name
+        for name, module in injection_root.named_modules()
+        if name
+        and isinstance(module, nn.Linear)
+        and any(name == target or name.endswith(f".{target}") for target in targets)
+        and not any(
+            name == root or name.startswith(f"{root}.") for root in excluded_roots
+        )
+    )
 
 
 def _existing_gse_report(model: nn.Module) -> GSEInjectionReport:
@@ -171,17 +199,44 @@ def configure_openvla_gse(
     ordinary model weights. This function only adds the new RL adapter and
     never loads or merges the repository's attached PEFT adapter. The default
     scope preserves the original language-only behavior. ``whole_model`` with
-    ``all-linear`` wraps every linear layer in the vision backbone, projector,
-    and language model, then freezes every original model parameter.
+    ``all-linear`` wraps every selected linear layer and freezes every original
+    model parameter. With ``freeze_vision_backbone=true``, the vision backbone
+    is excluded from GSE injection and remains completely frozen.
     """
     if not is_gse_enabled(config):
         raise ValueError("configure_openvla_gse requires enabled=true")
 
-    core_config = _build_core_config(config)
+    semantic_embedding_dim = None
+    if bool(config.get("semantic_conditioning", False)):
+        embedding_layer = model.get_input_embeddings()
+        semantic_embedding_dim = getattr(embedding_layer, "embedding_dim", None)
+        if semantic_embedding_dim is None and hasattr(embedding_layer, "weight"):
+            semantic_embedding_dim = int(embedding_layer.weight.shape[-1])
+    core_config = _build_core_config(
+        config, semantic_embedding_dim=semantic_embedding_dim
+    )
     scope, injection_root = _resolve_injection_scope(model, config)
-    target_modules = _resolve_target_modules(injection_root, config)
+    freeze_vision_backbone = bool(config.get("freeze_vision_backbone", False))
+    excluded_roots = (
+        ("vision_backbone",)
+        if scope == WHOLE_MODEL_SCOPE and freeze_vision_backbone
+        else ()
+    )
+    target_modules = _resolve_target_modules(
+        injection_root,
+        config,
+        excluded_roots=excluded_roots,
+    )
     exclude_modules = tuple(config.get("exclude_modules", ()))
     if already_injected:
+        if freeze_vision_backbone and any(
+            name == "vision_backbone" or name.startswith("vision_backbone.")
+            for name, _ in iter_gse_layers(model)
+        ):
+            raise ValueError(
+                "freeze_vision_backbone=True is incompatible with an already "
+                "injected vision GSE"
+            )
         report = _existing_gse_report(injection_root)
     else:
         report = inject_gse(
@@ -203,6 +258,8 @@ def configure_openvla_gse(
         for name, parameter in model.named_parameters():
             if not name.startswith("language_model."):
                 parameter.requires_grad_(True)
+    if freeze_vision_backbone:
+        model.vision_backbone.requires_grad_(False)
     if bool(config.get("train_value_head", False)) and hasattr(model, "value_head"):
         model.value_head.requires_grad_(True)
 

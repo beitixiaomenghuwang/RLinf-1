@@ -32,6 +32,10 @@ class GSEConfig:
     normalize_topk: bool = True
     router_bias: bool = False
     router_init_std: float = 0.02
+    semantic_conditioning: bool = False
+    semantic_embedding_dim: int | None = None
+    semantic_router_scale: float = 1.0
+    action_sequence_routing: bool = False
     orthogonal_gain: float = 1.0
     freeze_base: bool = True
     init_seed: int | None = None
@@ -80,6 +84,14 @@ class GSEConfig:
             raise ValueError("lora_alpha must be positive")
         if self.router_init_std < 0:
             raise ValueError("router_init_std must be non-negative")
+        if self.semantic_conditioning and (
+            self.semantic_embedding_dim is None or self.semantic_embedding_dim <= 0
+        ):
+            raise ValueError(
+                "semantic_embedding_dim must be positive when semantic_conditioning=True"
+            )
+        if self.semantic_router_scale < 0:
+            raise ValueError("semantic_router_scale must be non-negative")
         if self.orthogonal_gain <= 0:
             raise ValueError("orthogonal_gain must be positive")
 

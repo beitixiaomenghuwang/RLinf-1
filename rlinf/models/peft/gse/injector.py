@@ -100,3 +100,4 @@ def mark_only_gse_as_trainable(model: nn.Module) -> None:
         layer.specialized_experts.requires_grad_(True)
         if layer.config.routing_mode != "uniform":
             layer.router.requires_grad_(True)
+            layer.semantic_router.requires_grad_(True)

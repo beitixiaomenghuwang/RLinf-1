@@ -24,7 +24,7 @@ runner:
   logger:
     log_path: "../results"
     project_name: "pi05-multitask-peft-rl"
-    experiment_name: "libero90_gse_r32_svd_8specialized_lr5e5_official"
+    experiment_name: "libero90_gse_frozen_vision_r32_svd_8specialized_lr5e5_official"
     logger_backends: ["tensorboard", "wandb"]
     wandb_entity: "gxy1000h-jilin-university"
   max_epochs: 1000
@@ -124,11 +124,20 @@ actor:
       enabled: True
       scope: whole_model
       target_modules: all-linear
+      # Keep visual representations fixed; train projector/LLM GSE only.
+      freeze_vision_backbone: True
       total_rank: 32
       lora_alpha: 32.0
       num_experts: 8
       num_generalized_experts: 0
       routing_mode: "all"
+      # Route from frozen instruction semantics plus the current layer state.
+      # Projector/ordinary LLM tokens route independently; action-token
+      # positions share a sequence-level state context. Vision has no GSE.
+      semantic_conditioning: True
+      semantic_router_scale: 1.0
+      routing_granularity: "token"
+      action_sequence_routing: True
       top_k: 2
       initialization: "svd"
       init_seed: 42
@@ -141,7 +150,7 @@ actor:
       train_value_head: False
       load_balancing_loss_coef: 0.0
       orthogonality_loss_coef: 0.0
-      log_orthogonality: False
+      log_orthogonality: True
   optim:
     lr: 2.0e-5
     gse_lr: 5e-5

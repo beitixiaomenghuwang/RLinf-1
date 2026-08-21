@@ -24,7 +24,7 @@ runner:
   logger:
     log_path: "../results"
     project_name: rlinf
-    experiment_name: "libero90_gse_whole_model_r32_svd_8gpu_seed1234"
+    experiment_name: "libero90_gse_frozen_vision_r32_svd_8gpu_seed1234"
     logger_backends: ["tensorboard"]
 
   max_epochs: 1000
@@ -144,14 +144,19 @@ actor:
     is_lora: False
     gse:
       enabled: True
-      # Paper protocol: inject GSE into every Linear in the vision backbone,
-      # multimodal projector, and language model; freeze all original weights.
+      # PE-RL protocol: freeze the complete vision backbone and inject GSE only
+      # into the multimodal projector and language model.
       scope: whole_model
       target_modules: all-linear
+      freeze_vision_backbone: True
       total_rank: 32
       lora_alpha: 32.0
       num_experts: 8
       num_generalized_experts: 1
+      semantic_conditioning: True
+      semantic_router_scale: 1.0
+      routing_granularity: "token"
+      action_sequence_routing: True
       # The selected experts are evaluated together by the fused GSE path.
       top_k: 2
       initialization: "svd"
@@ -171,7 +176,7 @@ actor:
       # With FSDP full_shard/use_orig_params=False, original parameter views
       # cannot be inspected safely outside forward. Measure A-factor
       # orthogonality offline from saved checkpoints instead.
-      log_orthogonality: False
+      log_orthogonality: True
 
   optim:
     # Whole-model GSE freezes the dense base, so every trainable policy

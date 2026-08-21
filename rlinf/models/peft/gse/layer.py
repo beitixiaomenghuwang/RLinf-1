@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from .config import GSEConfig
+from .context import get_gse_routing_context
 from .initialization import initialize_expert_factors, initialize_router
 
 
@@ -81,6 +82,9 @@ class GSEAdapter(nn.Module):
         self.out_features = out_features
         self._load_balancing_loss: torch.Tensor | None = None
         self._router_stats: dict[str, torch.Tensor] = {}
+        self._cached_semantic_embeddings: torch.Tensor | None = None
+        self._cached_action_token_mask: torch.Tensor | None = None
+        self._cached_sequence_mask: torch.Tensor | None = None
 
         ranks = config.expert_ranks
         experts = [
@@ -112,6 +116,17 @@ class GSEAdapter(nn.Module):
             if config.num_specialized_experts > 0
             else nn.Identity()
         )
+        self.semantic_router = (
+            nn.Linear(
+                config.semantic_embedding_dim,
+                config.num_specialized_experts,
+                bias=False,
+            )
+            if config.semantic_conditioning
+            and config.semantic_embedding_dim is not None
+            and config.num_specialized_experts > 0
+            else nn.Identity()
+        )
 
         initialize_expert_factors(
             [expert.lora_a for expert in experts],
@@ -132,6 +147,13 @@ class GSEAdapter(nn.Module):
             )
             if config.routing_mode == "uniform":
                 self.router.requires_grad_(False)
+                self.semantic_router.requires_grad_(False)
+            if config.semantic_conditioning and config.num_specialized_experts > 0:
+                initialize_router(
+                    self.semantic_router,
+                    standard_deviation=config.router_init_std,
+                    seed=None if router_seed is None else router_seed + 1,
+                )
         self.to(device=device, dtype=dtype)
 
     @property
@@ -153,6 +175,9 @@ class GSEAdapter(nn.Module):
         """Discard losses and diagnostics saved by the latest forward pass."""
         self._load_balancing_loss = None
         self._router_stats = {}
+        self._cached_semantic_embeddings = None
+        self._cached_action_token_mask = None
+        self._cached_sequence_mask = None
 
     def orthogonality_loss(self) -> torch.Tensor:
         """Penalize correlation between rows of all expert A factors."""
@@ -173,7 +198,59 @@ class GSEAdapter(nn.Module):
 
     def _routing_probabilities(self, routing_inputs: torch.Tensor) -> torch.Tensor:
         logits = self.router(routing_inputs.to(self.router.weight.dtype))
+        if self.config.semantic_conditioning:
+            context = get_gse_routing_context()
+            if context is not None and context.semantic_embeddings is not None:
+                self._cached_semantic_embeddings = context.semantic_embeddings.detach()
+            semantic = self._cached_semantic_embeddings
+            if semantic is None:
+                raise RuntimeError(
+                    "semantic_conditioning=True requires an active GSE routing context"
+                )
+            semantic_logits = self.semantic_router(
+                semantic.to(self.semantic_router.weight.dtype)
+            )
+            if semantic_logits.shape[0] != logits.shape[0]:
+                if logits.shape[0] % semantic_logits.shape[0] != 0:
+                    raise ValueError(
+                        "Semantic routing batch does not match GSE token batch"
+                    )
+                semantic_logits = semantic_logits.repeat_interleave(
+                    logits.shape[0] // semantic_logits.shape[0], dim=0
+                )
+            logits = logits + self.config.semantic_router_scale * semantic_logits
         return F.softmax(logits.float(), dim=-1)
+
+    def _routing_inputs_for_tokens(self, inputs: torch.Tensor) -> torch.Tensor:
+        """Use an action-state pooled context for action tokens in LLM layers."""
+        context = get_gse_routing_context()
+        if context is not None and context.action_token_mask is not None:
+            self._cached_action_token_mask = context.action_token_mask.detach()
+        if context is not None and context.sequence_mask is not None:
+            self._cached_sequence_mask = context.sequence_mask.detach()
+        action_token_mask = self._cached_action_token_mask
+        if (
+            not self.config.action_sequence_routing
+            or action_token_mask is None
+            or getattr(self, "gse_domain", None) != "llm"
+            or inputs.ndim < 3
+            or tuple(action_token_mask.shape) != tuple(inputs.shape[:2])
+        ):
+            return inputs.reshape(-1, self.in_features)
+        mask = action_token_mask.to(device=inputs.device, dtype=torch.bool)
+        sequence_mask = self._cached_sequence_mask
+        if sequence_mask is not None and tuple(sequence_mask.shape) == tuple(
+            inputs.shape[:2]
+        ):
+            sequence_mask = sequence_mask.to(device=inputs.device, dtype=torch.bool)
+            pooled = (inputs * sequence_mask.unsqueeze(-1)).sum(
+                dim=1
+            ) / sequence_mask.sum(dim=1, keepdim=True).clamp_min(1).to(inputs.dtype)
+        else:
+            pooled = inputs.mean(dim=1)
+        routing_inputs = inputs.clone()
+        routing_inputs[mask] = pooled.unsqueeze(1).expand_as(inputs)[mask]
+        return routing_inputs.reshape(-1, self.in_features)
 
     def _uniform_residual(self, inputs: torch.Tensor) -> torch.Tensor:
         """Average every expert without consulting a router."""
@@ -312,7 +389,8 @@ class GSEAdapter(nn.Module):
 
     def _token_routed_residual(self, inputs: torch.Tensor) -> torch.Tensor:
         flattened = inputs.reshape(-1, self.in_features)
-        probabilities = self._routing_probabilities(flattened)
+        routing_inputs = self._routing_inputs_for_tokens(inputs)
+        probabilities = self._routing_probabilities(routing_inputs)
         weights, indices = self._select_experts(probabilities)
         if self._can_fuse_experts(self.all_experts):
             residual = self._fused_routed_residual(flattened, weights, indices)
@@ -437,6 +515,11 @@ class GSELinear(nn.Module):
     def router(self) -> nn.Linear:
         """Expose the specialized-expert router."""
         return self.adapter.router
+
+    @property
+    def semantic_router(self) -> nn.Module:
+        """Expose the frozen-instruction conditioning projection."""
+        return self.adapter.semantic_router
 
     @property
     def all_experts(self) -> tuple[GSEExpert, ...]:
