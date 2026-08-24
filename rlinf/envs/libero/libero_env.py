@@ -700,11 +700,6 @@ class LiberoEnv(gym.Env):
     def _extract_image_and_state(self, obs):
         full_image = get_libero_image(obs)
         wrist_image = get_libero_wrist_image(obs)
-        if self.cfg.get("official_image_preprocess", False):
-            from rlinf.envs.libero.utils import preprocess_openvla_oft_image
-
-            full_image = preprocess_openvla_oft_image(full_image)
-            wrist_image = preprocess_openvla_oft_image(wrist_image)
         return {
             "full_image": full_image,
             "wrist_image": wrist_image,

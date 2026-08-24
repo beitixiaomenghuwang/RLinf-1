@@ -1,6 +1,11 @@
 """Generalized and specialized expert residual adapters."""
 
 from .config import GSEConfig
+from .context import (
+    get_gse_routing_context,
+    gse_routing_context,
+    update_gse_routing_context,
+)
 from .initialization import joint_lora_a, orthogonality_error
 from .injector import (
     GSEInjectionReport,
@@ -39,6 +44,8 @@ __all__ = [
     "gse_task_router_metrics_from_tensor",
     "gse_task_router_statistics",
     "gse_state_dict",
+    "get_gse_routing_context",
+    "gse_routing_context",
     "inject_gse",
     "iter_gse_layers",
     "joint_lora_a",
@@ -46,4 +53,5 @@ __all__ = [
     "mark_only_gse_as_trainable",
     "orthogonality_error",
     "reset_gse_auxiliary_state",
+    "update_gse_routing_context",
 ]

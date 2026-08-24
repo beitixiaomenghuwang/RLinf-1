@@ -18,6 +18,7 @@ def _adapter_prefixes(model: nn.Module) -> tuple[str, ...]:
                 f"{root}adapter.generalized_experts.",
                 f"{root}adapter.specialized_experts.",
                 f"{root}adapter.router.",
+                f"{root}adapter.semantic_router.",
             )
         )
     return tuple(prefixes)

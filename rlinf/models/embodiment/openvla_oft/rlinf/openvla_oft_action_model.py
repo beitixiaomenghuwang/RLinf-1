@@ -32,6 +32,10 @@ from transformers.generation import TopKLogitsWarper
 
 from rlinf.models.embodiment.base_policy import BasePolicy, ForwardType
 from rlinf.models.embodiment.modules.value_head import ValueHead
+from rlinf.models.peft.gse import (
+    gse_routing_context,
+    update_gse_routing_context,
+)
 from rlinf.utils.utils import (
     compute_entropy_from_logits,
     compute_logprobs_from_logits,
@@ -76,6 +80,59 @@ class OpenVLAOFTForRLActionPrediction(OpenVLAOFTForActionPrediction, BasePolicy)
             )
 
         self.max_prompt_length = max_prompt_length
+        self._instruction_prefix_tokens: int | None = None
+        self._instruction_suffix_tokens: int | None = None
+
+    def _instruction_mask(self, attention_mask: torch.Tensor) -> torch.Tensor:
+        """Exclude padding and the fixed OpenVLA instruction template."""
+        valid = attention_mask.to(dtype=torch.bool)
+        prefix_tokens = self._instruction_prefix_tokens
+        suffix_tokens = self._instruction_suffix_tokens
+        if prefix_tokens is None or suffix_tokens is None:
+            fallback = valid.clone()
+            fallback[:, -1] = False
+            return fallback
+
+        instruction = torch.zeros_like(valid)
+        for row_index, row in enumerate(valid):
+            positions = torch.where(row)[0]
+            start = prefix_tokens
+            end = positions.numel() - suffix_tokens
+            if start < end:
+                instruction[row_index, positions[start:end]] = True
+            elif positions.numel() > 1:
+                instruction[row_index, positions[:-1]] = True
+        return instruction
+
+    @torch.no_grad()
+    def _get_frozen_instruction_embedding(
+        self, input_ids: torch.Tensor, attention_mask: torch.Tensor
+    ) -> torch.Tensor:
+        """Pool prompt token embeddings for semantic, task-ID-free routing."""
+        embeddings = self.get_input_embeddings()(input_ids)
+        mask = self._instruction_mask(attention_mask).to(
+            device=embeddings.device, dtype=embeddings.dtype
+        )
+        return (embeddings * mask.unsqueeze(-1)).sum(dim=1) / mask.sum(
+            dim=1, keepdim=True
+        ).clamp_min(1)
+
+    def _set_action_routing_mask(
+        self,
+        multimodal_embeddings: torch.Tensor,
+        multimodal_attention_mask: torch.Tensor,
+        action_count: int,
+    ) -> None:
+        action_mask = torch.zeros(
+            multimodal_embeddings.shape[:2],
+            device=multimodal_embeddings.device,
+            dtype=torch.bool,
+        )
+        action_mask[:, -action_count:] = True
+        update_gse_routing_context(
+            action_token_mask=action_mask,
+            sequence_mask=multimodal_attention_mask.to(dtype=torch.bool),
+        )
 
     def _build_embedding(self, input_ids, attention_mask, pixel_values):
         assert torch.all(input_ids[:, -1] == STOP_INDEX)
@@ -282,6 +339,10 @@ class OpenVLAOFTForRLActionPrediction(OpenVLAOFTForActionPrediction, BasePolicy)
             B, N, C, H, W = pixel_values.shape
             pixel_values = pixel_values.reshape(B, N * C, H, W)
 
+        semantic_embedding = self._get_frozen_instruction_embedding(
+            input_ids, attention_mask
+        )
+
         forward_inputs = {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
@@ -314,24 +375,30 @@ class OpenVLAOFTForRLActionPrediction(OpenVLAOFTForActionPrediction, BasePolicy)
         )  # [B, L + act + 1]
 
         # multimodal
-        mm_embeddings, mm_attention_mask = self._build_embedding(
-            input_ids, attention_mask, pixel_values
-        )
-        multimodal_position_ids = mm_attention_mask.cumsum(dim=1) - 1
+        with gse_routing_context(semantic_embedding):
+            mm_embeddings, mm_attention_mask = self._build_embedding(
+                input_ids, attention_mask, pixel_values
+            )
+            self._set_action_routing_mask(
+                mm_embeddings,
+                mm_attention_mask,
+                self.action_dim * self.num_action_chunks,
+            )
+            multimodal_position_ids = mm_attention_mask.cumsum(dim=1) - 1
 
-        # Forward pass through language model
-        outputs = self.language_model(
-            input_ids=None,
-            attention_mask=mm_attention_mask,
-            position_ids=multimodal_position_ids,
-            past_key_values=None,
-            inputs_embeds=mm_embeddings,
-            labels=None,
-            use_cache=None,
-            output_attentions=False,
-            output_hidden_states=True,
-            return_dict=True,
-        )
+            # Forward pass through language model
+            outputs = self.language_model(
+                input_ids=None,
+                attention_mask=mm_attention_mask,
+                position_ids=multimodal_position_ids,
+                past_key_values=None,
+                inputs_embeds=mm_embeddings,
+                labels=None,
+                use_cache=None,
+                output_attentions=False,
+                output_hidden_states=True,
+                return_dict=True,
+            )
 
         # Extract hidden states for action tokens
         last_hidden_states = outputs.hidden_states[-1]  # (B, seq_len, D)
@@ -458,6 +525,13 @@ class OpenVLAOFTForRLActionPrediction(OpenVLAOFTForActionPrediction, BasePolicy)
         self.action_scale = 1.0
 
         self.input_processor = input_processor
+        tokenizer = input_processor.tokenizer
+        prefix_ids = tokenizer(
+            "In: What action should the robot take to ", add_special_tokens=True
+        )["input_ids"]
+        suffix_ids = tokenizer("?\nOut: ", add_special_tokens=False)["input_ids"]
+        self._instruction_prefix_tokens = len(prefix_ids)
+        self._instruction_suffix_tokens = len(suffix_ids)
 
     def forward(self, forward_type=ForwardType.DEFAULT, **kwargs):
         if forward_type == ForwardType.DEFAULT:
@@ -486,6 +560,10 @@ class OpenVLAOFTForRLActionPrediction(OpenVLAOFTForActionPrediction, BasePolicy)
 
             action_tokens = forward_inputs["action_tokens"]
 
+        semantic_embedding = self._get_frozen_instruction_embedding(
+            input_ids, attention_mask
+        )
+
         assert torch.all(input_ids[:, 0] == 1)
         assert torch.all(attention_mask[:, 0] == 1)
         # last token is space ` `
@@ -506,27 +584,33 @@ class OpenVLAOFTForRLActionPrediction(OpenVLAOFTForActionPrediction, BasePolicy)
         )  # [B, L + act + 1]
 
         # multimodal
-        mm_embeddings, mm_attention_mask = self._build_embedding(
-            input_ids, attention_mask, pixel_values
-        )
-        multimodal_position_ids = mm_attention_mask.cumsum(dim=1) - 1
+        with gse_routing_context(semantic_embedding):
+            mm_embeddings, mm_attention_mask = self._build_embedding(
+                input_ids, attention_mask, pixel_values
+            )
+            self._set_action_routing_mask(
+                mm_embeddings,
+                mm_attention_mask,
+                self.action_dim * self.num_action_chunks,
+            )
+            multimodal_position_ids = mm_attention_mask.cumsum(dim=1) - 1
 
-        if compute_values:
-            output_hidden_states = True
+            if compute_values:
+                output_hidden_states = True
 
-        # Forward pass through language model
-        outputs = self.language_model(
-            input_ids=None,
-            attention_mask=mm_attention_mask,
-            position_ids=multimodal_position_ids,
-            past_key_values=None,
-            inputs_embeds=mm_embeddings,
-            labels=None,
-            use_cache=use_cache,
-            output_attentions=False,
-            output_hidden_states=output_hidden_states,
-            return_dict=True,
-        )
+            # Forward pass through language model
+            outputs = self.language_model(
+                input_ids=None,
+                attention_mask=mm_attention_mask,
+                position_ids=multimodal_position_ids,
+                past_key_values=None,
+                inputs_embeds=mm_embeddings,
+                labels=None,
+                use_cache=use_cache,
+                output_attentions=False,
+                output_hidden_states=output_hidden_states,
+                return_dict=True,
+            )
 
         if not compute_logprobs and not compute_values:
             return outputs

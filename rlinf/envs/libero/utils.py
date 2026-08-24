@@ -88,38 +88,6 @@ def get_libero_image(obs: dict[str, np.ndarray]) -> np.ndarray:
     return img
 
 
-def preprocess_openvla_oft_image(img: np.ndarray) -> np.ndarray:
-    """Match the image path used by the official OpenVLA-OFT evaluator."""
-    import tensorflow as tf
-
-    image = tf.image.encode_jpeg(img)
-    image = tf.io.decode_image(image, expand_animations=False, dtype=tf.uint8)
-    image = tf.image.resize(image, (224, 224), method="lanczos3", antialias=True)
-    image = tf.cast(tf.clip_by_value(tf.round(image), 0, 255), tf.uint8)
-
-    crop_fraction = tf.reshape(
-        tf.clip_by_value(tf.sqrt(tf.constant(0.9, dtype=tf.float32)), 0, 1),
-        (1,),
-    )
-    offset = (1.0 - crop_fraction) / 2.0
-    boxes = tf.stack(
-        [
-            offset,
-            offset,
-            offset + crop_fraction,
-            offset + crop_fraction,
-        ],
-        axis=1,
-    )
-    image = tf.image.convert_image_dtype(image, tf.float32)
-    image = tf.image.crop_and_resize(image[None], boxes, tf.constant([0]), (224, 224))[
-        0
-    ]
-    image = tf.clip_by_value(image, 0, 1)
-    image = tf.image.convert_image_dtype(image, tf.uint8, saturate=True)
-    return image.numpy()
-
-
 def get_libero_wrist_image(
     obs: dict[str, np.ndarray], resize_size: Union[int, tuple[int, int]] = 224
 ) -> np.ndarray:

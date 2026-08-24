@@ -40,7 +40,6 @@ env:
     use_ordered_reset_state_ids: True
     reset_gripper_open: False
     is_eval: True
-    official_image_preprocess: True
     video_cfg:
       save_video: False
       video_base_dir: ${runner.logger.log_path}/video/eval

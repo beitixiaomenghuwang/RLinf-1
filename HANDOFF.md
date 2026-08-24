@@ -1,8 +1,8 @@
 # Pi0.5 Multi-Task Parameter-Efficient RL Handoff
 
-Last updated: 2026-08-14 (Section 12.5d: corrected official LIBERO-90 image and
-sampling protocol; whole-model OpenVLA-OFT GSE formal run started from Base;
-all OpenVLA-OFT runs use SDPA)
+Last updated: 2026-08-21 (Section 12.7: current LIBERO-90 PE-RL freezes the
+vision backbone and trains semantic-conditioned projector/LLM GSE; all
+OpenVLA-OFT runs use SDPA)
 
 This document is the complete handoff for the Pi0.5 MetaWorld MT50 project. It
 retains validated experiments, output/checkpoint paths, reproducible commands,
@@ -1680,15 +1680,14 @@ that router skew is persistent and harmful.
 最大稳定配置。本节的并行度配置**已在本机实测定稿**(2026-08-13):最初按
 "GPU 数翻倍、单卡显存翻倍"外推的若干值在实测中被推翻,表中记录的是最终
 实测值与被否决的候选值,不要再按纸面外推调整。2026-08-13 的吞吐/显存
-测量来自旧 LLM-only GSE；12.5d 切换 whole-model GSE 后，最终性能基线以
-12.6 和修复后正式 run 为准。
+测量来自旧 LLM-only GSE；12.5d 记录的 whole-model GSE 也已被 12.7 的
+frozen-vision 方法定义取代。旧吞吐和显存只作历史诊断，当前基线必须重新测量。
 
 实测定稿:`128 env × 2 epoch` 训练、`64 env × 8 epoch` 评估、
 `rollout.micro_batch_size=8`、`actor.micro_batch_size=32`、allocator 仅设
-`max_split_size_mb:128`。这些 batch/并行度在 whole-model 正式 step 0 已
-再次通过；当前整步 1107.184 s（rollout 674.054 s、actor 396.259 s、
-权重同步 36.800 s），显存峰值约 57 GiB/卡。按首步保守外推，140 步纯
-训练至少约 43 小时，尚未计入每 10 步的 checkpoint 和 512 条周期评估。
+`max_split_size_mb:128`。环境并行度已验证；frozen-vision 模型的 actor
+吞吐和显存尚未完成正式八卡测量。whole-model 的 1107.184 s/step 和 57 GiB
+峰值不得用于新实验工期估算。
 
 ### 12.1 入口与资产
 
@@ -1720,17 +1719,17 @@ worker,训练在 step 0 之前退出。权重已用 `rsync` 复制到上表的�
 |---|---:|---:|---|
 | 训练并行度 | `64 env × 4 rollout epoch` | `128 env × 2 rollout epoch` | 协议等价(均为 256 条轨迹/step、32 个 group)。**`256 env × 1` 已被实测否决**:32 env/GPU 时 env worker 初始化即 `EGL_NOT_INITIALIZED`;16 env/GPU 是本机 EGL 上限 |
 | LIBERO-90 周期评估 | `32 env × 16 epoch` | `64 env × 8 epoch` | 总量同为 512 个 fixed 窗口。同理不能用 `512 env × 1`(EGL 上限);必须显式设 `env.eval.rollout_epoch=8`,否则 YAML 默认 16 会使每次评估跑 8192 条轨迹 |
-| actor micro / global batch | `16 / 1024` | `32 / 1024` | whole-model 正式 step 0 已通过。micro 64 的 +92 s 退化来自旧 LLM-only 调优，当前 run 不再重做吞吐消融 |
-| rollout micro batch | `4` | `8` | whole-model 正式 step 0 已通过。408→346 s 的提速来自旧 LLM-only 调优；当前 whole-model rollout 实测为 674.054 s |
+| actor micro / global batch | `16 / 1024` | `32 / 16384` | global batch 与当前官方协议一致；frozen-vision 首步需要重新验证。micro 64 的 +92 s 退化来自旧 LLM-only 调优 |
+| rollout micro batch | `4` | `8` | 8 是旧 LLM-only 实测最优值；frozen-vision 首步需重新记录实际吞吐 |
 | actor backend | FSDP + gradient checkpointing | 同左 | 沿用 |
-| actor / rollout offload | 均开启 | 均开启 | 沿用；whole-model 正式 backward 峰值约 57 GiB/卡，关闭 offload 尚未消融，不得在当前 run 中途改动 |
+| actor / rollout offload | 均开启 | 均开启 | 沿用；57 GiB 是旧 whole-model 数据，frozen-vision 峰值待重测 |
 | PyTorch allocator | `max_split_size_mb:128,garbage_collection_threshold:0.8` | **仅** `max_split_size_mb:128` | **必须删掉 `garbage_collection_threshold:0.8`**:本机带该项时 rollout worker 在生成中 `SIGSEGV`(GC 回收与 offload 的段释放竞争),移除后连续多步无异常。`expandable_segments` 未实测,不要默认打开 |
 | 训练步数 / 保存 / 评估 | `120 / 10 / 10` | `140 / 10 / 10` | 步数延长为 140,必须通过 `runner.max_steps=140` 设置(runner 取 `max_epochs` 换算值与 `max_steps` 的较小者,YAML 中 `max_steps: 120` 不覆盖则 120 步即停);cosine horizon 经 `total_training_steps=${runner.max_steps}` 自动跟随为 140 |
 
-八卡与四卡每个 global step 的轨迹数(256)、GRPO group 结构(32 组 × 8)
-和 global batch(1024)完全一致,只有硬件并行度不同;训练步数从 120 延长
-为 140,scheduler horizon 随之变为 140,与四卡 120 步曲线比较时按 step
-对齐前 120 步即可。
+八卡与四卡每个 global step 的轨迹数(256)和 GRPO group 结构(32 组 × 8)
+一致；当前 actor global batch 使用官方值 16384。训练步数从 120 延长为
+140，scheduler horizon 随之变为 140；旧四卡曲线只能作为历史参考，不能
+与改变模型结构后的 frozen-vision 曲线直接归因比较。
 
 ### 12.3 Docker 启动
 
@@ -1803,8 +1802,12 @@ WANDB_OVERRIDES=(
 
 ### 12.5 正式最大训练指令(140 步)
 
+> **2026-08-21 更新：** 当前 PE-RL 协议冻结视觉 backbone，以下命令和默认
+> 实验名已切换到 frozen-vision 配置。12.5d 中的 whole-model 437 层运行是
+> 历史结果，只能用于诊断，禁止从其 checkpoint resume。
+
 ```bash
-export RUN_DIR=/workspace/output/libero90_gse_whole_model_r32_svd_8gpu_seed1234
+export RUN_DIR=/workspace/output/libero90_gse_frozen_vision_r32_svd_8gpu_seed1234
 mkdir -p "$RUN_DIR"
 
 python examples/embodiment/train_embodied_agent.py \
@@ -1816,11 +1819,11 @@ python examples/embodiment/train_embodied_agent.py \
   env.eval.rollout_epoch=8 \
   rollout.micro_batch_size=8 \
   actor.micro_batch_size=32 \
-  actor.global_batch_size=1024 \
+  actor.global_batch_size=16384 \
   runner.max_steps=140 \
   +runner.max_checkpoints_to_keep=6 \
   runner.logger.log_path="$RUN_DIR" \
-  runner.logger.experiment_name=libero90_gse_whole_model_r32_svd_8gpu_seed1234 \
+  runner.logger.experiment_name=libero90_gse_frozen_vision_r32_svd_8gpu_seed1234 \
   "${WANDB_OVERRIDES[@]}" \
   2>&1 | tee "$RUN_DIR/console.log"
 ```
@@ -1841,7 +1844,7 @@ python examples/embodiment/train_embodied_agent.py \
 
 ```bash
 # 容器内,完成 12.3 的初始化后:
-export RUN_DIR=/workspace/output/libero90_gse_whole_model_r32_svd_8gpu_seed1234
+export RUN_DIR=/workspace/output/libero90_gse_frozen_vision_r32_svd_8gpu_seed1234
 mkdir -p "$RUN_DIR"
 bash scripts/run_libero90_gse_8gpu_loop.sh
 ```
@@ -1873,7 +1876,7 @@ Python 堆上)。
 `save_best_macro_mean=True`、GRPO `group_size=8`、温度 1.6 随机评估、
 GSE 1G+7S rank 32 SVD、全量 task-router 指标(`task_router_num_tasks: 90`)。
 中断续跑时保持全部参数不变,仅设
-`runner.resume_dir="$RUN_DIR/libero90_gse_whole_model_r32_svd_8gpu_seed1234/checkpoints/global_step_<N>"`。
+`runner.resume_dir="$RUN_DIR/libero90_gse_frozen_vision_r32_svd_8gpu_seed1234/checkpoints/global_step_<N>"`。
 
 ### 12.5b 评估低成功率根因:flash_attention_2 在本机行为级损坏(2026-08-13)
 
@@ -2049,6 +2052,9 @@ temperature 语义:`temperature_eval > 0` 即随机采样,greedy 必须用 `-1`
 
 ### 12.5d 官方评估协议与 whole-model GSE 正式训练(2026-08-14)
 
+本小节记录已废止的视觉 GSE 实验。其 437 层、参数量、显存、吞吐和 checkpoint
+不能代表 2026-08-21 起的 frozen-vision PE-RL，也不得作为新方法的恢复点。
+
 最终同机、同权重、同 fixed-reset 窗口对照定位出此前 20--25 pp 差距的
 核心原因，不是 CPU/GPU 仿真平台差异，而是项目评估路径同时偏离官方协议:
 
@@ -2185,3 +2191,62 @@ global batch 1024 下完成，是正式规模的修复验收，不是缩容冒�
 - 训练数值以 `RUN_DIR` 下的 `metrics.jsonl`、TensorBoard 与 W&B 为准;
   checkpoint 位于 `RUN_DIR/<experiment_name>/checkpoints/global_step_<N>/`,
   最佳权重快照位于 `checkpoints/best_macro_mean/`。
+
+### 12.7 Frozen-vision PE-RL 八卡协议(2026-08-21，当前有效)
+
+当前方法把视觉 backbone 定义为冻结状态编码器。配置必须同时满足：
+
+```yaml
+actor:
+  model:
+    gse:
+      scope: whole_model
+      target_modules: all-linear
+      freeze_vision_backbone: true
+      semantic_conditioning: true
+      routing_granularity: token
+      action_sequence_routing: true
+env:
+  train:
+    official_image_preprocess: false
+  eval:
+    official_image_preprocess: false
+```
+
+`all-linear` 在该组合下只枚举 projector 和 language model；不会向
+`vision_backbone` 注入 GSE。初始化完成后必须验证：
+
+```text
+all(not p.requires_grad for p in model.vision_backbone.parameters()) == True
+all(not name.startswith("vision_backbone")
+    for name in model.gse_injection_report.injected_module_names) == True
+```
+
+projector 与普通 LLM token 采用 token-level 路由；动作 token 位置采用共享的
+sequence-level 当前状态。所有 router 同时接收从 instruction token 提取的冻结
+文本 embedding，不使用 task ID。语义 projection 属于 GSE adapter，必须出现在
+optimizer 和 checkpoint 中。
+
+八卡启动入口仍为：
+
+```bash
+export RUN_DIR=/workspace/output/libero90_gse_frozen_vision_r32_svd_8gpu_seed1234
+mkdir -p "$RUN_DIR"
+bash scripts/run_libero90_gse_8gpu_loop.sh
+```
+
+脚本默认 `actor.global_batch_size=16384`、actor micro batch 32、rollout micro
+batch 8、gradient checkpointing 开启，并启用 W&B（环境凭据完整时）。不得将
+`INITIAL_RESUME` 或 `runner.resume_dir` 指向任何
+`libero90_gse_whole_model_*` checkpoint：视觉 GSE 已被移除且新增 semantic
+router，模型和 optimizer state 均不兼容；必须从 Base-SFT 启动新实验。
+
+当前主配置按实验要求在 train/eval 同时关闭 `official_image_preprocess`，使用
+一致的 raw-image 输入。12.5d 的 Base-SFT 85.9375% 和官方 GRPO 96.875%
+来自官方图像预处理，只能验证旧官方协议，不能作为本次 raw-image 训练的健康
+阈值。比较 Base-SFT、full GRPO 与 PE-RL 时必须全部使用相同的 raw-image
+配置；不得跨图像协议比较绝对成功率。
+
+12.5d 的 437 层、121,558,592 个 adapter 参数、57 GiB backward 峰值和
+1107.184 s/step 都是旧 whole-model 实测值。冻结视觉后的注入层数、可训练参数、
+显存和吞吐尚未完成真实 7B 八卡测量，首个正式 step 必须重新记录，不能沿用旧值。
