@@ -168,6 +168,17 @@ if [ ! -f "${CONFIG_PATH}/${CONFIG_NAME}.yaml" ]; then
     echo "Config not found under evaluations/${BENCHMARK}, fallback to ${CONFIG_PATH}"
 fi
 
+if [[ "${CONFIG_NAME}" == libero_90_plus_ood* ]]; then
+    export LIBERO_TYPE="plus"
+    if [ -z "${LIBERO_CONFIG_PATH:-}" ] && ! python -c "import liberoplus.liberoplus" >/dev/null 2>&1; then
+        export LIBERO_CONFIG_PATH="$(python -c "import pathlib; import libero.libero as l; print(pathlib.Path(l.__file__).resolve().parent.parent)")"
+    fi
+    if [ -z "${RLINF_LIBERO90_PLUS_OOD_MANIFEST:-}" ]; then
+        echo "RLINF_LIBERO90_PLUS_OOD_MANIFEST must point to a generated manifest" >&2
+        exit 1
+    fi
+fi
+
 if [ "${BENCHMARK}" != "realworld" ]; then
     setup_sim_env
 fi

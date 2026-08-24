@@ -72,14 +72,29 @@ if libero_type in ["pro", "plus"]:
         sys.modules["libero.libero.benchmark"] = real_libero_benchmark
         sys.modules["libero.libero.envs"] = real_libero_envs
     except ImportError as e:
-        print(
-            f"[Main Process Routing Error] Failed to import '{LIBERO_MAIN_MODULE_PATH}'. Error: {e}"
-        )
+        if libero_type == "plus":
+            # Upstream LIBERO-Plus keeps the package name ``libero`` while
+            # the RLinf fork installs ``liberoplus``. Support both layouts.
+            real_libero_pkg = importlib.import_module("libero")
+            real_libero_core = importlib.import_module("libero.libero")
+            real_libero_benchmark = importlib.import_module("libero.libero.benchmark")
+            real_libero_envs = importlib.import_module("libero.libero.envs")
+            sys.modules["libero"] = real_libero_pkg
+            sys.modules["libero.libero"] = real_libero_core
+            sys.modules["libero.libero.benchmark"] = real_libero_benchmark
+            sys.modules["libero.libero.envs"] = real_libero_envs
+        else:
+            print(
+                f"[Main Process Routing Error] Failed to import '{LIBERO_MAIN_MODULE_PATH}'. Error: {e}"
+            )
 
 if libero_type == "pro":
     from liberopro.liberopro.benchmark import Benchmark
 elif libero_type == "plus":
-    from liberoplus.liberoplus.benchmark import Benchmark
+    try:
+        from liberoplus.liberoplus.benchmark import Benchmark
+    except ImportError:
+        from libero.libero.benchmark import Benchmark
 else:
     from libero.libero.benchmark import Benchmark
 
@@ -107,6 +122,16 @@ class LiberoEnv(gym.Env):
         self.ignore_terminations = cfg.ignore_terminations
         self.auto_reset = cfg.auto_reset
         self.is_eval = cfg.get("is_eval", False)
+
+        if str(cfg.task_suite_name).lower() == "libero_90_plus_ood":
+            manifest_path = cfg.get("custom_plus_manifest", None)
+            if not manifest_path:
+                raise ValueError(
+                    "env.custom_plus_manifest is required for libero_90_plus_ood"
+                )
+            os.environ["RLINF_LIBERO90_PLUS_OOD_MANIFEST"] = os.path.expandvars(
+                str(manifest_path)
+            )
 
         self._generator = np.random.default_rng(seed=self.seed)
         self._generator_ordered = np.random.default_rng(seed=0)
@@ -167,6 +192,11 @@ class LiberoEnv(gym.Env):
         env_fns = []
 
         current_type_val = get_libero_type()
+        if (
+            self.cfg.task_suite_name.lower() == "libero_90_plus_ood"
+            and current_type_val == "standard"
+        ):
+            current_type_val = self.cfg.get("libero_variant", "plus")
 
         for env_fn_param in env_fn_params:
 
@@ -205,8 +235,31 @@ class LiberoEnv(gym.Env):
                         WorkerEnv = real_envs.OffScreenRenderEnv
 
                     except ImportError as e:
-                        print(f"[Worker Env Error] {e}")
-                        raise e
+                        if _type_val == "plus":
+                            real_pkg = importlib.import_module("libero")
+                            real_core = importlib.import_module("libero.libero")
+                            real_bench = importlib.import_module(
+                                "libero.libero.benchmark"
+                            )
+                            real_envs = importlib.import_module("libero.libero.envs")
+                            sys.modules["libero"] = real_pkg
+                            sys.modules["libero.libero"] = real_core
+                            sys.modules["libero.libero.benchmark"] = real_bench
+                            sys.modules["libero.libero.envs"] = real_envs
+                            loaded_path = os.path.dirname(real_core.__file__)
+                            os.environ["LIBERO_ASSET_ROOT"] = os.path.join(
+                                loaded_path, "assets"
+                            )
+                            os.environ["LIBERO_BDDL_PATH"] = os.path.join(
+                                loaded_path, "bddl_files"
+                            )
+                            os.environ["LIBERO_INIT_STATES_PATH"] = os.path.join(
+                                loaded_path, "init_files"
+                            )
+                            WorkerEnv = real_envs.OffScreenRenderEnv
+                        else:
+                            print(f"[Worker Env Error] {e}")
+                            raise e
                 else:
                     from libero.libero.envs import OffScreenRenderEnv as WorkerEnv
 
@@ -236,20 +289,27 @@ class LiberoEnv(gym.Env):
                 else None,
             ),
         )
-        if variant == "pro":
+        suite_name = self.cfg.task_suite_name.lower()
+        if suite_name == "libero_90_plus_ood":
+            bddl_root = None
+        elif variant == "pro":
             import liberopro.liberopro as l_pro
 
             bddl_root = l_pro.get_libero_path("bddl_files")
         elif variant == "plus":
-            import liberoplus.liberoplus as l_plus
+            try:
+                import liberoplus.liberoplus as l_plus
 
-            bddl_root = l_plus.get_libero_path("bddl_files")
+                bddl_root = l_plus.get_libero_path("bddl_files")
+            except ImportError:
+                from libero.libero import get_libero_path
+
+                bddl_root = get_libero_path("bddl_files")
         else:
             from libero.libero import get_libero_path
 
             bddl_root = get_libero_path("bddl_files")
 
-        suite_name = self.cfg.task_suite_name.lower()
         suite_keyword = suite_name.replace("libero_", "").strip()
 
         task_descriptions = []
@@ -272,6 +332,18 @@ class LiberoEnv(gym.Env):
             task = self.task_suite.get_task(self.task_ids[env_id])
             folder_name = task.problem_folder
             file_name = task.bddl_file
+
+            if suite_name == "libero_90_plus_ood":
+                env_fn_params.append(
+                    {
+                        **base_env_args,
+                        "bddl_file_name": file_name,
+                        "seed": simulator_seeds[env_id],
+                    }
+                )
+                task_descriptions.append(task.language)
+                continue
+
             original_path = os.path.join(bddl_root, folder_name, file_name)
 
             final_path = original_path
@@ -698,7 +770,7 @@ class LiberoEnv(gym.Env):
             if hasattr(self.cfg, "get")
             else "standard",
         )
-        if variant != "plus":
+        if variant != "plus" or self.task_suite.name == "libero_90_plus_ood":
             init_state = self._get_reset_states(env_idx=env_idx)
             self.env.set_init_state(init_state=init_state, id=env_idx)
 

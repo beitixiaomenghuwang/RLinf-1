@@ -52,9 +52,6 @@ elif libero_type == "plus":
         import liberoplus.liberoplus.benchmark as benchmark
         from liberoplus.liberoplus.benchmark import Benchmark
     except ImportError:
-        print(
-            "[Utils] Warning: LIBERO_TYPE=plus but 'liberoplus' not found. Falling back to 'libero'."
-        )
         import libero.libero.benchmark as benchmark
         from libero.libero.benchmark import Benchmark
 
@@ -97,9 +94,7 @@ def preprocess_openvla_oft_image(img: np.ndarray) -> np.ndarray:
 
     image = tf.image.encode_jpeg(img)
     image = tf.io.decode_image(image, expand_animations=False, dtype=tf.uint8)
-    image = tf.image.resize(
-        image, (224, 224), method="lanczos3", antialias=True
-    )
+    image = tf.image.resize(image, (224, 224), method="lanczos3", antialias=True)
     image = tf.cast(tf.clip_by_value(tf.round(image), 0, 255), tf.uint8)
 
     crop_fraction = tf.reshape(
@@ -117,9 +112,9 @@ def preprocess_openvla_oft_image(img: np.ndarray) -> np.ndarray:
         axis=1,
     )
     image = tf.image.convert_image_dtype(image, tf.float32)
-    image = tf.image.crop_and_resize(
-        image[None], boxes, tf.constant([0]), (224, 224)
-    )[0]
+    image = tf.image.crop_and_resize(image[None], boxes, tf.constant([0]), (224, 224))[
+        0
+    ]
     image = tf.clip_by_value(image, 0, 1)
     image = tf.image.convert_image_dtype(image, tf.uint8, saturate=True)
     return image.numpy()
@@ -183,6 +178,10 @@ def get_benchmark_overridden(benchmark_name) -> Benchmark:
         Benchmark class
     """
     name = str(benchmark_name).lower()
+    if name == "libero_90_plus_ood":
+        from rlinf.envs.libero.custom_plus import get_custom_benchmark
+
+        return get_custom_benchmark()
     if name != "libero_130":
         return benchmark.get_benchmark(benchmark_name)
 

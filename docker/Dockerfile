@@ -33,6 +33,7 @@ ENV ASCEND_VISIBLE_DEVICES=all
 ##################################################################################################
 FROM base-image-platform-${PLATFORM} AS base-image-reason
 FROM base-image-platform-${PLATFORM} AS base-image-embodied-maniskill_libero
+FROM base-image-platform-${PLATFORM} AS base-image-embodied-maniskill_libero-plus
 FROM base-image-platform-${PLATFORM} AS base-image-embodied-behavior-openvlaoft
 FROM base-image-platform-${PLATFORM} AS base-image-embodied-behavior-openpi
 FROM base-image-platform-${PLATFORM} AS base-image-embodied-metaworld
@@ -224,6 +225,22 @@ RUN link_assets
 
 # Set default env
 RUN echo "source ${UV_PATH}/openvla/bin/activate" >> ~/.bashrc
+
+##################################################################################################
+# Embodied: ManiSkill / LIBERO / LIBERO-Plus
+##################################################################################################
+FROM embodied-maniskill_libero-image AS embodied-maniskill_libero-plus-image
+
+ENV LIBERO_PLUS_PATH=/opt/envs/LIBERO-plus
+ENV RLINF_LIBERO90_PLUS_OOD_MANIFEST=/opt/assets/libero90_plus_ood/manifest.json
+
+COPY ./toolkits/libero/generate_libero90_plus_ood.py /opt/tools/generate_libero90_plus_ood.py
+
+RUN bash requirements/install.sh ${INSTALL_MIRROR_OPTION} --platform ${RLINF_PLATFORM} embodied --venv openvla-oft-plus --model openvla-oft --env liberoplus && \
+    source switch_env openvla-oft-plus && \
+    python /opt/tools/generate_libero90_plus_ood.py \
+        --libero-root /opt/envs/LIBERO-plus/libero/libero \
+        --output-root /opt/assets/libero90_plus_ood
 
 FROM embodied-common-image AS embodied-behavior-openvlaoft-image
 

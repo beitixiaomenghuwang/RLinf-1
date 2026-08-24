@@ -1240,9 +1240,9 @@ install_openvla_oft_model() {
         liberoplus)
             create_and_sync_venv
             install_common_embodied_deps
-            install_liberoplus_env
             install_flash_attn
             uv pip install git+${GITHUB_PREFIX}https://github.com/moojink/openvla-oft.git  --no-build-isolation
+            install_liberoplus_env
             ;;
         *)
             echo "Environment '$ENV_NAME' is not supported for OpenVLA-OFT model." >&2
@@ -1807,10 +1807,85 @@ install_liberoplus_env() {
     uv pip install -e "$libero_dir"
 
     local libero_plus_dir
-    libero_plus_dir=$(clone_or_reuse_repo LIBERO_PLUS_PATH "$VENV_DIR/libero_plus" https://github.com/RLinf/LIBERO-plus.git)
+    libero_plus_dir=$(clone_or_reuse_repo LIBERO_PLUS_PATH "$VENV_DIR/libero_plus" https://github.com/sylvestf/LIBERO-plus.git -b main)
+    git -C "$libero_plus_dir" checkout 4976dc30028e805ff8094b55501d532c48fec182
     uv pip install -r $libero_plus_dir/extra_requirements.txt
     uv pip install -e "$libero_plus_dir"
     uv pip install "mujoco<=3.9.0"
+
+    local libero_plus_assets_dir="$libero_plus_dir/libero/libero/assets"
+    local libero_plus_assets_sentinel="$libero_plus_assets_dir/scenes/libero_kitchen_tabletop_base_style.xml"
+    local libero_plus_assets_payload_rel="inspire/hdd/project/embodied-multimodality/public/syfei/libero_new/release/dataset/LIBERO-plus-0/assets"
+    if [ ! -f "$libero_plus_assets_sentinel" ]; then
+        local assets_tmp_dir
+        local assets_archive
+        local assets_url
+        local assets_sha256
+        assets_tmp_dir=$(mktemp -d)
+        assets_archive="${LIBERO_PLUS_ASSETS_ARCHIVE:-$assets_tmp_dir/assets.zip}"
+        assets_url="${LIBERO_PLUS_ASSETS_URL:-${HF_ENDPOINT:-https://huggingface.co}/datasets/Sylvest/LIBERO-plus/resolve/main/assets.zip?download=true}"
+        assets_sha256="${LIBERO_PLUS_ASSETS_SHA256:-96764a4bfbdaea98d4411598caeab235458318fe0f549611b93d1a323027b3cf}"
+
+        if [ -z "${LIBERO_PLUS_ASSETS_ARCHIVE:-}" ]; then
+            echo "Downloading LIBERO-Plus assets from $assets_url"
+            curl -fL --connect-timeout 120 --retry 5 --retry-delay 5 \
+                -o "$assets_archive" "$assets_url"
+        elif [ ! -f "$assets_archive" ]; then
+            echo "LIBERO_PLUS_ASSETS_ARCHIVE does not exist: $assets_archive" >&2
+            rm -rf "$assets_tmp_dir"
+            return 1
+        fi
+
+        echo "$assets_sha256  $assets_archive" | sha256sum --check -
+        if [ -L "$libero_plus_assets_dir" ] || [ -f "$libero_plus_assets_dir" ]; then
+            rm -f "$libero_plus_assets_dir"
+        fi
+        mkdir -p "$libero_plus_assets_dir"
+        find "$libero_plus_assets_dir" -maxdepth 1 -type l -delete
+        unzip -q -o "$assets_archive" -d "$libero_plus_assets_dir"
+        local asset_path
+        for asset_path in "$libero_plus_assets_dir/$libero_plus_assets_payload_rel"/*; do
+            ln -sfn \
+                "$libero_plus_assets_payload_rel/$(basename "$asset_path")" \
+                "$libero_plus_assets_dir/$(basename "$asset_path")"
+        done
+        rm -rf "$assets_tmp_dir"
+
+        if [ ! -f "$libero_plus_assets_sentinel" ]; then
+            echo "LIBERO-Plus assets are incomplete after extraction" >&2
+            return 1
+        fi
+    fi
+
+    local libero_plus_python_root
+    local libero_plus_core
+    local libero_plus_config_dir="$VENV_DIR/libero_config"
+    libero_plus_python_root=$(realpath "$libero_plus_dir")
+    libero_plus_core=$(realpath "$libero_plus_dir/libero/libero")
+    mkdir -p "$libero_plus_config_dir"
+    LIBERO_PLUS_CORE="$libero_plus_core" LIBERO_PLUS_CONFIG="$libero_plus_config_dir/config.yaml" python - <<'EOF'
+import os
+from pathlib import Path
+
+import yaml
+
+core = Path(os.environ["LIBERO_PLUS_CORE"])
+config = {
+    "benchmark_root": str(core),
+    "bddl_files": str(core / "bddl_files"),
+    "init_states": str(core / "init_files"),
+    "datasets": str(core.parent / "datasets"),
+    "assets": str(core / "assets"),
+}
+Path(os.environ["LIBERO_PLUS_CONFIG"]).write_text(yaml.safe_dump(config))
+EOF
+    sed -i \
+        -e '\|^export PYTHONPATH=.*/LIBERO-plus.*$|d' \
+        -e '\|^export LIBERO_CONFIG_PATH=.*/LIBERO-plus.*$|d' \
+        -e '\|^export LIBERO_CONFIG_PATH=.*/libero_config$|d' \
+        "$VENV_DIR/bin/activate"
+    echo "export PYTHONPATH=$libero_plus_python_root:\$PYTHONPATH" >> "$VENV_DIR/bin/activate"
+    echo "export LIBERO_CONFIG_PATH=$libero_plus_config_dir" >> "$VENV_DIR/bin/activate"
 }
 
 install_behavior_env() {
