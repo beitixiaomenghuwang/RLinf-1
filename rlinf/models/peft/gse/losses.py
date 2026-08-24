@@ -684,17 +684,23 @@ def gse_auxiliary_loss(
     load_balancing_coefficient: float = 0.0,
     orthogonality_coefficient: float = 0.0,
     log_orthogonality: bool = True,
+    orthogonality_metric: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    """Build configurable GSE regularization and its training metrics."""
+    """Build GSE regularization and detached diagnostics.
+
+    ``orthogonality_metric`` is supplied by the caller only when it has a safe
+    full-parameter view (for example, after an FSDP training batch). The
+    micro-batch loss path must not read sharded adapter parameters merely to
+    record a metric.
+    """
     if load_balancing_coefficient < 0 or orthogonality_coefficient < 0:
         raise ValueError("GSE auxiliary-loss coefficients must be non-negative")
 
     load_balancing = gse_load_balancing_loss(model)
     if orthogonality_coefficient > 0:
         orthogonality = gse_orthogonality_loss(model)
-    elif log_orthogonality:
-        with torch.no_grad():
-            orthogonality = gse_orthogonality_loss(model)
+    elif log_orthogonality and orthogonality_metric is not None:
+        orthogonality = orthogonality_metric.detach()
     else:
         orthogonality = load_balancing.new_zeros(())
 

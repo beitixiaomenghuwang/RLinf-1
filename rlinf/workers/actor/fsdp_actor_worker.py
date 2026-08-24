@@ -38,6 +38,7 @@ from rlinf.config import SupportedModel, torch_dtype_from_precision
 from rlinf.data.embodied_io_struct import Trajectory, convert_trajectories_to_batch
 from rlinf.data.io_struct import BatchResizingIterator, RolloutResult
 from rlinf.data.lerobot_paths import resolve_lerobot_repo_id
+from rlinf.hybrid_engines.fsdp import FSDP
 from rlinf.hybrid_engines.fsdp.fsdp_model_manager import FSDPModelManager
 from rlinf.hybrid_engines.fsdp.utils import (
     pack_fsdp_input,
@@ -52,6 +53,7 @@ from rlinf.models.peft.gse import (
     gse_auxiliary_loss,
     gse_layerwise_task_router_metrics,
     gse_layerwise_task_router_statistics,
+    gse_orthogonality_loss,
     gse_task_router_metrics_from_tensor,
     reset_gse_auxiliary_state,
 )
@@ -1415,6 +1417,28 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             )
         return loss
 
+    @torch.no_grad()
+    def _compute_gse_orthogonality_metric(self) -> float | None:
+        """Read orthogonality once from a safe FSDP full-parameter view."""
+        if not self.gse_enabled:
+            return None
+        if not bool(self.gse_cfg.get("log_orthogonality", False)):
+            return None
+        if float(self.gse_cfg.get("orthogonality_loss_coef", 0.0)) > 0:
+            return None
+        strategy = str(self.cfg.actor.fsdp_config.get("strategy", "fsdp"))
+        if strategy != "fsdp":
+            self.log_warning(
+                "Skipping GSE orthogonality metric for unsupported FSDP strategy: "
+                f"{strategy}"
+            )
+            return None
+        with FSDP.summon_full_params(
+            self.model, recurse=True, writeback=False
+        ):
+            metric = gse_orthogonality_loss(self.model)
+        return float(metric.detach().cpu())
+
     @Worker.timer("run_training")
     def run_training(self) -> None:
         """
@@ -1503,6 +1527,15 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         # put LR scheduler step here
         self.lr_scheduler.step()
         self.optimizer.zero_grad()
+        orthogonality_metric = self._compute_gse_orthogonality_metric()
+        if orthogonality_metric is not None:
+            append_to_dict(
+                metrics,
+                {
+                    "gse/orthogonality_loss": orthogonality_metric,
+                    "gse/weighted_orthogonality_loss": 0.0,
+                },
+            )
         clear_memory()
         mean_metric_dict = {key: np.mean(value) for key, value in metrics.items()}
         mean_metric_dict = all_reduce_dict(
@@ -1645,18 +1678,27 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             loss = self._train_sft_epoch(metrics_data, loss)
 
         if self.gse_enabled:
+            orthogonality_coefficient = float(
+                self.gse_cfg.get("orthogonality_loss_coef", 0.0)
+            )
+            log_orthogonality = bool(
+                self.gse_cfg.get("log_orthogonality", False)
+            )
             auxiliary_loss, gse_metrics = gse_auxiliary_loss(
                 self.model,
                 load_balancing_coefficient=float(
                     self.gse_cfg.get("load_balancing_loss_coef", 0.0)
                 ),
-                orthogonality_coefficient=float(
-                    self.gse_cfg.get("orthogonality_loss_coef", 0.0)
-                ),
-                log_orthogonality=bool(self.gse_cfg.get("log_orthogonality", True)),
+                orthogonality_coefficient=orthogonality_coefficient,
+                log_orthogonality=log_orthogonality,
             )
             loss += auxiliary_loss
             if bool(self.gse_cfg.get("log_router_metrics", True)):
+                if log_orthogonality and orthogonality_coefficient == 0:
+                    # Record the metric after run_training has a safe full-param
+                    # view instead of reading sharded parameters here.
+                    gse_metrics.pop("gse/orthogonality_loss", None)
+                    gse_metrics.pop("gse/weighted_orthogonality_loss", None)
                 metrics_data.update(scalar_metrics_to_python(gse_metrics))
             if (
                 (
