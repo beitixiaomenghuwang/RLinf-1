@@ -68,7 +68,6 @@ env:
     total_num_envs: 64
     max_episode_steps: 512
     max_steps_per_rollout_epoch: 512
-    official_image_preprocess: True
     reward_coef: ${algorithm.reward_coef}
     group_size: ${algorithm.group_size}
     reset_gripper_open: False
@@ -80,7 +79,6 @@ env:
     max_episode_steps: 512
     max_steps_per_rollout_epoch: 512
     group_size: 1
-    official_image_preprocess: True
     use_fixed_reset_state_ids: True
     use_ordered_reset_state_ids: True
     reset_gripper_open: False
