@@ -24,7 +24,7 @@ runner:
   logger:
     log_path: "../results"
     project_name: rlinf
-    experiment_name: "libero90_gse_frozen_vision_r32_svd_8gpu_seed1234"
+    experiment_name: "libero90_ortho_hydra_independent_r32_8gpu_seed1234"
     logger_backends: ["tensorboard"]
 
   max_epochs: 1000
@@ -140,47 +140,38 @@ actor:
     max_prompt_length: 128
     is_lora: False
     gse:
+      enabled: False
+    ortho_hydra:
       enabled: True
-      # PE-RL protocol: freeze the complete vision backbone and inject GSE only
-      # into the multimodal projector and language model.
+      # PE-RL protocol: freeze the complete vision backbone and adapt only the
+      # multimodal projector and language model.
       scope: whole_model
       target_modules: all-linear
       freeze_vision_backbone: True
+      # Total rank 32: eight independent rank-4 input/output experts.
       total_rank: 32
       lora_alpha: 32.0
       num_experts: 8
-      num_generalized_experts: 1
-      # Standard GSE routing uses hidden states without text conditioning.
-      semantic_conditioning: False
+      parameterization: "independent"
+      # Dense softmax uses all experts and fuses RMS-pooled rank-32 hidden
+      # states with the frozen text embedding.
       semantic_router_scale: 1.0
-      routing_granularity: "token"
-      action_sequence_routing: True
-      # The selected experts are evaluated together by the fused GSE path.
-      top_k: 2
-      initialization: "svd"
       init_seed: 42
       freeze_base: True
-      # Match the MetaWorld GSE diagnostic surface: aggregate and layerwise
-      # task/router statistics are emitted under train/gse/*.
+      train_value_head: False
+      load_balancing_loss_coef: 0.0
       log_router_metrics: True
       log_task_router_metrics: True
       log_layerwise_task_router_metrics: True
       task_router_num_tasks: 90
       task_router_informative_nmi_threshold: 0.01
-      train_value_head: False
-      # Both regularizers are diagnostics only in the formal run.
-      load_balancing_loss_coef: 0.0
-      orthogonality_loss_coef: 0.0
-      # With FSDP full_shard/use_orig_params=False, original parameter views
-      # cannot be inspected safely outside forward. Measure A-factor
-      # orthogonality offline from saved checkpoints instead.
       log_orthogonality: True
 
   optim:
-    # Whole-model GSE freezes the dense base, so every trainable policy
-    # parameter belongs to the GSE optimizer group below.
+    # Whole-model Ortho-Hydra freezes the dense base, so every trainable
+    # policy parameter belongs to the adapter optimizer group below.
     lr: 2.0e-5
-    gse_lr: 5e-5
+    ortho_hydra_lr: 5e-5
     total_training_steps: ${runner.max_steps}
     lr_warmup_steps: 0
     lr_scheduler: "cosine"

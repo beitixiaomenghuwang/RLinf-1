@@ -16,6 +16,7 @@ import math
 import random
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -31,6 +32,7 @@ from torch.utils._pytree import tree_map
 from rlinf.models.embodiment.base_policy import BasePolicy, ForwardType
 from rlinf.models.embodiment.modules.explore_noise_net import ExploreNoiseNet
 from rlinf.models.embodiment.modules.value_head import ValueHead
+from rlinf.models.peft.ortho_hydra import ortho_hydra_routing_context
 from rlinf.utils.logging import get_logger
 from rlinf.utils.nested_dict_process import copy_dict_tensor
 from rlinf.utils.pytree import register_pytree_dataclasses
@@ -1189,14 +1191,21 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             "eager"  # noqa: SLF001
         )
 
-        outputs_embeds, _ = self.paligemma_with_expert.forward(
-            attention_mask=full_att_2d_masks_4d,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=[None, suffix_embs],
-            use_cache=False,
-            adarms_cond=[None, adarms_cond],
+        semantic_embeddings = getattr(self, "_ortho_hydra_semantic_embeddings", None)
+        routing_context = (
+            ortho_hydra_routing_context(semantic_embeddings)
+            if semantic_embeddings is not None
+            else nullcontext()
         )
+        with routing_context:
+            outputs_embeds, _ = self.paligemma_with_expert.forward(
+                attention_mask=full_att_2d_masks_4d,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=[None, suffix_embs],
+                use_cache=False,
+                adarms_cond=[None, adarms_cond],
+            )
 
         suffix_out = outputs_embeds[1]
         suffix_out = suffix_out[:, -self.config.action_horizon :]
@@ -1228,6 +1237,26 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             use_cache=True,
         )
         return prefix_output, prefix_pad_masks, past_key_values
+
+    def embed_prefix(self, images, img_masks, lang_tokens, lang_masks):
+        """Embed the prefix and cache frozen text semantics when requested."""
+        self._cache_ortho_hydra_semantics(lang_tokens, lang_masks)
+        return super().embed_prefix(images, img_masks, lang_tokens, lang_masks)
+
+    @torch.no_grad()
+    def _cache_ortho_hydra_semantics(self, lang_tokens, lang_masks) -> None:
+        """Cache one frozen text embedding per sequence for all denoising steps."""
+        if not bool(getattr(self, "ortho_hydra_semantic_conditioning", False)):
+            return
+        if lang_tokens is None or lang_masks is None:
+            raise ValueError("OpenPI Ortho-Hydra requires tokenized prompts")
+        embedding_layer = self.paligemma_with_expert.paligemma.get_input_embeddings()
+        embeddings = embedding_layer(lang_tokens)
+        mask = lang_masks.to(device=embeddings.device, dtype=embeddings.dtype)
+        self._ortho_hydra_semantic_embeddings = (
+            (embeddings * mask.unsqueeze(-1)).sum(dim=1)
+            / mask.sum(dim=1, keepdim=True).clamp_min(1)
+        ).detach()
 
     def _compute_value_from_suffix(self, suffix_out):
         """Compute value from suffix output using value head."""

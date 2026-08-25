@@ -287,16 +287,17 @@ def get_fsdp_wrap_policy(module, config=None, is_lora=False, model_type=None):
             )
         policies.append(q_head_policy)
 
-    gse_adapter_classes = {
+    peft_adapter_classes = {
         submodule.__class__
         for submodule in module.modules()
         if getattr(submodule, "_is_gse_adapter", False)
+        or getattr(submodule, "_is_peft_adapter", False)
     }
-    if gse_adapter_classes:
-        gse_adapter_policy = functools.partial(
-            _module_wrap_policy, module_classes=gse_adapter_classes
+    if peft_adapter_classes:
+        peft_adapter_policy = functools.partial(
+            _module_wrap_policy, module_classes=peft_adapter_classes
         )
-        policies.append(gse_adapter_policy)
+        policies.append(peft_adapter_policy)
 
     if module_classes_to_wrap:
         module_classes_to_wrap = _resolve_module_classes_to_wrap(

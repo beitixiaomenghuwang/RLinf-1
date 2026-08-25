@@ -36,6 +36,10 @@ from rlinf.models.peft.gse import (
     gse_routing_context,
     update_gse_routing_context,
 )
+from rlinf.models.peft.ortho_hydra import (
+    ortho_hydra_checkpoint_contexts,
+    ortho_hydra_routing_context,
+)
 from rlinf.utils.utils import (
     compute_entropy_from_logits,
     compute_logprobs_from_logits,
@@ -82,6 +86,22 @@ class OpenVLAOFTForRLActionPrediction(OpenVLAOFTForActionPrediction, BasePolicy)
         self.max_prompt_length = max_prompt_length
         self._instruction_prefix_tokens: int | None = None
         self._instruction_suffix_tokens: int | None = None
+
+    def gradient_checkpointing_enable(
+        self, gradient_checkpointing_kwargs: Optional[dict[str, Any]] = None
+    ) -> None:
+        """Preserve Ortho-Hydra routing state during checkpoint recomputation."""
+        if (
+            gradient_checkpointing_kwargs is not None
+            and gradient_checkpointing_kwargs.get("use_reentrant") is False
+        ):
+            gradient_checkpointing_kwargs = dict(gradient_checkpointing_kwargs)
+            gradient_checkpointing_kwargs.setdefault(
+                "context_fn", ortho_hydra_checkpoint_contexts
+            )
+        super().gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs=gradient_checkpointing_kwargs
+        )
 
     def _instruction_mask(self, attention_mask: torch.Tensor) -> torch.Tensor:
         """Exclude padding and the fixed OpenVLA instruction template."""
@@ -375,7 +395,10 @@ class OpenVLAOFTForRLActionPrediction(OpenVLAOFTForActionPrediction, BasePolicy)
         )  # [B, L + act + 1]
 
         # multimodal
-        with gse_routing_context(semantic_embedding):
+        with (
+            gse_routing_context(semantic_embedding),
+            ortho_hydra_routing_context(semantic_embedding),
+        ):
             mm_embeddings, mm_attention_mask = self._build_embedding(
                 input_ids, attention_mask, pixel_values
             )
@@ -584,7 +607,10 @@ class OpenVLAOFTForRLActionPrediction(OpenVLAOFTForActionPrediction, BasePolicy)
         )  # [B, L + act + 1]
 
         # multimodal
-        with gse_routing_context(semantic_embedding):
+        with (
+            gse_routing_context(semantic_embedding),
+            ortho_hydra_routing_context(semantic_embedding),
+        ):
             mm_embeddings, mm_attention_mask = self._build_embedding(
                 input_ids, attention_mask, pixel_values
             )

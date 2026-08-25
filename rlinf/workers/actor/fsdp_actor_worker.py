@@ -57,6 +57,14 @@ from rlinf.models.peft.gse import (
     gse_task_router_metrics_from_tensor,
     reset_gse_auxiliary_state,
 )
+from rlinf.models.peft.ortho_hydra import (
+    ortho_hydra_auxiliary_loss,
+    ortho_hydra_layerwise_task_router_metrics,
+    ortho_hydra_layerwise_task_router_statistics,
+    ortho_hydra_orthogonality_error,
+    ortho_hydra_task_router_metrics_from_tensor,
+    reset_ortho_hydra_auxiliary_state,
+)
 from rlinf.scheduler import Channel, Cluster, Worker
 from rlinf.utils.data_iter_utils import (
     get_iterator_k_split,
@@ -869,9 +877,11 @@ class FSDPActor(FSDPModelManager, Worker):
 
         mean_metric_dict["actor/grad_norm"] = float(grad_norm)
         mean_metric_dict["actor/lr"] = lr_list[0]
-        if len(lr_list) > 1 and self.gse_enabled and self.cfg.actor.optim.get(
-            "gse_lr", None
-        ) is not None:
+        if (
+            len(lr_list) > 1
+            and self.gse_enabled
+            and self.cfg.actor.optim.get("gse_lr", None) is not None
+        ):
             mean_metric_dict["actor/gse_lr"] = lr_list[1]
         return mean_metric_dict
 
@@ -1053,6 +1063,15 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         self.gse_enabled = bool(
             self.gse_cfg is not None and self.gse_cfg.get("enabled", False)
         )
+        self.ortho_hydra_cfg = OmegaConf.select(
+            cfg, "actor.model.ortho_hydra", default=None
+        )
+        self.ortho_hydra_enabled = bool(
+            self.ortho_hydra_cfg is not None
+            and self.ortho_hydra_cfg.get("enabled", False)
+        )
+        if self.gse_enabled and self.ortho_hydra_enabled:
+            raise ValueError("GSE and Ortho-Hydra cannot both be enabled")
         self.advantage_normalization = resolve_advantage_normalization_config(
             cfg.algorithm
         )
@@ -1175,6 +1194,8 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         Args:
             input_channel: The input channel to read from.
         """
+        if hasattr(self, "rollout_batch"):
+            del self.rollout_batch
         clear_memory(sync=False)
 
         send_num = self._component_placement.get_world_size("env") * self.stage_num
@@ -1420,11 +1441,15 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
     @torch.no_grad()
     def _compute_gse_orthogonality_metric(self) -> float | None:
         """Read orthogonality once from a safe FSDP full-parameter view."""
-        if not self.gse_enabled:
+        if not (self.gse_enabled or self.ortho_hydra_enabled):
             return None
-        if not bool(self.gse_cfg.get("log_orthogonality", False)):
+        adapter_cfg = self.gse_cfg if self.gse_enabled else self.ortho_hydra_cfg
+        if not bool(adapter_cfg.get("log_orthogonality", False)):
             return None
-        if float(self.gse_cfg.get("orthogonality_loss_coef", 0.0)) > 0:
+        if (
+            self.gse_enabled
+            and float(self.gse_cfg.get("orthogonality_loss_coef", 0.0)) > 0
+        ):
             return None
         strategy = str(self.cfg.actor.fsdp_config.get("strategy", "fsdp"))
         if strategy != "fsdp":
@@ -1433,10 +1458,12 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 f"{strategy}"
             )
             return None
-        with FSDP.summon_full_params(
-            self.model, recurse=True, writeback=False
-        ):
-            metric = gse_orthogonality_loss(self.model)
+        with FSDP.summon_full_params(self.model, recurse=True, writeback=False):
+            metric = (
+                gse_orthogonality_loss(self.model)
+                if self.gse_enabled
+                else ortho_hydra_orthogonality_error(self.model)
+            )
         return float(metric.detach().cpu())
 
     @Worker.timer("run_training")
@@ -1515,10 +1542,16 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     "actor/lr": lr_list[0],
                 }
                 if len(lr_list) > 1:
-                    if self.gse_enabled and self.cfg.actor.optim.get(
-                        "gse_lr", None
-                    ) is not None:
+                    if (
+                        self.gse_enabled
+                        and self.cfg.actor.optim.get("gse_lr") is not None
+                    ):
                         data["actor/gse_lr"] = lr_list[1]
+                    elif (
+                        self.ortho_hydra_enabled
+                        and self.cfg.actor.optim.get("ortho_hydra_lr") is not None
+                    ):
+                        data["actor/ortho_hydra_lr"] = lr_list[1]
                     else:
                         data["critic/lr"] = lr_list[1]
                 if len(lr_list) > 2:
@@ -1532,8 +1565,11 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             append_to_dict(
                 metrics,
                 {
-                    "gse/orthogonality_loss": orthogonality_metric,
-                    "gse/weighted_orthogonality_loss": 0.0,
+                    (
+                        "gse/orthogonality_loss"
+                        if self.gse_enabled
+                        else "ortho_hydra/orthogonality_error"
+                    ): orthogonality_metric,
                 },
             )
         clear_memory()
@@ -1555,13 +1591,22 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         torch.distributed.all_reduce(
             reduced_statistics, op=torch.distributed.ReduceOp.SUM
         )
-        metrics = gse_task_router_metrics_from_tensor(reduced_statistics)
-        if bool(self.gse_cfg.get("log_layerwise_task_router_metrics", False)):
+        adapter_cfg = self.gse_cfg if self.gse_enabled else self.ortho_hydra_cfg
+        metrics = (
+            gse_task_router_metrics_from_tensor(reduced_statistics)
+            if self.gse_enabled
+            else ortho_hydra_task_router_metrics_from_tensor(reduced_statistics)
+        )
+        if bool(adapter_cfg.get("log_layerwise_task_router_metrics", False)):
             metrics.update(
-                gse_layerwise_task_router_metrics(
+                (
+                    gse_layerwise_task_router_metrics
+                    if self.gse_enabled
+                    else ortho_hydra_layerwise_task_router_metrics
+                )(
                     reduced_statistics,
                     informative_nmi_threshold=float(
-                        self.gse_cfg.get("task_router_informative_nmi_threshold", 0.01)
+                        adapter_cfg.get("task_router_informative_nmi_threshold", 0.01)
                     ),
                 )
             )
@@ -1606,6 +1651,8 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         compute_values = self.cfg.algorithm.adv_type == "gae"
         if self.gse_enabled:
             reset_gse_auxiliary_state(self.model)
+        elif self.ortho_hydra_enabled:
+            reset_ortho_hydra_auxiliary_state(self.model)
         with self.amp_context:
             output_dict = self.model(
                 forward_inputs=forward_inputs,
@@ -1681,9 +1728,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             orthogonality_coefficient = float(
                 self.gse_cfg.get("orthogonality_loss_coef", 0.0)
             )
-            log_orthogonality = bool(
-                self.gse_cfg.get("log_orthogonality", False)
-            )
+            log_orthogonality = bool(self.gse_cfg.get("log_orthogonality", False))
             auxiliary_loss, gse_metrics = gse_auxiliary_loss(
                 self.model,
                 load_balancing_coefficient=float(
@@ -1731,6 +1776,49 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         task_router_statistics["packed"] = micro_statistics.clone()
                     else:
                         task_router_statistics["packed"].add_(micro_statistics)
+        elif self.ortho_hydra_enabled:
+            auxiliary_loss, adapter_metrics = ortho_hydra_auxiliary_loss(
+                self.model,
+                load_balancing_coefficient=float(
+                    self.ortho_hydra_cfg.get("load_balancing_loss_coef", 0.0)
+                ),
+            )
+            loss += auxiliary_loss
+            if bool(self.ortho_hydra_cfg.get("log_router_metrics", True)):
+                metrics_data.update(scalar_metrics_to_python(adapter_metrics))
+            if (
+                (
+                    bool(self.ortho_hydra_cfg.get("log_task_router_metrics", False))
+                    or bool(
+                        self.ortho_hydra_cfg.get(
+                            "log_layerwise_task_router_metrics", False
+                        )
+                    )
+                )
+                and task_router_statistics is not None
+                and isinstance(task_ids, torch.Tensor)
+            ):
+                num_tasks = self.ortho_hydra_cfg.get("task_router_num_tasks")
+                if num_tasks is None:
+                    raise ValueError(
+                        "actor.model.ortho_hydra.task_router_num_tasks is required "
+                        "when task-conditioned router metrics are enabled"
+                    )
+                micro_statistics = ortho_hydra_layerwise_task_router_statistics(
+                    self.model,
+                    task_ids,
+                    num_tasks=int(num_tasks),
+                    domain=(
+                        "action"
+                        if self.cfg.actor.model.model_type == "openpi"
+                        else None
+                    ),
+                )
+                if micro_statistics.numel() > 0:
+                    if "packed" not in task_router_statistics:
+                        task_router_statistics["packed"] = micro_statistics.clone()
+                    else:
+                        task_router_statistics["packed"].add_(micro_statistics)
 
         loss /= self.gradient_accumulation
         with backward_ctx:
@@ -1740,6 +1828,8 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         append_to_dict(metrics, metrics_data)
         if self.gse_enabled:
             reset_gse_auxiliary_state(self.model)
+        elif self.ortho_hydra_enabled:
+            reset_ortho_hydra_auxiliary_state(self.model)
 
     def set_global_step(self, global_step: int) -> None:
         """
@@ -1758,10 +1848,13 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             "actor/lr": lr_list[0],
         }
         if len(lr_list) > 1:
-            if self.gse_enabled and self.cfg.actor.optim.get(
-                "gse_lr", None
-            ) is not None:
+            if self.gse_enabled and self.cfg.actor.optim.get("gse_lr") is not None:
                 metric_data["actor/gse_lr"] = lr_list[1]
+            elif (
+                self.ortho_hydra_enabled
+                and self.cfg.actor.optim.get("ortho_hydra_lr") is not None
+            ):
+                metric_data["actor/ortho_hydra_lr"] = lr_list[1]
             else:
                 metric_data["critic/lr"] = lr_list[1]
         if len(lr_list) > 2:

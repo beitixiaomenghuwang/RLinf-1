@@ -49,6 +49,11 @@ def get_model(cfg: DictConfig, torch_dtype=None):
         OpenPi0Config,
         OpenPi0ForRLActionPrediction,
     )
+    from rlinf.models.embodiment.openpi.ortho_hydra import (
+        configure_openpi_ortho_hydra,
+        is_ortho_hydra_enabled,
+        state_dict_contains_ortho_hydra,
+    )
 
     # config
     config_name = getattr(cfg.openpi, "config_name", None)
@@ -66,13 +71,16 @@ def get_model(cfg: DictConfig, torch_dtype=None):
 
     gse_config = cfg.get("gse", None)
     gse_enabled = is_gse_enabled(gse_config)
+    ortho_hydra_config = cfg.get("ortho_hydra", None)
+    ortho_hydra_enabled = is_ortho_hydra_enabled(ortho_hydra_config)
     moore_config = cfg.get("moore", None)
     moore_enabled = is_moore_enabled(moore_config)
-    if gse_enabled and moore_enabled:
-        raise ValueError("OpenPI GSE and MoORE cannot be enabled at the same time")
+    enabled_peft_methods = sum((gse_enabled, ortho_hydra_enabled, moore_enabled))
+    if enabled_peft_methods > 1:
+        raise ValueError("OpenPI GSE, Ortho-Hydra, and MoORE are mutually exclusive")
     action_lora_enabled = is_action_lora_enabled(cfg)
-    if (gse_enabled or moore_enabled) and cfg.get("is_lora", False):
-        raise ValueError("OpenPI GSE/MoORE and LoRA cannot be enabled at the same time")
+    if enabled_peft_methods and cfg.get("is_lora", False):
+        raise ValueError("OpenPI GSE/Ortho-Hydra/MoORE and LoRA are mutually exclusive")
 
     # load model
     checkpoint_dir = download.maybe_download(str(cfg.model_path))
@@ -113,13 +121,23 @@ def get_model(cfg: DictConfig, torch_dtype=None):
             model_state_dict.update(state_dict)
 
     checkpoint_has_gse = state_dict_contains_gse(model_state_dict)
+    checkpoint_has_ortho_hydra = state_dict_contains_ortho_hydra(model_state_dict)
     checkpoint_has_moore = state_dict_contains_moore(model_state_dict)
-    if checkpoint_has_gse and checkpoint_has_moore:
-        raise ValueError("The checkpoint cannot contain both GSE and MoORE parameters")
+    checkpoint_peft_methods = sum(
+        (checkpoint_has_gse, checkpoint_has_ortho_hydra, checkpoint_has_moore)
+    )
+    if checkpoint_peft_methods > 1:
+        raise ValueError(
+            "A checkpoint cannot contain multiple GSE/Ortho-Hydra/MoORE methods"
+        )
     checkpoint_has_vlm_gse = state_dict_contains_vlm_gse(model_state_dict)
     checkpoint_has_action_lora = state_dict_contains_action_lora(model_state_dict)
     if checkpoint_has_gse and checkpoint_has_action_lora:
         raise ValueError("The checkpoint cannot contain both GSE and action LoRA")
+    if checkpoint_has_ortho_hydra and checkpoint_has_action_lora:
+        raise ValueError(
+            "The checkpoint cannot contain both Ortho-Hydra and action LoRA"
+        )
     if checkpoint_has_moore and checkpoint_has_action_lora:
         raise ValueError("The checkpoint cannot contain both MoORE and action LoRA")
     if checkpoint_has_action_lora and not action_lora_enabled:
@@ -130,6 +148,11 @@ def get_model(cfg: DictConfig, torch_dtype=None):
     if checkpoint_has_moore and not moore_enabled:
         raise ValueError(
             "The checkpoint contains MoORE parameters, but model.moore.enabled is false"
+        )
+    if checkpoint_has_ortho_hydra and not ortho_hydra_enabled:
+        raise ValueError(
+            "The checkpoint contains Ortho-Hydra parameters, but "
+            "model.ortho_hydra.enabled is false"
         )
     vlm_gse_enabled = is_gse_enabled(
         gse_config.get("vlm", None) if gse_config is not None else None
@@ -154,6 +177,8 @@ def get_model(cfg: DictConfig, torch_dtype=None):
             configure_openpi_gse(model, action_only_config)
         else:
             configure_openpi_gse(model, gse_config)
+    elif checkpoint_has_ortho_hydra:
+        configure_openpi_ortho_hydra(model, ortho_hydra_config)
     elif checkpoint_has_moore:
         configure_openpi_moore(model, moore_config)
     elif checkpoint_has_action_lora:
@@ -172,6 +197,8 @@ def get_model(cfg: DictConfig, torch_dtype=None):
     model.paligemma_with_expert.to_bfloat16_for_selected_params("bfloat16")
     if gse_enabled and not checkpoint_has_gse:
         configure_openpi_gse(model, gse_config)
+    if ortho_hydra_enabled and not checkpoint_has_ortho_hydra:
+        configure_openpi_ortho_hydra(model, ortho_hydra_config)
     if moore_enabled and not checkpoint_has_moore:
         configure_openpi_moore(model, moore_config)
     if action_lora_enabled and not checkpoint_has_action_lora:

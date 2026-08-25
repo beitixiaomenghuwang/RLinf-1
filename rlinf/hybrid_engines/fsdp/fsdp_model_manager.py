@@ -534,9 +534,13 @@ class FSDPModelManager:
         weight_decay = self._cfg.optim.get("weight_decay", 1e-2)
 
         params_actor = []
-        params_gse = []
+        params_adapter = []
         params_critic = []
         gse_lr = self._cfg.optim.get("gse_lr", None)
+        ortho_hydra_lr = self._cfg.optim.get("ortho_hydra_lr", None)
+        if gse_lr is not None and ortho_hydra_lr is not None:
+            raise ValueError("Configure only one of gse_lr and ortho_hydra_lr")
+        adapter_lr = ortho_hydra_lr if ortho_hydra_lr is not None else gse_lr
 
         if enable_critic_warmup:
             self._logger.info("[FSDP] Enable critic warmup for value head.")
@@ -555,8 +559,8 @@ class FSDPModelManager:
                 if param.requires_grad:
                     if "value_head" in name or "model.value_head" in name:
                         params_critic.append(param)
-                    elif gse_lr is not None and ".adapter." in name:
-                        params_gse.append(param)
+                    elif adapter_lr is not None and ".adapter." in name:
+                        params_adapter.append(param)
                     else:
                         params_actor.append(param)
 
@@ -569,11 +573,11 @@ class FSDPModelManager:
                     "betas": betas,
                 }
             )
-        if len(params_gse) > 0:
+        if len(params_adapter) > 0:
             param_groups.append(
                 {
-                    "params": params_gse,
-                    "lr": gse_lr,
+                    "params": params_adapter,
+                    "lr": adapter_lr,
                     "betas": betas,
                 }
             )

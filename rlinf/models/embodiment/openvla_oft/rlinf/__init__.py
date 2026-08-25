@@ -111,11 +111,27 @@ def get_model(cfg: DictConfig, torch_dtype=torch.bfloat16):
     # attached lora_adapter must not be applied again; GSE is the only adapter
     # injected for this RL experiment.
     gse_config = cfg.get("gse", None)
+    ortho_hydra_config = cfg.get("ortho_hydra", None)
+    if (
+        gse_config is not None
+        and bool(gse_config.get("enabled", False))
+        and ortho_hydra_config is not None
+        and bool(ortho_hydra_config.get("enabled", False))
+    ):
+        raise ValueError("OpenVLA GSE and Ortho-Hydra are mutually exclusive")
     if gse_config is not None and bool(gse_config.get("enabled", False)):
         from rlinf.models.embodiment.openvla_oft.rlinf.gse import (
             configure_openvla_gse,
         )
 
         configure_openvla_gse(model, gse_config)
+    if ortho_hydra_config is not None and bool(
+        ortho_hydra_config.get("enabled", False)
+    ):
+        from rlinf.models.embodiment.openvla_oft.rlinf.ortho_hydra import (
+            configure_openvla_ortho_hydra,
+        )
+
+        configure_openvla_ortho_hydra(model, ortho_hydra_config)
 
     return model

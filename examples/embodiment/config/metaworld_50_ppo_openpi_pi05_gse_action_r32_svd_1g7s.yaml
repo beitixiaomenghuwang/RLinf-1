@@ -14,3 +14,5 @@ actor:
       num_experts: 8
       num_generalized_experts: 1
       top_k: 2
+      # Standard GSE routing uses action-expert hidden states only.
+      semantic_conditioning: False
