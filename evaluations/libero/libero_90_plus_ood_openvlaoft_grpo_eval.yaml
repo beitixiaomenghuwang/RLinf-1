@@ -1,0 +1,75 @@
+defaults:
+  - env/libero_90_plus_ood@env.eval
+  - model/openvla_oft@rollout.model
+  - override hydra/job_logging: stdout
+  - _self_
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    env,rollout: all
+
+runner:
+  task_type: embodied_eval
+  logger:
+    log_path: "../results"
+    project_name: rlinf
+    experiment_name: "libero_90_plus_ood_openvlaoft_grpo_eval"
+    logger_backends: ["tensorboard"]
+  only_eval: True
+  ckpt_path: null
+
+env:
+  group_name: "EnvGroup"
+  eval:
+    custom_plus_manifest: ${oc.env:RLINF_LIBERO90_PLUS_OOD_MANIFEST}
+    libero_variant: plus
+    rollout_epoch: 1
+    task_id_start: null
+    task_id_end: null
+    # Four MuJoCo workers fit a 24 GB GPU / 32 GB RAM workstation without swap thrashing.
+    total_num_envs: 4
+    auto_reset: True
+    ignore_terminations: False
+    max_episode_steps: 512
+    # ceil(1890 / 4) episode windows, each with a 512-step worst case.
+    max_steps_per_rollout_epoch: 242176
+    group_size: 1
+    use_fixed_reset_state_ids: True
+    use_ordered_reset_state_ids: True
+    reset_gripper_open: False
+    is_eval: True
+    official_image_preprocess: True
+    video_cfg:
+      save_video: False
+      video_base_dir: ${runner.logger.log_path}/video/eval
+
+rollout:
+  sampling_params:
+    do_sample: True
+    temperature_train: 1.6
+    temperature_eval: 1.6
+    top_k: -1
+    top_p: 1.0
+    repetition_penalty: 1.0
+  group_name: "RolloutGroup"
+  generation_backend: "huggingface"
+  enable_offload: False
+  micro_batch_size: 2
+  pipeline_stage_num: 1
+  model:
+    model_path: ${oc.env:LIBERO90_MODEL_PATH}
+    model_type: "openvla_oft"
+    implement_version: "rlinf"
+    precision: "bf16"
+    unnorm_key: libero_90_no_noops_trajall
+    max_prompt_length: 128
+    is_lora: False
+    attn_implementation: "sdpa"
