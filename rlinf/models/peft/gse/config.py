@@ -6,8 +6,10 @@ from typing import Literal
 RoutingGranularity = Literal["sequence", "token"]
 SequencePooling = Literal["mean", "first", "last"]
 Initialization = Literal["orthogonal_zero", "kaiming_zero", "svd"]
-ScalingMode = Literal["total_rank", "expert_rank"]
+ScalingMode = Literal["total_rank", "expert_rank", "gse"]
 RoutingMode = Literal["topk", "all", "uniform"]
+RouterInput = Literal["hidden", "rank_rms"]
+RouterInitialization = Literal["default", "normal", "kaiming"]
 
 
 @dataclass(frozen=True)
@@ -27,10 +29,20 @@ class GSEConfig:
     routing_granularity: RoutingGranularity = "sequence"
     sequence_pooling: SequencePooling = "mean"
     routing_mode: RoutingMode = "topk"
+    router_input: RouterInput = "hidden"
     initialization: Initialization = "orthogonal_zero"
     scaling_mode: ScalingMode = "total_rank"
+    gse_eta: float = 1.0
+    svd_rho: float = 1.0
+    preserve_svd_output: bool = False
     normalize_topk: bool = True
     router_bias: bool = False
+    # "default" reproduces the official GSE repo, which leaves the router at
+    # nn.Linear's own reset_parameters: kaiming_uniform_(a=sqrt(5)), i.e.
+    # uniform(+/-1/sqrt(in_features)) with std 1/sqrt(3*in_features). The scale
+    # therefore tracks in_features automatically and router_init_std is unused.
+    # "normal" uses router_init_std verbatim at every width.
+    router_initialization: RouterInitialization = "normal"
     router_init_std: float = 0.02
     semantic_conditioning: bool = False
     semantic_embedding_dim: int | None = None
@@ -50,8 +62,16 @@ class GSEConfig:
                 {"orthogonal_zero", "kaiming_zero", "svd"},
                 self.initialization,
             ),
-            "scaling_mode": ({"total_rank", "expert_rank"}, self.scaling_mode),
+            "scaling_mode": (
+                {"total_rank", "expert_rank", "gse"},
+                self.scaling_mode,
+            ),
             "routing_mode": ({"topk", "all", "uniform"}, self.routing_mode),
+            "router_input": ({"hidden", "rank_rms"}, self.router_input),
+            "router_initialization": (
+                {"default", "normal", "kaiming"},
+                self.router_initialization,
+            ),
         }
         for field_name, (choices, value) in valid_values.items():
             if value not in choices:
@@ -78,10 +98,16 @@ class GSEConfig:
                 "normalize_topk must be False when top_k=1 so the task loss can "
                 "train the router"
             )
+        if self.router_input == "rank_rms" and self.routing_granularity != "sequence":
+            raise ValueError("rank_rms router_input requires sequence routing")
         if not 0.0 <= self.lora_dropout < 1.0:
             raise ValueError("lora_dropout must be in [0, 1)")
         if self.lora_alpha <= 0:
             raise ValueError("lora_alpha must be positive")
+        if self.gse_eta <= 0:
+            raise ValueError("gse_eta must be positive")
+        if self.svd_rho <= 0:
+            raise ValueError("svd_rho must be positive")
         if self.router_init_std < 0:
             raise ValueError("router_init_std must be non-negative")
         if self.semantic_conditioning and (
@@ -108,8 +134,10 @@ class GSEConfig:
             base_rank + int(index < remainder) for index in range(self.num_experts)
         )
 
-    def scaling_for_rank(self, expert_rank: int) -> float:
+    def scaling_for_rank(self, expert_rank: int, in_features: int) -> float:
         """Return the residual scaling for one expert."""
+        if self.scaling_mode == "gse":
+            return (3.0 * self.gse_eta * in_features / expert_rank) ** 0.5
         denominator = (
             self.total_rank if self.scaling_mode == "total_rank" else expert_rank
         )

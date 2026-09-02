@@ -2,17 +2,24 @@ defaults:
   - metaworld_50_ppo_openpi_pi05_gse_action_r32_svd
   - _self_
 
-# Matched expert-structure ablation: remove the always-active generalized
-# branch and route across all eight specialized experts.
+# Main method: eight dense specialized experts. Route from the RMS energy of
+# their concatenated rank-space A projections, following Ortho-Hydra.
 runner:
   logger:
     experiment_name: "metaworld_50_pi05_gse_action_r32_svd_only_specialized"
-  max_epochs: 160
+  max_epochs: 180
   val_check_interval: 20
-  save_interval: 20
+  save_interval: 10
 
 actor:
   model:
     gse:
       num_generalized_experts: 0
       routing_mode: "all"
+      routing_granularity: "token"
+      router_input: "rank_rms"
+      # A zero-initialized router keeps the weight matrix at rank 0, so every
+      # expert logit stays identical and softmax cannot leave uniform routing.
+      # A small non-zero standard deviation makes the router full rank while
+      # frozen-baseline subtraction still preserves the SFT policy at step 0.
+      router_init_std: 0.02

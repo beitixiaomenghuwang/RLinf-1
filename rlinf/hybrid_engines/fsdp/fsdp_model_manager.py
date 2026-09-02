@@ -49,6 +49,17 @@ warnings.filterwarnings(
     category=UserWarning,
 )
 
+# Router parameter names for GSE (``adapter.router``, ``adapter.semantic_router``)
+# and Ortho-Hydra (``router``, ``semantic_router``). Matching on the ".router."
+# and ".semantic_router." segments keeps expert factors (``lora_a``, ``lora_b``,
+# ``q_basis``, ``s_q``) out of the router group.
+_ROUTER_NAME_PARTS = (".router.", ".semantic_router.")
+
+
+def _is_router_parameter(name: str) -> bool:
+    """Return whether a parameter belongs to an adapter's routing network."""
+    return any(part in name for part in _ROUTER_NAME_PARTS)
+
 
 class FSDPModelManager:
     """
@@ -397,6 +408,7 @@ class FSDPModelManager:
             save_full_model_weights=self._cfg.fsdp_config.get(
                 "save_full_model_weights", True
             ),
+            adapter_only=self._cfg.fsdp_config.get("adapter_only_checkpoint", False),
         )
 
         if restore_weight_offload:
@@ -535,12 +547,28 @@ class FSDPModelManager:
 
         params_actor = []
         params_adapter = []
+        params_router = []
         params_critic = []
         gse_lr = self._cfg.optim.get("gse_lr", None)
         ortho_hydra_lr = self._cfg.optim.get("ortho_hydra_lr", None)
         if gse_lr is not None and ortho_hydra_lr is not None:
             raise ValueError("Configure only one of gse_lr and ortho_hydra_lr")
         adapter_lr = ortho_hydra_lr if ortho_hydra_lr is not None else gse_lr
+        # The router is a tiny Linear(width, num_specialized) whose gradient
+        # arrives only through the routing weights, so it trains far slower than
+        # the expert factors at a shared lr. gse_router_lr gives it its own
+        # group; gse_router_weight_decay defaults to the global weight_decay.
+        router_lr = self._cfg.optim.get("gse_router_lr", None)
+        router_weight_decay = self._cfg.optim.get(
+            "gse_router_weight_decay", weight_decay
+        )
+        # Router grouping is name-based, so it only works while each router keeps
+        # its own name in the parameter path. Under FSDP1 with
+        # use_orig_params=False an adapter collapses into one
+        # `adapter._fsdp_wrapped_module._flat_param`; the `_is_adapter_router`
+        # wrap policy in hybrid_engines/fsdp/utils.py counteracts that by making
+        # every router its own FSDP unit. The empty-group check below is what
+        # actually enforces this, so no config combination is rejected here.
 
         if enable_critic_warmup:
             self._logger.info("[FSDP] Enable critic warmup for value head.")
@@ -559,6 +587,8 @@ class FSDPModelManager:
                 if param.requires_grad:
                     if "value_head" in name or "model.value_head" in name:
                         params_critic.append(param)
+                    elif router_lr is not None and _is_router_parameter(name):
+                        params_router.append(param)
                     elif adapter_lr is not None and ".adapter." in name:
                         params_adapter.append(param)
                     else:
@@ -580,6 +610,27 @@ class FSDPModelManager:
                     "lr": adapter_lr,
                     "betas": betas,
                 }
+            )
+        if router_lr is not None and not enable_critic_warmup and not params_router:
+            raise ValueError(
+                "optim.gse_router_lr is set but no router parameter was found. "
+                f"Expected trainable parameters whose names contain one of "
+                f"{_ROUTER_NAME_PARTS}. Under FSDP1 this requires each router to "
+                "be its own FSDP unit; check that the adapter tags its routers "
+                "with _is_adapter_router so the wrap policy can find them."
+            )
+        if len(params_router) > 0:
+            param_groups.append(
+                {
+                    "params": params_router,
+                    "lr": router_lr,
+                    "betas": betas,
+                    "weight_decay": router_weight_decay,
+                }
+            )
+            self._logger.info(
+                f"[FSDP] Router param group: {len(params_router)} tensors, "
+                f"lr={router_lr}, weight_decay={router_weight_decay}"
             )
         if len(params_critic) > 0:
             param_groups.append(

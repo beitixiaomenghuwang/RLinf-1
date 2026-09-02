@@ -287,6 +287,29 @@ def get_fsdp_wrap_policy(module, config=None, is_lora=False, model_type=None):
             )
         policies.append(q_head_policy)
 
+    # Wrap adapter routers as their own FSDP units, ahead of the adapter policy
+    # below. With use_orig_params=False FSDP fuses each adapter into a single
+    # `adapter._fsdp_wrapped_module._flat_param`, which erases the ".router." /
+    # ".semantic_router." names that a dedicated router optimizer group
+    # (optim.gse_router_lr) matches on -- the group would come out empty and
+    # every router would silently train at optim.lr. Giving each router its own
+    # unit keeps its name in the parameter path. Routers are tiny
+    # Linear(width, num_specialized) modules, so the extra units cost
+    # essentially nothing, and nothing at all under NO_SHARD.
+    has_adapter_router = any(
+        getattr(submodule, "_is_adapter_router", False)
+        for submodule in module.modules()
+    )
+    if has_adapter_router:
+        from torch.distributed.fsdp.wrap import lambda_auto_wrap_policy
+
+        def is_adapter_router(candidate):
+            return getattr(candidate, "_is_adapter_router", False)
+
+        policies.append(
+            functools.partial(lambda_auto_wrap_policy, lambda_fn=is_adapter_router)
+        )
+
     peft_adapter_classes = {
         submodule.__class__
         for submodule in module.modules()

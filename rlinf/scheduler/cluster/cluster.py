@@ -428,13 +428,19 @@ class Cluster:
             if self._distributed_log_collector is not None:
                 self._distributed_log_collector.stop()
 
-            with without_http_proxies():
-                alive_actors = list_actors(
-                    filters=[
-                        ("STATE", "=", "ALIVE"),
-                        ("RAY_NAMESPACE", "=", Cluster.NAMESPACE),
-                    ]
+            try:
+                with without_http_proxies():
+                    alive_actors = list_actors(
+                        filters=[
+                            ("STATE", "=", "ALIVE"),
+                            ("RAY_NAMESPACE", "=", Cluster.NAMESPACE),
+                        ]
+                    )
+            except Exception as exc:  # pragma: no cover - Ray shutdown order
+                logging.getLogger(__name__).warning(
+                    "Unable to list Ray actors during failure cleanup: %s", exc
                 )
+                alive_actors = []
             for actor_state in alive_actors:
                 actor = ray.get_actor(actor_state.name)
                 ray.kill(actor, no_restart=True)

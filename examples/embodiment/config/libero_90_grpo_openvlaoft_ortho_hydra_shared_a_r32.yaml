@@ -31,9 +31,16 @@ runner:
   max_steps: 120
 
   only_eval: False
-  val_check_interval: 10
+  val_check_interval: 20
   save_interval: 10
   save_best_macro_mean: True
+  # No cap: adapter-only checkpoints are ~110 MiB, so keeping the whole
+  # training trajectory costs less than one old 17G full checkpoint and lets
+  # any step be re-evaluated later. Stated explicitly rather than relying on
+  # the key being absent, so adding a cap upstream cannot silently start
+  # pruning these runs. null disables pruning (prune_old_checkpoints returns
+  # early on None).
+  max_checkpoints_to_keep: null
 
   resume_dir: null
   ckpt_path: null
@@ -153,6 +160,7 @@ actor:
       lora_alpha: 32.0
       num_experts: 8
       parameterization: "shared_a"
+      routing_granularity: "token"
       # Dense softmax uses all experts and fuses RMS-pooled rank-32 hidden
       # states with the frozen text embedding.
       semantic_router_scale: 1.0
@@ -186,6 +194,23 @@ actor:
     clip_grad: 1.0
 
   fsdp_config:
+    # A PEFT checkpoint is dominated by the frozen backbone, re-saved verbatim at
+    # every step. Measured on a pi0.5 GSE rank-32 checkpoint (job 1468982 step
+    # 100): 17G total, of which the adapter tensors were 33.8 MiB. The rest was
+    # 7.94 GiB of frozen base inside the DCP shards plus an 8.0 GiB
+    # full_weights.pt copy of the same weights. Every parameter carrying
+    # optimizer state was an adapter/router/value_head tensor, and each base
+    # tensor differing from model.safetensors differed by exactly its bf16
+    # rounding, so the base is frozen and is restored from
+    # actor.model.model_path on resume. Load auto-detects the format from a
+    # marker file, so a run can switch and still resume from older full
+    # checkpoints.
+    adapter_only_checkpoint: True
+    # full_weights.pt is the whole model, so writing it would restore the cost
+    # adapter-only saving removes. Standalone eval via runner.ckpt_path needs a
+    # materialized file: rebuild it from the base weights plus one adapter
+    # checkpoint instead of re-saving it at every save_interval.
+    save_full_model_weights: False
     strategy: "fsdp"
     gradient_checkpointing: True
     gradient_checkpointing_use_reentrant: False

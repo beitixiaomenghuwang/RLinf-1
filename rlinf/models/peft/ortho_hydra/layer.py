@@ -1,11 +1,13 @@
 """Ortho-Hydra residual linear layer."""
 
+from collections.abc import Callable
 from typing import Any
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
+from ..router_fsdp import mark_adapter_router
 from .config import OrthoHydraConfig
 from .context import get_ortho_hydra_routing_context
 from .initialization import initialize_router, principal_bases
@@ -61,6 +63,13 @@ class OrthoHydraAdapter(nn.Module):
         self.out_features = out_features
         self._load_balancing_loss: torch.Tensor | None = None
         self._router_stats: dict[str, torch.Tensor] = {}
+        self._inference_basis_cache: dict[
+            str, tuple[tuple[tuple[int, int], ...], torch.Tensor]
+        ] = {}
+        # Activation-checkpoint recomputation may run after the outer
+        # ContextVar has been restored; retain batch-local routing semantics
+        # until the corresponding backward completes.
+        self._cached_semantic_embeddings: torch.Tensor | None = None
 
         left, right = principal_bases(base_weight, config.total_rank)
         rank = config.expert_rank
@@ -114,6 +123,10 @@ class OrthoHydraAdapter(nn.Module):
             if config.lora_dropout > 0
             else nn.Identity()
         )
+        # Give each router its own FSDP unit so a per-router optimizer group can
+        # still find it by name; see rlinf/models/peft/router_fsdp.py.
+        mark_adapter_router(self.router)
+        mark_adapter_router(self.semantic_router)
         self.to(device=device, dtype=dtype)
 
     @property
@@ -130,6 +143,7 @@ class OrthoHydraAdapter(nn.Module):
         """Discard diagnostics saved by the latest forward."""
         self._load_balancing_loss = None
         self._router_stats = {}
+        self._cached_semantic_embeddings = None
 
     def orthogonality_error(self) -> torch.Tensor:
         """Measure cross-expert overlap of the frozen output subspaces."""
@@ -141,25 +155,56 @@ class OrthoHydraAdapter(nn.Module):
         error = cross[mask].square().mean()
         return error + self.lambda_layer.sum() * 0.0
 
+    def _effective_basis(
+        self,
+        name: str,
+        parameters: tuple[torch.Tensor, ...],
+        build: Callable[[], torch.Tensor],
+    ) -> torch.Tensor:
+        """Cache a Cayley-transformed basis only for inference forwards."""
+        if torch.is_grad_enabled():
+            return build()
+        signature = tuple(
+            (parameter._version, parameter.data_ptr()) for parameter in parameters
+        )
+        cached = self._inference_basis_cache.get(name)
+        if cached is None or cached[0] != signature:
+            cached = (signature, build())
+            self._inference_basis_cache[name] = cached
+        return cached[1]
+
     def _bottleneck(self, inputs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         adapter_inputs = self.dropout(inputs)
         if self.config.parameterization == "shared_a":
             assert self.s_q is not None and self.q_basis is not None
             assert self.s_routing_q is not None and self.routing_q_basis is not None
-            q_effective = _cayley(self.s_q).to(self.q_basis) @ self.q_basis
+            q_effective = self._effective_basis(
+                "shared_q",
+                (self.s_q,),
+                lambda: _cayley(self.s_q).to(self.q_basis) @ self.q_basis,
+            )
             hidden = F.linear(adapter_inputs.to(q_effective.dtype), q_effective)
-            routing_q = (
-                _cayley(self.s_routing_q).to(self.routing_q_basis)
-                @ self.routing_q_basis
+            routing_q = self._effective_basis(
+                "routing_q",
+                (self.s_routing_q,),
+                lambda: (
+                    _cayley(self.s_routing_q).to(self.routing_q_basis)
+                    @ self.routing_q_basis
+                ),
             )
             routing_hidden = F.linear(adapter_inputs.to(routing_q.dtype), routing_q)
             return hidden, routing_hidden
 
-        q_effective = torch.stack(
-            [
-                _cayley(expert.s_q).to(expert.q_basis) @ expert.q_basis
-                for expert in self.experts
-            ]
+        q_parameters = tuple(expert.s_q for expert in self.experts)
+        q_effective = self._effective_basis(
+            "independent_q",
+            q_parameters,
+            lambda: torch.stack(
+                [
+                    _cayley(expert.s_q).to(expert.q_basis) @ expert.q_basis
+                    for expert in self.experts
+                ]
+            ),
         )
         hidden = torch.einsum(
             "...i,eri->...er", adapter_inputs.to(q_effective.dtype), q_effective
@@ -174,19 +219,21 @@ class OrthoHydraAdapter(nn.Module):
                 routing_hidden.shape[0], -1, self.config.total_rank
             ).float()
             pooled = pooled.square().mean(dim=1).sqrt()
-        logits = self.router(pooled.to(self.router.weight.dtype))
+        # The dtype cast lives in the router's forward pre-hook, not here; see
+        # peft/router_fsdp.py for why the caller cannot read weight.dtype.
+        logits = self.router(pooled)
 
         context = get_ortho_hydra_routing_context()
-        if context is None:
+        if context is not None:
+            self._cached_semantic_embeddings = context.semantic_embeddings
+        semantic = self._cached_semantic_embeddings
+        if semantic is None:
             raise RuntimeError(
                 "Ortho-Hydra requires frozen text embeddings in its routing context"
             )
-        semantic = context.semantic_embeddings
         if semantic.shape[0] != logits.shape[0]:
             raise ValueError("Text embedding batch does not match router batch")
-        semantic_logits = self.semantic_router(
-            semantic.to(self.semantic_router.weight.dtype)
-        )
+        semantic_logits = self.semantic_router(semantic)
         logits = logits + self.config.semantic_router_scale * semantic_logits
         return F.softmax(logits.float(), dim=-1)
 
@@ -225,11 +272,16 @@ class OrthoHydraAdapter(nn.Module):
         probabilities = self._routing_probabilities(routing_hidden)
         self._record_routing(probabilities)
 
-        p_effective = torch.stack(
-            [
-                expert.p_basis @ _cayley(expert.s_p).to(expert.p_basis)
-                for expert in self.experts
-            ]
+        p_parameters = tuple(expert.s_p for expert in self.experts)
+        p_effective = self._effective_basis(
+            "p",
+            p_parameters,
+            lambda: torch.stack(
+                [
+                    expert.p_basis @ _cayley(expert.s_p).to(expert.p_basis)
+                    for expert in self.experts
+                ]
+            ),
         )
         scaled_hidden = hidden * self.lambda_layer.to(hidden)
         if self.config.parameterization == "shared_a":

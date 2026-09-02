@@ -30,9 +30,7 @@ def _full_svd_factors(
     if compute_device.type == "cpu" and torch.cuda.is_available():
         compute_device = torch.device("cuda", torch.cuda.current_device())
     matrix = weight.detach().to(device=compute_device, dtype=torch.float32)
-    left, singular_values, right = torch.linalg.svd(
-        matrix, full_matrices=False
-    )
+    left, singular_values, right = torch.linalg.svd(matrix, full_matrices=False)
     left = left[:, :rank]
     singular_values = singular_values[:rank]
     right = right[:rank]
@@ -56,13 +54,13 @@ def initialize_expert_factors(
     seed: int | None,
     orthogonal_gain: float,
     base_weight: torch.Tensor | None = None,
+    scalings: Sequence[float] | None = None,
+    svd_rho: float = 1.0,
 ) -> None:
-    """Initialize expert factors from a random basis or a full SVD.
+    """Initialize expert factors from a random basis or a balanced full SVD.
 
-    ``svd`` initializes every retained A/B parameter from exact leading
-    singular triplets. GSEAdapter freezes a copy of these factors and subtracts
-    their initial output, preserving the base policy while both trainable
-    factors receive gradients from the first update.
+    ``svd`` follows VLA-GSE's factor geometry: each expert receives disjoint
+    singular triplets and splits ``S / (scaling * rho)`` evenly across A and B.
     """
     if len(lora_a_layers) != len(lora_b_layers):
         raise ValueError("A and B layer counts must match")
@@ -104,10 +102,26 @@ def initialize_expert_factors(
                 "svd initialization requires total rank no larger than the base "
                 f"weight rank, got {total_rank} > {min(base_weight.shape)}"
             )
-        left, singular_values, joint_a = _full_svd_factors(
-            base_weight, total_rank
-        )
-        joint_b = (left * singular_values.unsqueeze(0)).contiguous()
+        if scalings is None or len(scalings) != len(lora_a_layers):
+            raise ValueError("svd initialization requires one scaling per expert")
+        if svd_rho <= 0:
+            raise ValueError("svd_rho must be positive")
+        left, singular_values, right = _full_svd_factors(base_weight, total_rank)
+        joint_a = torch.empty_like(right)
+        joint_b = torch.empty_like(left)
+        offset = 0
+        for lora_a, scaling in zip(lora_a_layers, scalings, strict=True):
+            rank = lora_a.out_features
+            root = (
+                singular_values[offset : offset + rank] / (scaling * svd_rho)
+            ).sqrt()
+            joint_a[offset : offset + rank] = (
+                root.unsqueeze(1) * right[offset : offset + rank]
+            )
+            joint_b[:, offset : offset + rank] = left[
+                :, offset : offset + rank
+            ] * root.unsqueeze(0)
+            offset += rank
     else:
         raise ValueError(f"Unsupported GSE initialization: {method}")
 
@@ -142,13 +156,26 @@ def initialize_expert_factors(
 def initialize_router(
     router: nn.Linear,
     *,
+    method: str,
     standard_deviation: float,
     seed: int | None,
 ) -> None:
-    """Initialize a router with small random logits and optional zero bias."""
+    """Initialize a router from the configured distribution.
+
+    ``default`` and ``kaiming`` both reproduce ``nn.Linear.reset_parameters``
+    (``kaiming_uniform_`` with ``a=sqrt(5)``), which draws from
+    ``uniform(+/-1/sqrt(in_features))`` and so rescales itself with the router
+    width. Only ``normal`` reads ``standard_deviation``; the official GSE repo
+    never touches its router, making ``default`` the faithful setting.
+    """
     generator = _cpu_generator(seed)
     weight = torch.empty(router.weight.shape, dtype=torch.float32, device="cpu")
-    weight.normal_(mean=0.0, std=standard_deviation, generator=generator)
+    if method == "normal":
+        weight.normal_(mean=0.0, std=standard_deviation, generator=generator)
+    elif method in ("default", "kaiming"):
+        nn.init.kaiming_uniform_(weight, a=math.sqrt(5), generator=generator)
+    else:
+        raise ValueError(f"Unsupported router initialization: {method}")
     router.weight.copy_(weight.to(router.weight))
     if router.bias is not None:
         router.bias.zero_()

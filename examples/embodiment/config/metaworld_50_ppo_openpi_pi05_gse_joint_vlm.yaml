@@ -11,8 +11,12 @@ runner:
     experiment_name: "metaworld_50_ppo_openpi_pi05_gse_joint_vlm"
   max_epochs: 320
   val_check_interval: 20
-  save_interval: 20
-  max_checkpoints_to_keep: 4
+  save_interval: 10
+  # No cap: adapter-only checkpoints are ~110 MiB, so keeping the whole
+  # training trajectory costs less than a single old 17G full checkpoint and
+  # lets any step be re-evaluated later. null disables pruning entirely
+  # (prune_old_checkpoints returns early on None).
+  max_checkpoints_to_keep: null
   resume_dir: null
   ckpt_path: null
 

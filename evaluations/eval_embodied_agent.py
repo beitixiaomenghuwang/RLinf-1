@@ -29,7 +29,6 @@ mp.set_start_method("spawn", force=True)
 
 
 @hydra.main(
-    version_base="1.1",
     config_path="libero",
     config_name="libero_spatial_starvla_eval",
 )

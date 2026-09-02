@@ -13,3 +13,4 @@ actor:
     gse:
       num_experts: 32
       num_generalized_experts: 0
+      routing_granularity: "token"

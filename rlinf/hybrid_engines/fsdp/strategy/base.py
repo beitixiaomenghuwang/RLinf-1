@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import os
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
@@ -42,6 +43,11 @@ from rlinf.utils.utils import clear_memory
 if TYPE_CHECKING:
     from rlinf.workers.actor.fsdp_actor_worker import FSDPActor
     from rlinf.workers.inference.fsdp_inference_worker import FSDPInference
+
+# Written beside a checkpoint that holds only adapter tensors. Its presence, not
+# the current config, decides how a checkpoint is loaded, so a run that switches
+# to adapter-only saving can still resume from its older full checkpoints.
+_ADAPTER_ONLY_MARKER = "adapter_only_checkpoint.json"
 
 
 class FSDPStrategyBase(ABC):
@@ -189,6 +195,7 @@ class FSDPStrategyBase(ABC):
         save_path: str,
         save_full_model_weights: bool = True,
         checkpoint_format: str = "dcp",
+        adapter_only: bool = False,
     ) -> None:
         """
         Save the training state checkpoint.
@@ -206,9 +213,22 @@ class FSDPStrategyBase(ABC):
             save_path (str): The path to save the checkpoint.
             save_full_model_weights (bool): Whether to save full model weights.
             checkpoint_format (str): "dcp" or "local_shard".
+            adapter_only (bool): Persist only the tensors being optimized, leaving
+                the frozen backbone to be reloaded from the base model path. Only
+                valid for PEFT runs, where the backbone is frozen.
         """
         clear_memory()
         torch.distributed.barrier()
+        if adapter_only and save_full_model_weights:
+            # full_weights.pt is the entire model, so writing it would restore the
+            # cost adapter-only saving exists to remove.
+            if hasattr(cls, "logger") and cls.logger is not None:
+                cls.logger.warning(
+                    "[Checkpoint] adapter_only is set, so the full-model "
+                    "full_weights.pt is not written; set "
+                    "fsdp_config.save_full_model_weights=False to silence this."
+                )
+            save_full_model_weights = False
         opts = StateDictOptions(full_state_dict=False, cpu_offload=True)
         try:
             training_state = Checkpoint(
@@ -218,6 +238,7 @@ class FSDPStrategyBase(ABC):
                 opts,
                 fsdp_version=cls.get_fsdp_version(),
                 checkpoint_format=checkpoint_format,
+                adapter_only=adapter_only,
             )
             if checkpoint_format == "local_shard":
                 local_shard_save_path = os.path.join(
@@ -247,6 +268,29 @@ class FSDPStrategyBase(ABC):
             raise e
         torch.distributed.barrier()
 
+        if adapter_only and torch.distributed.get_rank() == 0:
+            # Written only after the tensors are safely on disk, so a crash
+            # mid-save cannot leave a full checkpoint labelled adapter-only.
+            with open(
+                os.path.join(save_path, _ADAPTER_ONLY_MARKER), "w", encoding="utf-8"
+            ) as marker:
+                json.dump(
+                    {
+                        "adapter_only": True,
+                        "checkpoint_format": checkpoint_format,
+                        "note": (
+                            "Frozen base weights are omitted; resume loads them "
+                            "from the configured base model path."
+                        ),
+                    },
+                    marker,
+                    indent=2,
+                    sort_keys=True,
+                )
+                marker.write("\n")
+        if adapter_only:
+            torch.distributed.barrier()
+
         if save_full_model_weights:
             opts = StateDictOptions(full_state_dict=True, cpu_offload=True)
             sd_save_path = os.path.join(save_path, "model_state_dict")
@@ -265,6 +309,25 @@ class FSDPStrategyBase(ABC):
                     )
 
             torch.distributed.barrier()
+
+    @classmethod
+    def _detect_adapter_only_checkpoint(cls, load_path: str) -> bool:
+        """Report whether a saved checkpoint omits the frozen backbone.
+
+        Adapter-only saving is a property of the file, not of the running config:
+        a run that switches formats still has to resume from its last full
+        checkpoint. The marker is written at save time, so checkpoints predating
+        the feature are correctly read as full ones.
+        """
+        is_adapter_only = os.path.isfile(
+            os.path.join(load_path, _ADAPTER_ONLY_MARKER)
+        )
+        if is_adapter_only and hasattr(cls, "logger") and cls.logger is not None:
+            cls.logger.info(
+                f"[Checkpoint] {load_path} is adapter-only; keeping the frozen "
+                "base weights already loaded from the base model path."
+            )
+        return is_adapter_only
 
     @classmethod
     def load_checkpoint(
@@ -292,6 +355,11 @@ class FSDPStrategyBase(ABC):
             checkpoint_format (str): "dcp" or "local_shard".
         """
         opts = StateDictOptions(full_state_dict=False, cpu_offload=True)
+        # Whether the checkpoint holds only adapter tensors is a property of the
+        # file, not of the current config: a run that switches to adapter-only
+        # saving still has to resume from its last full checkpoint. Detect it
+        # from the checkpoint itself so both formats load under one code path.
+        adapter_only = cls._detect_adapter_only_checkpoint(load_path)
         training_state = Checkpoint(
             model=model,
             optimizers=optimizers,
@@ -299,6 +367,7 @@ class FSDPStrategyBase(ABC):
             opts=opts,
             fsdp_version=cls.get_fsdp_version(),
             checkpoint_format=checkpoint_format,
+            adapter_only=adapter_only,
         )
         try:
             if checkpoint_format == "local_shard":

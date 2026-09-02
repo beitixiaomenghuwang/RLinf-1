@@ -81,7 +81,26 @@ def state_dict_contains_vlm_gse(state_dict: Mapping[str, Any]) -> bool:
     )
 
 
-def _build_core_config(config: Mapping[str, Any]) -> GSEConfig:
+def _semantic_embedding_dim(model: nn.Module) -> int:
+    """Return the PaliGemma text embedding width used for semantic routing."""
+    try:
+        embedding = model.paligemma_with_expert.paligemma.get_input_embeddings()
+    except AttributeError as error:
+        raise ValueError(
+            "OpenPI GSE semantic conditioning requires PaliGemma input embeddings"
+        ) from error
+    dimension = getattr(embedding, "embedding_dim", None)
+    if dimension is None and hasattr(embedding, "weight"):
+        dimension = int(embedding.weight.shape[-1])
+    if dimension is None:
+        raise ValueError("Cannot determine OpenPI text embedding dimension")
+    return int(dimension)
+
+
+def _build_core_config(
+    config: Mapping[str, Any],
+    semantic_embedding_dim: int | None = None,
+) -> GSEConfig:
     unknown_fields = set(config) - _INTEGRATION_FIELDS - _GSE_CONFIG_FIELDS
     if unknown_fields:
         raise ValueError(f"Unknown OpenPI GSE fields: {sorted(unknown_fields)}")
@@ -90,6 +109,13 @@ def _build_core_config(config: Mapping[str, Any]) -> GSEConfig:
         for name in _GSE_CONFIG_FIELDS
         if name in config and config[name] is not None
     }
+    if bool(values.get("semantic_conditioning", False)):
+        if semantic_embedding_dim is None:
+            raise ValueError(
+                "OpenPI GSE semantic_conditioning requires a resolvable text "
+                "embedding dimension"
+            )
+        values["semantic_embedding_dim"] = semantic_embedding_dim
     values["record_routing_assignments"] = bool(
         config.get("log_task_router_metrics", False)
         or config.get("log_layerwise_task_router_metrics", False)
@@ -235,7 +261,15 @@ def configure_openpi_gse(
     ):
         raise ValueError("This GSE configuration requires a pi0.5 model")
 
-    core_config = _build_core_config(config)
+    semantic_conditioning = bool(config.get("semantic_conditioning", False)) or bool(
+        is_gse_enabled(config.get("vlm", None))
+        and isinstance(config.get("vlm"), Mapping)
+        and config["vlm"].get("semantic_conditioning", False)
+    )
+    semantic_embedding_dim = (
+        _semantic_embedding_dim(model) if semantic_conditioning else None
+    )
+    core_config = _build_core_config(config, semantic_embedding_dim)
     action_expert = get_action_expert_transformer(model)
     target_modules = tuple(config.get("target_modules", DEFAULT_ACTION_EXPERT_TARGETS))
     exclude_modules = tuple(config.get("exclude_modules", ()))
@@ -264,7 +298,7 @@ def configure_openpi_gse(
         vlm_exclusions = tuple(vlm_config.get("exclude_modules", ()))
         vlm_report = _inject_vlm_layers(
             vlm,
-            _build_core_config(vlm_config),
+            _build_core_config(vlm_config, semantic_embedding_dim),
             layer_indices,
             vlm_targets,
             vlm_exclusions,
@@ -291,6 +325,7 @@ def configure_openpi_gse(
     )
 
     model.gse_injection_report = report
+    model.gse_semantic_conditioning = semantic_conditioning
     logging.getLogger(__name__).info(
         "Injected GSE into %d OpenPI linear layers (%d action, %d VLM; %d parameters)",
         len(report.injected_module_names),

@@ -116,6 +116,18 @@ class LiberoEnv(gym.Env):
         self.use_fixed_reset_state_ids = cfg.use_fixed_reset_state_ids
         self.specific_reset_id = cfg.get("specific_reset_id", None)
         self.task_id_filter = cfg.get("task_id_filter", None)
+        task_id_start = cfg.get("task_id_start", None)
+        task_id_end = cfg.get("task_id_end", None)
+        if self.task_id_filter is None and (
+            task_id_start is not None or task_id_end is not None
+        ):
+            if task_id_start is None or task_id_end is None:
+                raise ValueError(
+                    "task_id_start and task_id_end must be provided together"
+                )
+            self.task_id_filter = list(
+                range(int(task_id_start), int(task_id_end) + 1)
+            )
         if self.task_id_filter is not None:
             self.task_id_filter = list(self.task_id_filter)
 
@@ -156,6 +168,10 @@ class LiberoEnv(gym.Env):
 
         self._init_metrics()
         self._elapsed_steps = np.zeros(self.num_envs, dtype=np.int32)
+        # Evaluation workers can exhaust their ordered task pool before the
+        # rollout budget ends. Keep those slots idle instead of stepping the
+        # terminated MuJoCo episode again.
+        self._eval_exhausted = np.zeros(self.num_envs, dtype=bool)
 
         self.video_cfg = cfg.video_cfg
         self.current_raw_obs = None
@@ -781,6 +797,7 @@ class LiberoEnv(gym.Env):
             if self.is_eval:
                 self._task_success_stats = {}
                 self._eval_seen_trials = set()
+                self._eval_exhausted[:] = False
                 self.start_idx = 0
                 pool = self.reset_state_ids_all[self.seed_offset]
                 self._eval_reset_pool = pool[pool >= 0].copy()
@@ -818,9 +835,33 @@ class LiberoEnv(gym.Env):
             actions = actions.detach().cpu().numpy()
 
         self._elapsed_steps += 1
-        raw_obs, _reward, terminations, info_lists = self.env.step(actions)
-        self.current_raw_obs = raw_obs
-        infos = list_of_dict_to_dict_of_list(info_lists)
+        active_mask = ~self._eval_exhausted if self.is_eval else np.ones(
+            self.num_envs, dtype=bool
+        )
+        if active_mask.all():
+            raw_obs, _reward, terminations, info_lists = self.env.step(actions)
+            self.current_raw_obs = raw_obs
+            infos = list_of_dict_to_dict_of_list(info_lists)
+        elif not active_mask.any():
+            raw_obs = self.current_raw_obs
+            terminations = np.zeros(self.num_envs, dtype=bool)
+            info_lists = [{} for _ in range(self.num_envs)]
+            infos = list_of_dict_to_dict_of_list(info_lists)
+        else:
+            active_env_idx = np.flatnonzero(active_mask)
+            active_obs, _reward, active_terminations, active_info_lists = (
+                self.env.step(actions[active_mask], id=active_env_idx)
+            )
+            raw_obs = list(self.current_raw_obs)
+            for i, env_idx in enumerate(active_env_idx):
+                raw_obs[env_idx] = active_obs[i]
+            self.current_raw_obs = raw_obs
+            terminations = np.zeros(self.num_envs, dtype=bool)
+            terminations[active_mask] = active_terminations
+            info_lists = [{} for _ in range(self.num_envs)]
+            for i, env_idx in enumerate(active_env_idx):
+                info_lists[env_idx] = active_info_lists[i]
+            infos = list_of_dict_to_dict_of_list(info_lists)
         truncations = self.elapsed_steps >= self.cfg.max_episode_steps
         obs = self._wrap_obs(raw_obs)
 
@@ -934,8 +975,10 @@ class LiberoEnv(gym.Env):
         new_reset_state_ids = self._get_ordered_reset_state_ids(len(env_idx))
         valid_mask = new_reset_state_ids >= 0
         env_to_reset = env_idx[valid_mask]
+        self._eval_exhausted[env_idx[~valid_mask]] = True
         if len(env_to_reset) > 0:
             self.reset_state_ids[env_to_reset] = new_reset_state_ids[valid_mask]
+            self._eval_exhausted[env_to_reset] = False
             obs, infos = self.reset(
                 env_idx=env_to_reset,
                 reset_state_ids=self.reset_state_ids[env_to_reset],

@@ -9,12 +9,13 @@ runner:
     experiment_name: "metaworld_50_pi05_gse_action_r32_svd_no_router"
   max_epochs: 160
   val_check_interval: 20
-  save_interval: 20
+  save_interval: 10
 
 actor:
   model:
     gse:
       routing_mode: "uniform"
+      routing_granularity: "token"
       num_generalized_experts: 8
       log_router_metrics: false
       log_task_router_metrics: false

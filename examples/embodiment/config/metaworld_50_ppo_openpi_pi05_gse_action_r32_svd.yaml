@@ -2,22 +2,38 @@ defaults:
   - metaworld_50_ppo_openpi_pi05_gse_action_r32
   - _self_
 
-# Action-only rank-32 GSE with full SVD factors and a frozen initial baseline.
-# Subtracting that baseline preserves the SFT policy at initialization while
-# all rank-32 A/B factors remain trainable. The total rank is split across two
-# generalized and six specialized experts.
+# Action-only rank-32 GSE with balanced full-SVD factors. A frozen copy of each
+# initialized expert is subtracted under the same route, so every step-0 sample
+# exactly matches the SFT policy while both live factors remain trainable.
 runner:
   logger:
     experiment_name: "metaworld_50_pi05_gse_action_r32_svd_2g6s"
   max_epochs: 240
   val_check_interval: 20
-  save_interval: 20
+  save_interval: 10
 
 actor:
   model:
     gse:
       initialization: "svd"
+      # scaling_mode "gse" makes scaling_for_rank return
+      #   sqrt(3 * gse_eta * in_features / expert_rank)
+      # (rlinf/models/peft/gse/config.py:139-140), so lora_alpha is NEVER READ on
+      # this branch -- setting it anywhere below this file is inert. Two
+      # consequences worth stating, because both have been misread before:
+      #   1. The scaling is NOT 1.0. Measured with gse_eta=1.0 and 8 experts:
+      #      27.71 at total_rank 32, 19.60 at 64, 13.86 at 128 (in_features=1024;
+      #      double each for in_features=4096).
+      #   2. It shrinks as 1/sqrt(expert_rank), so a bare total_rank sweep moves
+      #      capacity AND residual magnitude at once. To vary capacity alone, set
+      #      gse_eta = expert_rank / 4 (2.0 at rank 64, 4.0 at rank 128) to
+      #      reproduce the rank-32 scaling.
+      scaling_mode: "gse"
+      gse_eta: 1.0
+      svd_rho: 10.0
+      preserve_svd_output: True
       num_experts: 8
       num_generalized_experts: 2
       top_k: 2
       init_seed: 42
+      routing_granularity: "token"

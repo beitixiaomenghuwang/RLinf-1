@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from ..router_fsdp import mark_adapter_router
 from .config import GSEConfig
 from .context import get_gse_routing_context
 from .initialization import initialize_expert_factors, initialize_router
@@ -21,44 +22,42 @@ class GSEExpert(nn.Module):
         rank: int,
         dropout: float,
         scaling: float,
-        preserve_initial_output: bool,
     ) -> None:
         super().__init__()
         self.lora_a = nn.Linear(in_features, rank, bias=False)
         self.lora_b = nn.Linear(rank, out_features, bias=False)
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
-        self.preserve_initial_output = preserve_initial_output
-        if preserve_initial_output:
-            self.register_buffer(
-                "initial_lora_a",
-                torch.empty_like(self.lora_a.weight),
-                persistent=False,
-            )
-            self.register_buffer(
-                "initial_lora_b",
-                torch.empty_like(self.lora_b.weight),
-                persistent=False,
-            )
         self.register_buffer("scaling", torch.tensor(float(scaling)))
+        self.register_buffer("initial_lora_a", None, persistent=False)
+        self.register_buffer("initial_lora_b", None, persistent=False)
 
     @torch.no_grad()
-    def capture_initial_factors(self) -> None:
-        """Capture the immutable SVD factors used as the zero-output baseline."""
-        if self.preserve_initial_output:
-            self.initial_lora_a.copy_(self.lora_a.weight)
-            self.initial_lora_b.copy_(self.lora_b.weight)
+    def preserve_initial_output(self) -> None:
+        """Freeze the initialized factors as a non-persistent output baseline."""
+        self.initial_lora_a = self.lora_a.weight.detach().clone()
+        self.initial_lora_b = self.lora_b.weight.detach().clone()
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         """Apply the low-rank residual transformation."""
+        residual, _ = self.forward_components(inputs)
+        return residual
+
+    def forward_components(
+        self, inputs: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Return the trainable residual and its frozen initial component."""
         adapter_inputs = inputs.to(self.lora_a.weight.dtype)
         adapter_inputs = self.dropout(adapter_inputs)
         outputs = self.lora_b(self.lora_a(adapter_inputs))
-        if self.preserve_initial_output:
-            initial_outputs = F.linear(
-                F.linear(adapter_inputs, self.initial_lora_a), self.initial_lora_b
-            )
+        initial_outputs = None
+        if self.initial_lora_a is not None and self.initial_lora_b is not None:
+            initial_hidden = F.linear(adapter_inputs, self.initial_lora_a)
+            initial_outputs = F.linear(initial_hidden, self.initial_lora_b)
             outputs = outputs - initial_outputs
-        return outputs * self.scaling
+        scaled_initial = (
+            None if initial_outputs is None else initial_outputs * self.scaling
+        )
+        return outputs * self.scaling, scaled_initial
 
 
 class GSEAdapter(nn.Module):
@@ -93,8 +92,7 @@ class GSEAdapter(nn.Module):
                 out_features,
                 rank,
                 config.lora_dropout,
-                config.scaling_for_rank(rank),
-                config.initialization == "svd",
+                config.scaling_for_rank(rank, in_features),
             )
             for rank in ranks
         ]
@@ -107,9 +105,12 @@ class GSEAdapter(nn.Module):
         self.register_buffer(
             "_rank_expert_indices", rank_expert_indices, persistent=False
         )
+        router_in_features = (
+            config.total_rank if config.router_input == "rank_rms" else in_features
+        )
         self.router = (
             nn.Linear(
-                in_features,
+                router_in_features,
                 config.num_specialized_experts,
                 bias=config.router_bias,
             )
@@ -135,13 +136,20 @@ class GSEAdapter(nn.Module):
             seed=config.init_seed,
             orthogonal_gain=config.orthogonal_gain,
             base_weight=base_weight,
+            scalings=[float(expert.scaling) for expert in experts],
+            svd_rho=config.svd_rho,
         )
-        for expert in experts:
-            expert.capture_initial_factors()
+        if config.initialization == "svd":
+            if config.preserve_svd_output:
+                for expert in experts:
+                    expert.preserve_initial_output()
+            else:
+                self._adjust_base_weight_for_svd(base_weight, experts, split)
         if config.num_specialized_experts > 0:
             router_seed = None if config.init_seed is None else config.init_seed + 1
             initialize_router(
                 self.router,
+                method=config.router_initialization,
                 standard_deviation=config.router_init_std,
                 seed=router_seed,
             )
@@ -151,10 +159,48 @@ class GSEAdapter(nn.Module):
             if config.semantic_conditioning and config.num_specialized_experts > 0:
                 initialize_router(
                     self.semantic_router,
+                    method=config.router_initialization,
                     standard_deviation=config.router_init_std,
                     seed=None if router_seed is None else router_seed + 1,
                 )
+        # Give each router its own FSDP unit so optim.gse_router_lr can still
+        # find it by name; see rlinf/models/peft/router_fsdp.py.
+        mark_adapter_router(self.router)
+        mark_adapter_router(self.semantic_router)
         self.to(device=device, dtype=dtype)
+
+    @staticmethod
+    @torch.no_grad()
+    def _adjust_base_weight_for_svd(
+        base_weight: torch.Tensor,
+        experts: list[GSEExpert],
+        num_generalized_experts: int,
+    ) -> None:
+        """Subtract the expected initialized GSE contribution from the base.
+
+        This legacy mode averages the always-on generalized experts and the
+        routed experts under a uniform router prior. Exact per-sample
+        preservation uses frozen expert baselines instead.
+        """
+        num_specialized = len(experts) - num_generalized_experts
+        residual = torch.zeros_like(base_weight, dtype=torch.float32)
+        if num_generalized_experts:
+            generalized = sum(
+                expert.scaling.float()
+                * (expert.lora_b.weight.float() @ expert.lora_a.weight.float())
+                for expert in experts[:num_generalized_experts]
+            )
+            residual.add_(generalized / num_generalized_experts)
+        if num_specialized:
+            specialized = sum(
+                expert.scaling.float()
+                * (expert.lora_b.weight.float() @ expert.lora_a.weight.float())
+                for expert in experts[num_generalized_experts:]
+            )
+            residual.add_(specialized / num_specialized)
+        base_weight.sub_(
+            residual.to(device=base_weight.device, dtype=base_weight.dtype)
+        )
 
     @property
     def all_experts(self) -> tuple[GSEExpert, ...]:
@@ -197,7 +243,10 @@ class GSEAdapter(nn.Module):
         return residual / len(self.generalized_experts)
 
     def _routing_probabilities(self, routing_inputs: torch.Tensor) -> torch.Tensor:
-        logits = self.router(routing_inputs.to(self.router.weight.dtype))
+        # The dtype cast lives in the router's forward pre-hook, not here: once
+        # the router is its own FSDP unit, reading router.weight.dtype from the
+        # caller sees the pre-unshard dtype. See peft/router_fsdp.py.
+        logits = self.router(routing_inputs)
         if self.config.semantic_conditioning:
             context = get_gse_routing_context()
             if context is not None and context.semantic_embeddings is not None:
@@ -207,9 +256,7 @@ class GSEAdapter(nn.Module):
                 raise RuntimeError(
                     "semantic_conditioning=True requires an active GSE routing context"
                 )
-            semantic_logits = self.semantic_router(
-                semantic.to(self.semantic_router.weight.dtype)
-            )
+            semantic_logits = self.semantic_router(semantic)
             if semantic_logits.shape[0] != logits.shape[0]:
                 if logits.shape[0] % semantic_logits.shape[0] != 0:
                     raise ValueError(
@@ -295,35 +342,41 @@ class GSEAdapter(nn.Module):
         experts: tuple[GSEExpert, ...],
         expert_weights: torch.Tensor,
         rank_expert_indices: torch.Tensor,
+        rank_hidden: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Evaluate weighted experts with two fused low-rank projections."""
-        lora_a = torch.cat([expert.lora_a.weight for expert in experts], dim=0)
         lora_b = torch.cat([expert.lora_b.weight for expert in experts], dim=1)
-        adapter_inputs = inputs.to(lora_a.dtype)
-        hidden = F.linear(adapter_inputs, lora_a)
+        if rank_hidden is None:
+            lora_a = torch.cat([expert.lora_a.weight for expert in experts], dim=0)
+            rank_hidden = F.linear(inputs.to(lora_a.dtype), lora_a)
 
-        rank_weights = expert_weights.to(hidden.dtype).index_select(
+        rank_weights = expert_weights.to(rank_hidden.dtype).index_select(
             -1, rank_expert_indices
         )
-        while rank_weights.ndim < hidden.ndim:
+        while rank_weights.ndim < rank_hidden.ndim:
             rank_weights = rank_weights.unsqueeze(-2)
         rank_scaling = torch.stack([expert.scaling for expert in experts]).index_select(
             0, rank_expert_indices
         )
-        weighted_hidden = hidden * rank_weights * rank_scaling
+        weighted_hidden = rank_hidden * rank_weights * rank_scaling
         residual = F.linear(weighted_hidden, lora_b)
 
-        if experts[0].preserve_initial_output:
+        if experts[0].initial_lora_a is not None:
             initial_lora_a = torch.cat(
                 [expert.initial_lora_a for expert in experts], dim=0
             )
             initial_lora_b = torch.cat(
                 [expert.initial_lora_b for expert in experts], dim=1
             )
-            initial_hidden = F.linear(adapter_inputs, initial_lora_a)
-            weighted_initial_hidden = initial_hidden * rank_weights * rank_scaling
-            initial_residual = F.linear(weighted_initial_hidden, initial_lora_b)
-            residual = residual - initial_residual
+            initial_hidden = F.linear(inputs.to(initial_lora_a.dtype), initial_lora_a)
+            # Numerically subtract the same routed initialization, but detach
+            # only its gate weights. This preserves the SFT function exactly
+            # while giving the router the live-expert gradient used by GSE.
+            weighted_initial_hidden = (
+                initial_hidden * rank_weights.detach() * rank_scaling
+            )
+            residual = residual - F.linear(weighted_initial_hidden, initial_lora_b)
+
         return residual
 
     def _fused_routed_residual(
@@ -331,6 +384,7 @@ class GSEAdapter(nn.Module):
         inputs: torch.Tensor,
         weights: torch.Tensor,
         indices: torch.Tensor,
+        rank_hidden: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if self.config.routing_mode == "all":
             specialized_weights = weights
@@ -354,6 +408,7 @@ class GSEAdapter(nn.Module):
             self.all_experts,
             expert_weights,
             self._rank_expert_indices,
+            rank_hidden,
         )
 
     def _record_routing(
@@ -364,9 +419,10 @@ class GSEAdapter(nn.Module):
         num_experts = len(self.specialized_experts)
         counts = torch.bincount(selected_experts.reshape(-1), minlength=num_experts)
         fractions = counts.float() / selected_experts.numel()
+        expert_loads = counts.float() / probabilities.shape[0]
         mean_probabilities = probabilities.mean(dim=0)
         self._load_balancing_loss = num_experts * torch.sum(
-            fractions.to(mean_probabilities) * mean_probabilities
+            expert_loads.to(mean_probabilities) * mean_probabilities
         )
         entropy = -torch.sum(
             probabilities * probabilities.clamp_min(1e-12).log(), dim=-1
@@ -403,10 +459,16 @@ class GSEAdapter(nn.Module):
             item_indices, slots = torch.where(indices == expert_index)
             if item_indices.numel() == 0:
                 continue
-            expert_outputs = expert(flattened[item_indices]).to(residual.dtype)
-            residual[item_indices] += (
-                weights[item_indices, slots, None].to(residual.dtype) * expert_outputs
+            expert_outputs, initial_outputs = expert.forward_components(
+                flattened[item_indices]
             )
+            selected_weights = weights[item_indices, slots, None].to(residual.dtype)
+            weighted_outputs = selected_weights * expert_outputs.to(residual.dtype)
+            if initial_outputs is not None:
+                weighted_outputs += (
+                    selected_weights - selected_weights.detach()
+                ) * initial_outputs.to(residual.dtype)
+            residual[item_indices] += weighted_outputs
         specialized = residual.reshape(*inputs.shape[:-1], self.out_features)
         return self._generalized_residual(inputs).to(inputs.dtype) + specialized
 
@@ -420,14 +482,33 @@ class GSEAdapter(nn.Module):
             return sequences[:, -1]
         return sequences.mean(dim=1)
 
+    def _rank_space_hidden(self, inputs: torch.Tensor) -> torch.Tensor:
+        lora_a = torch.cat([expert.lora_a.weight for expert in self.all_experts], dim=0)
+        return F.linear(inputs.to(lora_a.dtype), lora_a)
+
+    def _rank_space_rms_context(self, rank_hidden: torch.Tensor) -> torch.Tensor:
+        """RMS-pool concatenated expert rank projections per sequence."""
+        hidden = rank_hidden.float()
+        if rank_hidden.ndim <= 2:
+            return hidden.reshape(-1, self.config.total_rank).abs()
+        sequences = hidden.reshape(hidden.shape[0], -1, self.config.total_rank)
+        return sequences.square().mean(dim=1).sqrt()
+
     def _sequence_routed_residual(self, inputs: torch.Tensor) -> torch.Tensor:
-        context = self._sequence_context(inputs)
+        rank_hidden = None
+        if self.config.router_input == "rank_rms":
+            rank_hidden = self._rank_space_hidden(inputs)
+            context = self._rank_space_rms_context(rank_hidden)
+        else:
+            context = self._sequence_context(inputs)
         probabilities = self._routing_probabilities(context)
         weights, indices = self._select_experts(probabilities)
         if self._can_fuse_experts(self.all_experts):
             fused_inputs = inputs if inputs.ndim > 1 else inputs.unsqueeze(0)
+            if rank_hidden is not None and inputs.ndim == 1:
+                rank_hidden = rank_hidden.unsqueeze(0)
             fused_residual = self._fused_routed_residual(
-                fused_inputs, weights, indices
+                fused_inputs, weights, indices, rank_hidden
             ).to(inputs.dtype)
             return fused_residual if inputs.ndim > 1 else fused_residual.squeeze(0)
         residual = inputs.new_zeros(*inputs.shape[:-1], self.out_features)
@@ -438,14 +519,23 @@ class GSEAdapter(nn.Module):
             sequence_indices, slots = torch.where(indices == expert_index)
             if sequence_indices.numel() == 0:
                 continue
-            expert_outputs = expert(routed_inputs[sequence_indices]).to(
-                routed_residual.dtype
+            expert_outputs, initial_outputs = expert.forward_components(
+                routed_inputs[sequence_indices]
             )
             shape = (sequence_indices.shape[0],) + (1,) * (expert_outputs.ndim - 1)
-            selected_weights = weights[sequence_indices, slots].reshape(shape)
-            routed_residual[sequence_indices] += (
-                selected_weights.to(routed_residual.dtype) * expert_outputs
+            selected_weights = (
+                weights[sequence_indices, slots]
+                .reshape(shape)
+                .to(routed_residual.dtype)
             )
+            weighted_outputs = selected_weights * expert_outputs.to(
+                routed_residual.dtype
+            )
+            if initial_outputs is not None:
+                weighted_outputs += (
+                    selected_weights - selected_weights.detach()
+                ) * initial_outputs.to(routed_residual.dtype)
+            routed_residual[sequence_indices] += weighted_outputs
         specialized = routed_residual if inputs.ndim > 1 else routed_residual.squeeze(0)
         return self._generalized_residual(inputs).to(inputs.dtype) + specialized
 

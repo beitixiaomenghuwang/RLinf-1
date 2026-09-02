@@ -9,8 +9,12 @@ runner:
     experiment_name: "metaworld_50_pi05_gse_action_r32"
   max_epochs: 240
   val_check_interval: 20
-  save_interval: 20
-  max_checkpoints_to_keep: 4
+  save_interval: 10
+  # No cap: adapter-only checkpoints are ~110 MiB, so keeping the whole
+  # training trajectory costs less than a single old 17G full checkpoint and
+  # lets any step be re-evaluated later. null disables pruning entirely
+  # (prune_old_checkpoints returns early on None).
+  max_checkpoints_to_keep: null
   resume_dir: null
 
 algorithm:
@@ -33,6 +37,14 @@ actor:
       total_rank: 32
       lora_alpha: 32.0
       train_action_adapters: True
+      routing_granularity: "token"
+      # Judge router specialization by the layerwise metrics, not the aggregate
+      # ones. gse_task_router_metrics_from_tensor sums the packed statistics over
+      # all injected layers before computing nmi/cramers_v, so layers with
+      # opposing task preferences cancel: a run measured 0.02 aggregate
+      # adjusted_cramers_v against 0.21 layerwise mean and 0.41 layerwise max.
+      # Read layerwise_{nmi,adjusted_cramers_v}_{mean,p90,max} and
+      # layerwise_informative_fraction.
       log_task_router_metrics: True
       log_layerwise_task_router_metrics: True
       task_router_num_tasks: 50

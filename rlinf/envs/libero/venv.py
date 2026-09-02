@@ -49,10 +49,9 @@ if libero_type == "pro":
 elif libero_type == "plus":
     try:
         from liberoplus.liberoplus.envs import OffScreenRenderEnv
-    except ImportError as e:
-        print(
-            f"[Venv] Warning: LIBERO_TYPE=plus but import failed ({e}). Falling back to standard libero..."
-        )
+    except ImportError:
+        # The upstream LIBERO-Plus fork keeps the import name ``libero``;
+        # only the RLinf fork uses the optional ``liberoplus`` namespace.
         from libero.libero.envs import OffScreenRenderEnv
 
 else:

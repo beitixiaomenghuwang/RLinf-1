@@ -9,9 +9,10 @@ runner:
     experiment_name: "metaworld_50_pi05_gse_action_r32_svd_random0"
   max_epochs: 160
   val_check_interval: 20
-  save_interval: 20
+  save_interval: 10
 
 actor:
   model:
     gse:
       initialization: "kaiming_zero"
+      routing_granularity: "token"

@@ -16,7 +16,7 @@ import math
 import random
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import nullcontext
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -32,6 +32,7 @@ from torch.utils._pytree import tree_map
 from rlinf.models.embodiment.base_policy import BasePolicy, ForwardType
 from rlinf.models.embodiment.modules.explore_noise_net import ExploreNoiseNet
 from rlinf.models.embodiment.modules.value_head import ValueHead
+from rlinf.models.peft.gse import gse_routing_context
 from rlinf.models.peft.ortho_hydra import ortho_hydra_routing_context
 from rlinf.utils.logging import get_logger
 from rlinf.utils.nested_dict_process import copy_dict_tensor
@@ -462,14 +463,15 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             )
             return prefix_output, suffix_out
 
-        prefix_output, suffix_out = self._apply_checkpoint(
-            forward_func,
-            prefix_embs,
-            suffix_embs,
-            att_2d_masks_4d,
-            position_ids,
-            adarms_cond,
-        )
+        with self._adapter_routing_contexts():
+            prefix_output, suffix_out = self._apply_checkpoint(
+                forward_func,
+                prefix_embs,
+                suffix_embs,
+                att_2d_masks_4d,
+                position_ids,
+                adarms_cond,
+            )
 
         suffix_out = suffix_out[:, -self.config.action_horizon :]
         suffix_out = suffix_out.to(dtype=torch.float32)
@@ -1191,13 +1193,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             "eager"  # noqa: SLF001
         )
 
-        semantic_embeddings = getattr(self, "_ortho_hydra_semantic_embeddings", None)
-        routing_context = (
-            ortho_hydra_routing_context(semantic_embeddings)
-            if semantic_embeddings is not None
-            else nullcontext()
-        )
-        with routing_context:
+        with self._adapter_routing_contexts():
             outputs_embeds, _ = self.paligemma_with_expert.forward(
                 attention_mask=full_att_2d_masks_4d,
                 position_ids=position_ids,
@@ -1240,23 +1236,47 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
 
     def embed_prefix(self, images, img_masks, lang_tokens, lang_masks):
         """Embed the prefix and cache frozen text semantics when requested."""
-        self._cache_ortho_hydra_semantics(lang_tokens, lang_masks)
+        self._cache_adapter_semantics(lang_tokens, lang_masks)
         return super().embed_prefix(images, img_masks, lang_tokens, lang_masks)
 
+    def _adapter_routing_contexts(self) -> ExitStack:
+        """Expose cached prompt semantics to whichever adapters requested them."""
+        stack = ExitStack()
+        ortho_hydra_embeddings = getattr(self, "_ortho_hydra_semantic_embeddings", None)
+        if ortho_hydra_embeddings is not None:
+            stack.enter_context(ortho_hydra_routing_context(ortho_hydra_embeddings))
+        gse_embeddings = getattr(self, "_gse_semantic_embeddings", None)
+        if gse_embeddings is not None:
+            stack.enter_context(gse_routing_context(gse_embeddings))
+        return stack
+
     @torch.no_grad()
-    def _cache_ortho_hydra_semantics(self, lang_tokens, lang_masks) -> None:
-        """Cache one frozen text embedding per sequence for all denoising steps."""
-        if not bool(getattr(self, "ortho_hydra_semantic_conditioning", False)):
+    def _cache_adapter_semantics(self, lang_tokens, lang_masks) -> None:
+        """Cache one frozen text embedding per sequence for all denoising steps.
+
+        The prefix is embedded once per action selection while the action expert
+        runs for every denoising step, so pooling here keeps the routing signal
+        constant across the steps of one chunk.
+        """
+        wants_ortho_hydra = bool(
+            getattr(self, "ortho_hydra_semantic_conditioning", False)
+        )
+        wants_gse = bool(getattr(self, "gse_semantic_conditioning", False))
+        if not (wants_ortho_hydra or wants_gse):
             return
         if lang_tokens is None or lang_masks is None:
-            raise ValueError("OpenPI Ortho-Hydra requires tokenized prompts")
+            raise ValueError("OpenPI semantic conditioning requires tokenized prompts")
         embedding_layer = self.paligemma_with_expert.paligemma.get_input_embeddings()
         embeddings = embedding_layer(lang_tokens)
         mask = lang_masks.to(device=embeddings.device, dtype=embeddings.dtype)
-        self._ortho_hydra_semantic_embeddings = (
+        pooled = (
             (embeddings * mask.unsqueeze(-1)).sum(dim=1)
             / mask.sum(dim=1, keepdim=True).clamp_min(1)
         ).detach()
+        if wants_ortho_hydra:
+            self._ortho_hydra_semantic_embeddings = pooled
+        if wants_gse:
+            self._gse_semantic_embeddings = pooled
 
     def _compute_value_from_suffix(self, suffix_out):
         """Compute value from suffix output using value head."""
