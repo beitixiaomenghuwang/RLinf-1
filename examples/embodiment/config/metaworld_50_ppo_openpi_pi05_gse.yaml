@@ -172,6 +172,13 @@ actor:
     lr_warmup_steps: -1
     lr_scheduler: "cosine"
     num_cycles: 0.5
+    # Decay each param group to 10% of its own initial lr. Expressed as a RATE,
+    # not min_lr: transformers computes min_lr_rate = min_lr / optimizer.defaults["lr"],
+    # and build_optimizer sets lr only per param group, so defaults["lr"] stays at
+    # torch AdamW's own 1e-3. An absolute min_lr is therefore divided by 1e-3
+    # regardless of the configured lrs, which silently rescales the floor whenever
+    # a group lr changes. min_lr_rate bypasses that division entirely.
+    min_lr_rate: 0.1
 
   fsdp_config:
     # A PEFT checkpoint is dominated by the frozen backbone, re-saved verbatim at

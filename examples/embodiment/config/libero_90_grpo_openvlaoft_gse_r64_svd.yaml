@@ -207,13 +207,23 @@ actor:
   optim:
     # Whole-model GSE freezes the dense base, so every trainable policy
     # parameter belongs to the GSE optimizer group below.
-    lr: 2.0e-5
-    gse_lr: 6e-5
+    # actor.optim.lr is deliberately absent. freeze_base + train_value_head:False
+    # leave no parameter outside the adapter/router groups, so build_optimizer
+    # never creates the actor param group that would read it
+    # (fsdp_model_manager.py: `if len(params_actor) > 0`). Adding it back would
+    # look like a real knob while changing nothing.
+    gse_lr: 8e-5
     total_training_steps: ${runner.max_steps}
     lr_warmup_steps: 0
     lr_scheduler: "cosine"
     num_cycles: 0.5
-    min_lr: 1.0e-6
+    # Decay each param group to 10% of its own initial lr. Expressed as a RATE,
+    # not min_lr: transformers computes min_lr_rate = min_lr / optimizer.defaults["lr"],
+    # and build_optimizer sets lr only per param group, so defaults["lr"] stays at
+    # torch AdamW's own 1e-3. An absolute min_lr is therefore divided by 1e-3
+    # regardless of the configured lrs, which silently rescales the floor whenever
+    # a group lr changes. min_lr_rate bypasses that division entirely.
+    min_lr_rate: 0.1
     # Warm-restart only: preserve Adam state but start a fresh LR schedule.
     reset_lr_scheduler_on_resume: False
     adam_beta1: 0.9

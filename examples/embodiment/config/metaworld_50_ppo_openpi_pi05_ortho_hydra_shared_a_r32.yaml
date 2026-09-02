@@ -147,7 +147,6 @@ actor:
       lora_alpha: 32.0
       num_experts: 8
       parameterization: "shared_a"
-      routing_granularity: "token"
       # Dense softmax uses all experts and fuses RMS-pooled rank-32 hidden
       # states with the frozen text embedding.
       semantic_router_scale: 1.0

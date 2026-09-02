@@ -24,10 +24,15 @@ actor:
       #   1. The scaling is NOT 1.0. Measured with gse_eta=1.0 and 8 experts:
       #      27.71 at total_rank 32, 19.60 at 64, 13.86 at 128 (in_features=1024;
       #      double each for in_features=4096).
-      #   2. It shrinks as 1/sqrt(expert_rank), so a bare total_rank sweep moves
-      #      capacity AND residual magnitude at once. To vary capacity alone, set
-      #      gse_eta = expert_rank / 4 (2.0 at rank 64, 4.0 at rank 128) to
-      #      reproduce the rank-32 scaling.
+      #   2. It shrinks as 1/sqrt(expert_rank), which is the method, not an
+      #      artifact: rank x scaling^2 = 3*gse_eta*in_features is held constant,
+      #      so a low-rank expert gets a proportionally larger residual. Keep
+      #      gse_eta at 1.0 across the rank sweep. Do NOT rescale eta per rank to
+      #      "hold the scaling fixed" -- that reproduces neither the official GSE
+      #      repo (VLA-GSE hardcodes this formula under init_type="gse" and has
+      #      no scaling_mode knob) nor a clean ablation. A capacity-only ablation
+      #      belongs on scaling_mode: "total_rank" with lora_alpha = expert_rank,
+      #      not on a distorted eta.
       scaling_mode: "gse"
       gse_eta: 1.0
       svd_rho: 10.0
