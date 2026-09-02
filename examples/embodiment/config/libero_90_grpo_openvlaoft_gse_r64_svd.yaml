@@ -153,20 +153,44 @@ actor:
       scope: whole_model
       target_modules: all-linear
       freeze_vision_backbone: True
-      total_rank: 32
+      total_rank: 64
       lora_alpha: 32.0
       num_experts: 8
       num_generalized_experts: 1
       # Standard GSE routing uses hidden states without text conditioning.
       semantic_conditioning: False
-      semantic_router_scale: 1.0
-      routing_granularity: "token"
-      action_sequence_routing: True
       # The selected experts are evaluated together by the fused GSE path.
       top_k: 2
       initialization: "svd"
       init_seed: 42
       freeze_base: True
+      # GSE-specific scaling: sqrt(3 * gse_eta * in_features / expert_rank).
+      # This makes lora_alpha ignored and compensates for rank limitations.
+      # Measured with gse_eta=1.0 and 8 experts: 27.71 at total_rank 32,
+      # 19.60 at 64, 13.86 at 128 (in_features=1024). The scaling shrinks as
+      # 1/sqrt(expert_rank), so rank × scaling² = constant (VLA-GSE design).
+      scaling_mode: "gse"
+      gse_eta: 1.0
+      svd_rho: 10.0
+      preserve_svd_output: True
+      # Token-level routing: one routing decision per token, matching the
+      # official GSE method. action_sequence_routing is removed.
+      routing_mode: "topk"
+      routing_granularity: "token"
+      sequence_pooling: "mean"
+      router_input: "hidden"
+      # Match the official GSE repo: kaiming_uniform_(a=sqrt(5)) =
+      # uniform(+/-1/sqrt(in_features)), std 1/sqrt(3*in_features). The scale
+      # tracks in_features automatically, unlike a fixed router_init_std.
+      router_initialization: "default"
+      # Nonzero dropout disables the fused two-matmul expert path and falls
+      # back to a per-expert Python loop, roughly doubling actor training time.
+      lora_dropout: 0.0
+      # The Switch-style load-balancing term is minimized at uniform routing,
+      # so it opposes task specialization. Measured at coef 0.01-0.02 it
+      # dominated the PPO objective by more than an order of magnitude.
+      load_balancing_loss_coef: 0.0
+      orthogonality_loss_coef: 0.0
       # Match the MetaWorld GSE diagnostic surface: aggregate and layerwise
       # task/router statistics are emitted under train/gse/*.
       log_router_metrics: True
@@ -175,11 +199,6 @@ actor:
       task_router_num_tasks: 90
       task_router_informative_nmi_threshold: 0.01
       train_value_head: False
-      # Both regularizers are diagnostics only in the formal run. SVD uses the
-      # original GSE expectation-preserving base adjustment, so routed expert
-      # differences and router gradients are live from step 0.
-      load_balancing_loss_coef: 0.0
-      orthogonality_loss_coef: 0.0
       # With FSDP full_shard/use_orig_params=False, original parameter views
       # cannot be inspected safely outside forward. Measure A-factor
       # orthogonality offline from saved checkpoints instead.
@@ -189,7 +208,7 @@ actor:
     # Whole-model GSE freezes the dense base, so every trainable policy
     # parameter belongs to the GSE optimizer group below.
     lr: 2.0e-5
-    gse_lr: 5e-5
+    gse_lr: 6e-5
     total_training_steps: ${runner.max_steps}
     lr_warmup_steps: 0
     lr_scheduler: "cosine"
@@ -202,6 +221,20 @@ actor:
     adam_eps: 1.0e-08
     weight_decay: 0.01
     clip_grad: 1.0
+    # The router is a single Linear(width, num_experts) whose gradient arrives
+    # only through the routing weights, so at the shared 2e-5 it barely moves
+    # while the expert factors train. Give it its own param group at 1e-3,
+    # matching the MetaWorld GSE configuration.
+    gse_router_lr: 1.0e-3
+    # Weight decay on a softmax router shrinks logits toward zero, which is a
+    # pull toward UNIFORM routing -- the same direction as the load-balancing
+    # loss this experiment sets to 0.0. So it cannot be large. But 1e-3 is 50x
+    # the base lr, and an unregularized router can saturate its softmax into
+    # hard routing with dead experts. 0.01 (the global value) shrinks weights
+    # ~3% over 3000 optimizer steps: enough to bound logit growth, far too weak
+    # to force uniformity. Raise only if router logits diverge; do not raise to
+    # "encourage balance", that is what killed specialization before.
+    gse_router_weight_decay: 0.01
 
   fsdp_config:
     # A PEFT checkpoint is dominated by the frozen backbone, re-saved verbatim at
