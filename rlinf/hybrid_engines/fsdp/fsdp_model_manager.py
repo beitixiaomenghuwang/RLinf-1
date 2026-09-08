@@ -360,9 +360,38 @@ class FSDPModelManager:
             # preserve Adam moments without inheriting the old LR schedule.
             initial_lrs = [group["lr"] for group in self.optimizer.param_groups]
 
+        # `Optimizer.load_state_dict` restores the checkpoint's param_group
+        # HYPER-PARAMETERS too, not just the moments, so a resume silently
+        # reverts betas/eps/weight_decay to whatever the run that wrote the
+        # checkpoint used. That makes a config change to adam_beta2 a no-op on
+        # resume with no warning at all -- the same class of trap as the LR
+        # being restored from the checkpoint. Capture the configured values and
+        # write them back afterwards.
+        configured_hparams = [
+            {
+                "betas": group.get("betas"),
+                "eps": group.get("eps"),
+                "weight_decay": group.get("weight_decay"),
+            }
+            for group in self.optimizer.param_groups
+        ]
+
         self._strategy.load_checkpoint(
             self.model, self.optimizer, self.lr_scheduler, load_path
         )
+
+        if len(configured_hparams) == len(self.optimizer.param_groups):
+            for group, wanted in zip(
+                self.optimizer.param_groups, configured_hparams, strict=True
+            ):
+                for name, value in wanted.items():
+                    if value is not None and group.get(name) != value:
+                        self._logger.info(
+                            f"[FSDP] Restoring configured optimizer {name}="
+                            f"{value} after resume (checkpoint had "
+                            f"{group.get(name)})"
+                        )
+                        group[name] = value
 
         if initial_lrs is not None:
             if len(initial_lrs) != len(self.optimizer.param_groups):

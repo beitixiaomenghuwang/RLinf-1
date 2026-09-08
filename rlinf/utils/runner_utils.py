@@ -41,8 +41,25 @@ def check_progress(
     is_train_end = step == max_steps
 
     if is_validation_enabled:
-        assert save_interval < 0 or save_interval % val_check_interval == 0, (
-            f"{save_interval=} must be divisible by {val_check_interval=}"
+        # The save and validation grids have to stay aligned, but either
+        # direction is sound:
+        #   save_interval % val_check_interval == 0 -- every checkpoint carries a
+        #       fresh validation (save 20 / val 10);
+        #   val_check_interval % save_interval == 0 -- every validation lands on a
+        #       step that is also saved (save 10 / val 20), which is what
+        #       _maybe_save_best_macro_mean and the evaluation_complete marker
+        #       need, since the embodied runner saves BEFORE it validates.
+        # Only incommensurate settings are rejected: with save 15 / val 20 the
+        # validation at step 20 has no checkpoint of its own, so the best-macro
+        # snapshot has to force an unscheduled save and the completion marker is
+        # skipped for that step.
+        assert (
+            save_interval < 0
+            or save_interval % val_check_interval == 0
+            or val_check_interval % save_interval == 0
+        ), (
+            f"{save_interval=} and {val_check_interval=} must be commensurate: "
+            "one has to be a multiple of the other"
         )
 
     # run validation on the last step
