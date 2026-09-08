@@ -25,6 +25,7 @@ from .losses import (
     gse_task_router_metrics_from_tensor,
     gse_task_router_statistics,
     reset_gse_auxiliary_state,
+    set_gse_router_stats_enabled,
 )
 from .state import gse_state_dict, load_gse_state_dict
 
@@ -53,5 +54,6 @@ __all__ = [
     "mark_only_gse_as_trainable",
     "orthogonality_error",
     "reset_gse_auxiliary_state",
+    "set_gse_router_stats_enabled",
     "update_gse_routing_context",
 ]

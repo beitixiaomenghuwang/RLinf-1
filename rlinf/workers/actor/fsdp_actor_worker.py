@@ -56,6 +56,7 @@ from rlinf.models.peft.gse import (
     gse_orthogonality_loss,
     gse_task_router_metrics_from_tensor,
     reset_gse_auxiliary_state,
+    set_gse_router_stats_enabled,
 )
 from rlinf.models.peft.ortho_hydra import (
     ortho_hydra_auxiliary_loss,
@@ -1072,6 +1073,23 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         )
         if self.gse_enabled and self.ortho_hydra_enabled:
             raise ValueError("GSE and Ortho-Hydra cannot both be enabled")
+        # Sample adapter diagnostics on every Nth micro-batch. 1 keeps the
+        # original per-micro-batch behavior; larger values trade metric
+        # resolution WITHIN a step (notably task_router covered_tasks, which
+        # accumulates over sampled micro-batches only) for throughput.
+        self.adapter_metrics_micro_batch_interval = int(
+            self.cfg.actor.get("adapter_metrics_micro_batch_interval", 1)
+        )
+        # Counts global batches (optimizer steps), not micro-batches: the
+        # sampling decision has to be constant within a gradient-accumulation
+        # window. Persists across steps so the sampled subset rotates rather
+        # than always landing on the first global batch of a step.
+        self._global_batch_counter = 0
+        if self.adapter_metrics_micro_batch_interval < 1:
+            raise ValueError(
+                "actor.adapter_metrics_micro_batch_interval must be >= 1, got "
+                f"{self.adapter_metrics_micro_batch_interval}"
+            )
         self.advantage_normalization = resolve_advantage_normalization_config(
             cfg.algorithm
         )
@@ -1522,6 +1540,30 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     train_global_batch_size // self.cfg.actor.micro_batch_size,
                 )
 
+                # Adapter diagnostics are reduced over the whole step, so they
+                # do not have to be recomputed for every global batch. At 128
+                # micro-batches per step over hundreds of injected layers the
+                # bookkeeping is a large fixed cost; sampling every Nth global
+                # batch keeps the metric names and their meaning while paying
+                # 1/N. Interval 1 (the default) is the original behavior.
+                #
+                # The decision is made PER GLOBAL BATCH, never per micro-batch:
+                # toggling it inside a gradient-accumulation window makes the
+                # router receive a gradient on some micro-batches and not
+                # others, and FSDP asserts on that in the post-backward with
+                # "All sharded parameters that received a gradient in the
+                # post-backward should use `_saved_grad_shard`" (job 1477193
+                # died there at step 0). Every micro-batch of one optimizer
+                # step must produce the same set of gradients.
+                collect_adapter_metrics = (
+                    self._global_batch_counter
+                    % self.adapter_metrics_micro_batch_interval
+                    == 0
+                )
+                self._global_batch_counter += 1
+                if self.gse_enabled:
+                    set_gse_router_stats_enabled(self.model, collect_adapter_metrics)
+
                 self.optimizer.zero_grad()
                 for idx, batch in enumerate(train_micro_batch):
                     self.train_micro_batch(
@@ -1529,6 +1571,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         metrics=metrics,
                         is_last=(idx + 1) == self.gradient_accumulation,
                         task_router_statistics=task_router_statistics,
+                        collect_adapter_metrics=collect_adapter_metrics,
                     )
                     # avoid gpu memory leak
                     train_micro_batch[idx] = None
@@ -1619,6 +1662,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         *,
         is_last: bool,
         task_router_statistics: dict[str, torch.Tensor] | None = None,
+        collect_adapter_metrics: bool = True,
     ) -> None:
         micro_batch = put_tensor_device(micro_batch, self.device)
         backward_ctx = self.before_micro_batch(self.model, is_last_micro_batch=is_last)
@@ -1724,7 +1768,26 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         if self.enable_sft_co_train:
             loss = self._train_sft_epoch(metrics_data, loss)
 
-        if self.gse_enabled:
+        if self.gse_enabled and not collect_adapter_metrics:
+            # This micro-batch is not being sampled for diagnostics. The
+            # auxiliary loss still has to be added whenever its coefficients are
+            # nonzero, otherwise the objective would differ between sampled and
+            # unsampled micro-batches.
+            load_balancing_coefficient = float(
+                self.gse_cfg.get("load_balancing_loss_coef", 0.0)
+            )
+            orthogonality_coefficient = float(
+                self.gse_cfg.get("orthogonality_loss_coef", 0.0)
+            )
+            if load_balancing_coefficient > 0 or orthogonality_coefficient > 0:
+                auxiliary_loss, _ = gse_auxiliary_loss(
+                    self.model,
+                    load_balancing_coefficient=load_balancing_coefficient,
+                    orthogonality_coefficient=orthogonality_coefficient,
+                    log_orthogonality=False,
+                )
+                loss += auxiliary_loss
+        elif self.gse_enabled:
             orthogonality_coefficient = float(
                 self.gse_cfg.get("orthogonality_loss_coef", 0.0)
             )

@@ -24,6 +24,13 @@ class GSEConfig:
     lora_alpha: float = 64.0
     num_experts: int = 8
     num_generalized_experts: int = 2
+    # None keeps the uniform divmod split. Setting it gives every generalized
+    # expert this rank and divides the remaining budget across the specialized
+    # experts, which is how a wide always-on expert is combined with many
+    # fine-grained routed ones (e.g. total_rank 64 = 1x8 generalized +
+    # 14x4 specialized). The layer and the SVD initializer already work off each
+    # expert's own rank, so only the split itself needs to be told about this.
+    generalized_expert_rank: int | None = None
     top_k: int = 2
     lora_dropout: float = 0.0
     routing_granularity: RoutingGranularity = "sequence"
@@ -52,6 +59,16 @@ class GSEConfig:
     freeze_base: bool = True
     init_seed: int | None = None
     record_routing_assignments: bool = False
+    # _record_routing() builds ~10 small tensors per layer per forward, and it
+    # is called on EVERY forward. Its outputs have exactly two consumers: the
+    # load-balancing loss (only used when load_balancing_loss_coef > 0) and the
+    # router diagnostics under train/gse/*. When neither is wanted, the whole
+    # call is dead work -- measured at 41-44% of GSE's per-layer overhead over
+    # plain LoRA at the same rank, and this model injects 437 layers evaluated
+    # 128 times per step. The integration layer derives this from the public
+    # log_* switches and the load-balancing coefficient, so a run that asks for
+    # metrics still gets them.
+    collect_router_stats: bool = True
 
     def __post_init__(self) -> None:
         """Validate model-independent configuration fields."""
@@ -89,6 +106,19 @@ class GSEConfig:
             raise ValueError("num_generalized_experts must be in [0, num_experts)")
         if self.total_rank < self.num_experts:
             raise ValueError("total_rank must allocate at least rank 1 per expert")
+        if self.generalized_expert_rank is not None:
+            if self.generalized_expert_rank <= 0:
+                raise ValueError("generalized_expert_rank must be positive")
+            generalized_total = (
+                self.generalized_expert_rank * self.num_generalized_experts
+            )
+            specialized_total = self.total_rank - generalized_total
+            if specialized_total < self.num_specialized_experts:
+                raise ValueError(
+                    "generalized_expert_rank leaves too little of total_rank for "
+                    f"the specialized experts: {specialized_total} remaining for "
+                    f"{self.num_specialized_experts} experts"
+                )
         if self.routing_mode == "topk" and not (
             1 <= self.top_k <= self.num_specialized_experts
         ):
@@ -129,9 +159,20 @@ class GSEConfig:
     @property
     def expert_ranks(self) -> tuple[int, ...]:
         """Split total rank deterministically and exactly across experts."""
-        base_rank, remainder = divmod(self.total_rank, self.num_experts)
-        return tuple(
-            base_rank + int(index < remainder) for index in range(self.num_experts)
+        if self.generalized_expert_rank is None:
+            base_rank, remainder = divmod(self.total_rank, self.num_experts)
+            return tuple(
+                base_rank + int(index < remainder)
+                for index in range(self.num_experts)
+            )
+        generalized_total = self.generalized_expert_rank * self.num_generalized_experts
+        specialized_total = self.total_rank - generalized_total
+        num_specialized = self.num_specialized_experts
+        if num_specialized == 0:
+            return (self.generalized_expert_rank,) * self.num_generalized_experts
+        base_rank, remainder = divmod(specialized_total, num_specialized)
+        return (self.generalized_expert_rank,) * self.num_generalized_experts + tuple(
+            base_rank + int(index < remainder) for index in range(num_specialized)
         )
 
     def scaling_for_rank(self, expert_rank: int, in_features: int) -> float:

@@ -87,6 +87,16 @@ def _build_core_config(
         config.get("log_task_router_metrics", False)
         or config.get("log_layerwise_task_router_metrics", False)
     )
+    # Skip the per-layer routing bookkeeping entirely when nothing consumes it.
+    # It is otherwise paid on every forward of every injected layer; see the
+    # note on GSEConfig.collect_router_stats. The load-balancing coefficient
+    # has to be part of the condition because that loss is a real training
+    # term, not a diagnostic.
+    values["collect_router_stats"] = bool(
+        config.get("log_router_metrics", True)
+        or values["record_routing_assignments"]
+        or float(config.get("load_balancing_loss_coef", 0.0)) > 0.0
+    )
     return GSEConfig(**values)
 
 

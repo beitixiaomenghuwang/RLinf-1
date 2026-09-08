@@ -81,6 +81,12 @@ class GSEAdapter(nn.Module):
         self.out_features = out_features
         self._load_balancing_loss: torch.Tensor | None = None
         self._router_stats: dict[str, torch.Tensor] = {}
+        # Per-micro-batch gate for the routing bookkeeping. The diagnostics are
+        # averaged over a step anyway, so a caller that logs once per step does
+        # not need them recomputed on all of its micro-batches; see
+        # set_gse_router_stats_enabled(). Defaults to True so nothing changes
+        # for a caller that never touches it.
+        self._stats_enabled: bool = True
         self._cached_semantic_embeddings: torch.Tensor | None = None
         self._cached_action_token_mask: torch.Tensor | None = None
         self._cached_sequence_mask: torch.Tensor | None = None
@@ -369,12 +375,20 @@ class GSEAdapter(nn.Module):
                 [expert.initial_lora_b for expert in experts], dim=1
             )
             initial_hidden = F.linear(inputs.to(initial_lora_a.dtype), initial_lora_a)
-            # Numerically subtract the same routed initialization, but detach
-            # only its gate weights. This preserves the SFT function exactly
-            # while giving the router the live-expert gradient used by GSE.
-            weighted_initial_hidden = (
-                initial_hidden * rank_weights.detach() * rank_scaling
-            )
+            # Subtract the routed initialization with the SAME (non-detached)
+            # gate weights that scale the live branch. The residual is then
+            # g * s * (BA - B0A0) x, so d/dg is the true derivative of the
+            # layer output: exactly 0 at step 0, growing as the experts move.
+            #
+            # Detaching this branch's gates instead made autograd report
+            # d/dg = s*BA*x -- the gradient of the FULL base function -- while
+            # the true directional derivative was 0 at init and ~1/1000 of the
+            # reported value afterwards. Measured in float64 against a central
+            # finite difference (overstatement 12304x at delta=1e-3, 389x at
+            # 5e-2); with this line the ratio is 1.00 at every delta. Upstream
+            # VLA-GSE has no such branch at all: it folds the residual into the
+            # base weight once, so its router gradient is likewise the true one.
+            weighted_initial_hidden = initial_hidden * rank_weights * rank_scaling
             residual = residual - F.linear(weighted_initial_hidden, initial_lora_b)
 
         return residual
@@ -416,6 +430,13 @@ class GSEAdapter(nn.Module):
         probabilities: torch.Tensor,
         selected_experts: torch.Tensor,
     ) -> None:
+        # Both products of this function are optional: the load-balancing loss
+        # is only read when its coefficient is nonzero, and the rest is pure
+        # diagnostics. Skipping it leaves _load_balancing_loss as None, which
+        # gse_load_balancing_loss() already filters out, and an empty
+        # _router_stats, which gse_router_metrics() already skips.
+        if not self.config.collect_router_stats or not self._stats_enabled:
+            return
         num_experts = len(self.specialized_experts)
         counts = torch.bincount(selected_experts.reshape(-1), minlength=num_experts)
         fractions = counts.float() / selected_experts.numel()
@@ -459,15 +480,15 @@ class GSEAdapter(nn.Module):
             item_indices, slots = torch.where(indices == expert_index)
             if item_indices.numel() == 0:
                 continue
-            expert_outputs, initial_outputs = expert.forward_components(
-                flattened[item_indices]
-            )
+            expert_outputs, _ = expert.forward_components(flattened[item_indices])
             selected_weights = weights[item_indices, slots, None].to(residual.dtype)
             weighted_outputs = selected_weights * expert_outputs.to(residual.dtype)
-            if initial_outputs is not None:
-                weighted_outputs += (
-                    selected_weights - selected_weights.detach()
-                ) * initial_outputs.to(residual.dtype)
+            # No initial-output correction: forward_components already returns
+            # s*(BA - B0A0)x, so scaling it by the live gate gives the exact
+            # g*s*(BA - B0A0)x this path needs. The old
+            # `(w - w.detach()) * initial` term existed to hand the router the
+            # detached-gate gradient; see _fused_expert_residual for why that
+            # was removed.
             residual[item_indices] += weighted_outputs
         specialized = residual.reshape(*inputs.shape[:-1], self.out_features)
         return self._generalized_residual(inputs).to(inputs.dtype) + specialized
@@ -519,7 +540,7 @@ class GSEAdapter(nn.Module):
             sequence_indices, slots = torch.where(indices == expert_index)
             if sequence_indices.numel() == 0:
                 continue
-            expert_outputs, initial_outputs = expert.forward_components(
+            expert_outputs, _ = expert.forward_components(
                 routed_inputs[sequence_indices]
             )
             shape = (sequence_indices.shape[0],) + (1,) * (expert_outputs.ndim - 1)
@@ -531,10 +552,9 @@ class GSEAdapter(nn.Module):
             weighted_outputs = selected_weights * expert_outputs.to(
                 routed_residual.dtype
             )
-            if initial_outputs is not None:
-                weighted_outputs += (
-                    selected_weights - selected_weights.detach()
-                ) * initial_outputs.to(routed_residual.dtype)
+            # See the note in the token-granularity path: forward_components
+            # already returns s*(BA - B0A0)x, so no extra correction belongs
+            # here.
             routed_residual[sequence_indices] += weighted_outputs
         specialized = routed_residual if inputs.ndim > 1 else routed_residual.squeeze(0)
         return self._generalized_residual(inputs).to(inputs.dtype) + specialized

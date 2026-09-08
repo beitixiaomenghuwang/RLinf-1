@@ -722,3 +722,20 @@ def reset_gse_auxiliary_state(model: nn.Module) -> None:
     """Clear forward-dependent losses and router statistics."""
     for _, layer in iter_gse_layers(model):
         layer.reset_auxiliary_state()
+
+
+def set_gse_router_stats_enabled(model: nn.Module, enabled: bool) -> None:
+    """Turn the per-forward routing bookkeeping on or off for every GSE layer.
+
+    ``_record_routing`` builds roughly ten small tensors per layer per forward,
+    so on a model with hundreds of injected layers it is a large fixed cost paid
+    once per micro-batch. Router diagnostics are reduced over a whole step
+    before they are logged, so a caller that logs once per step can leave this
+    off for the micro-batches it does not intend to read.
+
+    Do NOT disable it while ``load_balancing_loss_coef > 0``: the load-balancing
+    term is produced by the same function and is a real training term. The
+    layer's own ``collect_router_stats`` config field is the static equivalent.
+    """
+    for _, layer in iter_gse_layers(model):
+        layer.adapter._stats_enabled = bool(enabled)

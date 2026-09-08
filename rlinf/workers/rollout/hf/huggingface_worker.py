@@ -35,6 +35,10 @@ from rlinf.data.embodied_io_struct import (
 from rlinf.hybrid_engines.weight_syncer import WeightSyncer
 from rlinf.models import get_model
 from rlinf.models.embodiment.base_policy import BasePolicy
+from rlinf.models.peft.gse import (
+    iter_gse_layers,
+    set_gse_router_stats_enabled,
+)
 from rlinf.scheduler import (
     Channel,
     Cluster,
@@ -56,6 +60,11 @@ def resolve_rollout_seed(
     """Resolve a deterministic per-worker seed when one is configured."""
     base_seed = rollout_config.get("seed", model_config.get("seed", None))
     return None if base_seed is None else int(base_seed) + int(rank)
+
+
+def _gse_layers_present(model) -> bool:
+    """True when this policy actually has GSE adapters injected."""
+    return any(True for _ in iter_gse_layers(model))
 
 
 class MultiStepRolloutWorker(Worker):
@@ -174,6 +183,26 @@ class MultiStepRolloutWorker(Worker):
             rollout_model_config.model_path = self.cfg.rollout.model.model_path
 
         self.hf_model: BasePolicy = get_model(rollout_model_config)
+
+        # Rollout never consumes GSE router statistics: nothing in this worker
+        # reads router_stats, and generation runs under torch.no_grad, so the
+        # load-balancing loss has no consumer either. Recording them anyway
+        # costs ~10 small tensors per injected layer on EVERY forward, and
+        # rollout is the phase with the most forwards at the smallest token
+        # counts (one per action chunk), which is exactly where fixed per-layer
+        # overhead dominates. Measured on the LIBERO-90 whole-model GSE arm
+        # (437 injected layers, 64-token forwards): 38-50% of the per-layer
+        # cost. This is observational state only -- the residual is unchanged
+        # bit-for-bit -- so the sampled actions are identical.
+        #
+        # Set on the rollout model only; the actor keeps collecting metrics.
+        # Weight sync copies tensors and cannot clobber this Python flag.
+        if _gse_layers_present(self.hf_model):
+            set_gse_router_stats_enabled(self.hf_model, False)
+            self.log_info(
+                "[GSE] Disabled router-stat collection on the rollout model "
+                "(diagnostics are produced by the actor)."
+            )
 
         if self.cfg.runner.get("ckpt_path", None):
             model_dict = torch.load(self.cfg.runner.ckpt_path)

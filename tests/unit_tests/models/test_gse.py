@@ -61,6 +61,14 @@ def test_config_treats_rank_as_layer_total() -> None:
             {"router_input": "rank_rms", "routing_granularity": "token"},
             "requires sequence routing",
         ),
+        (
+            {"generalized_expert_rank": 0},
+            "generalized_expert_rank must be positive",
+        ),
+        (
+            {"generalized_expert_rank": 6},
+            "too little of total_rank",
+        ),
     ],
 )
 def test_config_rejects_invalid_expert_allocations(
@@ -68,6 +76,77 @@ def test_config_rejects_invalid_expert_allocations(
 ) -> None:
     with pytest.raises(ValueError, match=message):
         make_config(**overrides)
+
+
+def test_generalized_expert_rank_splits_budget_asymmetrically() -> None:
+    """A wide always-on expert can coexist with fine-grained routed experts."""
+    config = make_config(
+        total_rank=64,
+        num_experts=15,
+        num_generalized_experts=1,
+        generalized_expert_rank=8,
+        top_k=4,
+    )
+
+    assert config.expert_ranks == (8,) + (4,) * 14
+    assert sum(config.expert_ranks) == config.total_rank
+    # The uniform divmod split would have produced this instead, which is the
+    # whole reason the field exists.
+    assert make_config(
+        total_rank=64, num_experts=15, num_generalized_experts=1, top_k=4
+    ).expert_ranks != config.expert_ranks
+
+
+def test_unequal_expert_ranks_keep_svd_zero_residual_and_fused_equivalence() -> None:
+    """Heterogeneous ranks must not break SVD preservation or expert fusion."""
+    torch.manual_seed(11)
+    base_layer = nn.Linear(32, 24)
+    config = make_config(
+        total_rank=16,
+        num_experts=5,
+        num_generalized_experts=1,
+        generalized_expert_rank=8,
+        top_k=2,
+        initialization="svd",
+        preserve_svd_output=True,
+        scaling_mode="gse",
+        routing_granularity="sequence",
+    )
+    layer = GSELinear(deepcopy(base_layer), config)
+
+    ranks = tuple(expert.lora_a.out_features for expert in layer.all_experts)
+    assert ranks == (8, 2, 2, 2, 2)
+
+    inputs = torch.randn(6, 32)
+    with torch.no_grad():
+        # Every expert holds a disjoint slice of the SVD, so the residual must
+        # still cancel exactly at step 0 despite the uneven slicing.
+        torch.testing.assert_close(layer(inputs), base_layer(inputs))
+
+    # The fused two-matmul path indexes rank columns through
+    # _rank_expert_indices, which must expand per-expert weights by each
+    # expert's own rank rather than a shared one.
+    assert layer.adapter._rank_expert_indices.tolist() == (
+        [0] * 8 + [1] * 2 + [2] * 2 + [3] * 2 + [4] * 2
+    )
+    sparse_config = make_config(
+        total_rank=16,
+        num_experts=5,
+        num_generalized_experts=1,
+        generalized_expert_rank=8,
+        top_k=2,
+        initialization="svd",
+        preserve_svd_output=True,
+        scaling_mode="gse",
+        routing_granularity="sequence",
+        lora_dropout=0.1,
+    )
+    sparse_layer = GSELinear(deepcopy(base_layer), sparse_config)
+    sparse_layer.load_state_dict(layer.state_dict())
+    sparse_layer.eval()
+    layer.eval()
+    with torch.no_grad():
+        torch.testing.assert_close(layer(inputs), sparse_layer(inputs))
 
 
 def test_orthogonal_zero_initialization_preserves_base_output() -> None:
@@ -324,8 +403,89 @@ def test_exact_svd_initialization_trains_factors_and_router_from_step_zero() -> 
         and torch.count_nonzero(expert.lora_b.weight.grad) > 0
         for expert in layer.all_experts
     )
+    # The router gradient must be EXACTLY ZERO here, and that is correct rather
+    # than a defect. Under preserve_svd_output the residual is
+    # g * s * (BA - B0A0) x, and at step 0 B == B0 and A == A0, so changing the
+    # gate cannot change the layer output: the true derivative is zero.
+    #
+    # This assertion used to demand a nonzero gradient, which only held because
+    # the subtracted branch's gate was detached. That made autograd report
+    # d/dg = s*BA*x -- the gradient of the whole base function -- against a true
+    # directional derivative of 0 (verified by float64 central differences:
+    # 12304x overstatement once the experts had moved 1e-3, 389x at 5e-2). The
+    # router then walked on a signal with no effect on the loss. Upstream
+    # VLA-GSE folds the residual into the base weight instead and likewise has
+    # no such phantom term.
     assert layer.router.weight.grad is not None
-    assert torch.count_nonzero(layer.router.weight.grad) > 0
+    assert torch.count_nonzero(layer.router.weight.grad) == 0
+
+
+def test_preserve_svd_router_gradient_matches_finite_difference() -> None:
+    """The router gradient must be the TRUE derivative, not a detached proxy.
+
+    Regression test for the phantom router gradient: the subtracted initial
+    branch used to carry ``rank_weights.detach()``, so autograd reported
+    ``d/dg = s*BA*x`` (the whole base function) while the real derivative was
+    zero at step 0 and orders of magnitude smaller afterwards. Compared against
+    a float64 central difference, the reported gradient overstated the truth by
+    ~12300x at 1e-3 expert movement.
+    """
+    torch.manual_seed(0)
+    config = make_config(
+        initialization="svd",
+        total_rank=8,
+        num_experts=4,
+        num_generalized_experts=1,
+        top_k=2,
+        routing_granularity="token",
+        scaling_mode="gse",
+        svd_rho=10.0,
+        preserve_svd_output=True,
+        router_initialization="normal",
+        router_init_std=0.02,
+    )
+    layer = GSELinear(nn.Linear(16, 16, bias=False).double(), config).double()
+    inputs = torch.randn(3, 6, 16, dtype=torch.float64)
+    target = torch.randn(3, 6, 16, dtype=torch.float64)
+
+    def loss() -> torch.Tensor:
+        return (layer(inputs) - target).pow(2).mean()
+
+    # At step 0 the gate provably cannot change the output.
+    layer.zero_grad()
+    loss().backward()
+    assert torch.count_nonzero(layer.router.weight.grad) == 0
+
+    # Once the experts move, the gradient must agree with a finite difference.
+    with torch.no_grad():
+        for expert in layer.all_experts:
+            weight = expert.lora_b.weight
+            weight.add_(torch.randn_like(weight) * 1e-2 * weight.norm())
+
+    layer.zero_grad()
+    loss().backward()
+    gradient = layer.router.weight.grad.detach().clone()
+    assert gradient.norm() > 0
+
+    direction = gradient / gradient.norm()
+    # 1e-5, not something smaller: top-k routing makes the loss piecewise smooth
+    # and the loss values here are ~1e0 while the directional derivative is
+    # ~3e-4, so a tiny epsilon is dominated by cancellation. Measured ratios at
+    # this operating point: 1.0006 at 1e-5, 1.0176 at 1e-6, 0.60 at 1e-8.
+    epsilon = 1e-5
+    with torch.no_grad():
+        layer.router.weight.add_(direction * epsilon)
+        plus = loss().item()
+        layer.router.weight.add_(direction * (-2 * epsilon))
+        minus = loss().item()
+        layer.router.weight.add_(direction * epsilon)
+    directional_derivative = (plus - minus) / (2 * epsilon)
+
+    # Ratio 1.0 means autograd reports exactly the true sensitivity. Before the
+    # fix this ratio was ~12300.
+    assert directional_derivative > 0
+    ratio = gradient.norm().item() / directional_derivative
+    assert 0.99 < ratio < 1.01, f"router gradient off by {ratio:.2f}x"
 
 
 def test_kaiming_router_initialization_is_deterministic_and_nonzero() -> None:
@@ -729,8 +889,13 @@ def _semantic_layer(
     """Build a sequence-routed layer with joint hidden/semantic routing.
 
     Uses ``svd`` initialization because ``orthogonal_zero`` leaves every
-    ``lora_b`` at zero, which makes the whole expert residual -- and therefore
-    every router gradient -- identically zero.
+    ``lora_b`` at zero, which makes the whole expert residual identically zero.
+
+    Note that ``svd`` + ``preserve_svd_output`` is *also* gate-insensitive at
+    step 0 -- the residual is ``g * s * (BA - B0A0) x`` and ``B == B0`` there --
+    so a test that needs a nonzero router gradient must perturb ``lora_b``
+    first. Only the routing *decisions* (probabilities, selected experts) are
+    meaningful straight after construction.
     """
     base = nn.Linear(embedding_dim, embedding_dim, bias=False)
     return GSELinear(
@@ -846,6 +1011,15 @@ def test_semantic_conditioning_routes_by_task_when_hidden_states_match() -> None
 def test_semantic_router_receives_gradient() -> None:
     torch.manual_seed(0)
     layer = _semantic_layer(32, 1.0)
+    # The experts must have moved off their initialization first. With
+    # preserve_svd_output the residual is g * s * (BA - B0A0) x, so while
+    # B == B0 the layer output does not depend on the gate at all and BOTH
+    # routers correctly receive exactly zero gradient. Perturbing lora_b puts
+    # the layer in the regime the router actually trains in.
+    with torch.no_grad():
+        for expert in layer.all_experts:
+            weight = expert.lora_b.weight
+            weight.add_(torch.randn_like(weight) * 0.01 * weight.norm())
     with gse_routing_context(torch.randn(3, 32)):
         layer(torch.randn(3, 4, 32)).square().mean().backward()
     gradient = layer.adapter.semantic_router.weight.grad
