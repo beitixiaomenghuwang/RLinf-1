@@ -1,28 +1,100 @@
 defaults:
-  - metaworld_50_ppo_openpi_pi05_gse_action_r32_svd
+  - metaworld_50_ppo_openpi_pi05_gse_action_r32_svd_1g7s
   - _self_
 
-# Matched multi-expert ablation: all eight experts are always active and
-# uniformly averaged, so no router is used.
+# Ablation A of PAPER_SUMMARY.md 4.4: the multi-expert residual WITHOUT a
+# learned router, trained independently from the SFT policy. It is the only arm
+# that can turn the inference-time routing interventions (>=4.47 pp for
+# uniform, >=7.37 pp for random_router) into an actual contribution number,
+# because those numbers are dependence LOWER BOUNDS: flattening a trained
+# router at inference punishes the specialization the experts co-adapted to
+# rather than neutrally removing routing (PAPER_SUMMARY 5.3c).
+#
+# PARENT CHANGED 2026-09-08. This file used to inherit
+# metaworld_50_ppo_openpi_pi05_gse_action_r32_svd, which is the 2g6s profile
+# with svd + preserve_svd_output and scaling_mode "gse". Against the current
+# main method that differs in FOUR unmatched knobs at once -- expert split,
+# initialization, residual scaling, and therefore effective step size -- so its
+# difference from Ours would not have isolated routing at all. It now inherits
+# the main method itself, so every non-routing knob tracks it by construction:
+# orthogonal_zero initialization, scaling_mode "total_rank" at scaling exactly
+# 1.0, eight experts, the same 126 action-expert projections, lr 5e-5 with
+# cosine min_lr_rate 0.1 and no router lr override, adapter-only checkpoints,
+# 128 train envs x 2 rollout epochs, and the 512-slot fixed eval reset pool.
+#
+# routing_mode "uniform" with num_generalized_experts == num_experts is a real
+# no-router build, not a router pinned to uniform. GSEAdapter constructs
+# nn.Identity() instead of the router Linear when num_specialized_experts == 0
+# (rlinf/models/peft/gse/layer.py:112-124), so there are no router parameters
+# to train, no router FSDP unit, and no routing statistics anywhere; the
+# forward averages all eight experts with weight 1/8 (_uniform_residual).
+# test_uniform_routing_averages_all_experts_without_router pins both halves.
+#
+# KNOWN NON-MATCHED QUANTITY -- state it in the paper, do not silently "fix"
+# it. Matching here is on LEARNING RATE, which is what PAPER_SUMMARY 4.4
+# specifies ("same rank, same injection surface, same lr, same budget, same
+# reset pool"), NOT on effective residual step. The main method puts gate mass
+# 2.0 on each token (the generalized expert at 1.0 plus top-2 specialized
+# renormalized to 1.0); uniform aggregation puts 1/8 on each of eight experts,
+# i.e. gate mass 1.0. Adam's step on a zero-initialized B is ~lr regardless of
+# the gate that scales its gradient, and the residual contribution of expert e
+# is proportional to that gate, so this arm's effective residual step is
+# roughly 0.5x the main method's. A shortfall here is therefore partly a
+# step-size effect and not purely the absence of routing. If a step-matched
+# companion is wanted, set GSE_LORA_ALPHA=128.0 in the launcher (scaling 2.0)
+# and report it as a SEPARATE arm; do not substitute it for this one.
+
 runner:
   logger:
-    experiment_name: "metaworld_50_pi05_gse_action_r32_svd_no_router"
-  max_epochs: 160
+    experiment_name: "metaworld_50_pi05_gse_action_r64_no_router"
+  # 300 steps, matching the rank-64 main-method horizon. The parent sets
+  # actor.optim.total_training_steps: ${runner.max_epochs}, so the cosine
+  # horizon follows this value automatically. runner.max_steps stays -1: the
+  # embodied runner uses num_steps_per_epoch = 1 and only clamps max_epochs
+  # with max_steps when max_steps >= 0 (rlinf/runners/embodied_runner.py:917).
+  max_epochs: 300
+  # save 10 / val 20 became legal in f296bd8b, which relaxed check_progress to
+  # accept either interval dividing the other. This is the
+  # val_check_interval % save_interval == 0 direction, where every validation
+  # lands on a step that is also saved -- which is what
+  # _maybe_save_best_macro_mean and the evaluation_complete marker need, since
+  # the embodied runner saves BEFORE it validates. Keeping val at 20 also keeps
+  # the eval grid identical to the main method's, so the two success curves are
+  # comparable step for step.
   val_check_interval: 20
-  # Must be divisible by val_check_interval: check_progress in
-  # rlinf/utils/runner_utils.py asserts save_interval % val_check_interval == 0
-  # whenever validation is enabled, and the embodied runner hardcodes
-  # limit_val_batches=1.0 so it always is. save_interval 10 against
-  # val_check_interval 20 crashes at the FIRST eval, not at startup (job
-  # 1471717 died there after 34 minutes).
-  save_interval: 20
+  save_interval: 10
+  # No cap. Adapter-only checkpoints are ~110 MiB at rank 32, so 30 of them at
+  # rank 64 stays well under 20 GiB, and keeping every step lets any of them be
+  # re-evaluated later without a re-run.
+  max_checkpoints_to_keep: null
 
 actor:
   model:
     gse:
+      # The paper's main method is rank 64: eight experts x rank 8, 29.1 M
+      # trainable parameters (PAPER_SUMMARY 3.3, HANDOFF.md 5.1). The parent
+      # YAML is pinned at 32 and its rank-64 arm is produced by a launcher
+      # override, so this file states 64 explicitly instead of inheriting 32.
+      #
+      # lora_alpha MUST track total_rank. scaling_for_rank divides by
+      # total_rank under scaling_mode "total_rank", so leaving the parent's
+      # 32.0 against rank 64 would give scaling 0.5 and halve the effective
+      # step a second time, on top of the gate-mass factor discussed above.
+      total_rank: 64
+      lora_alpha: 64.0
+      # All eight experts always active, uniformly averaged, no router.
       routing_mode: "uniform"
-      routing_granularity: "token"
       num_generalized_experts: 8
+      # num_experts (8) and top_k (2) are inherited unchanged. top_k and
+      # routing_granularity are both INERT under uniform: GSEAdapter.forward
+      # dispatches on routing_mode before granularity, and GSEConfig validates
+      # top_k only on the "topk" branch. They are left untouched so that a diff
+      # against the main method shows exactly one behavioural change.
+      #
+      # Every router diagnostic would be an empty or constant series here --
+      # _record_routing is not even reached under uniform -- so the three
+      # router metric switches are off. log_orthogonality stays on: the expert
+      # A factors still exist and their orthogonality is still meaningful.
       log_router_metrics: false
       log_task_router_metrics: false
       log_layerwise_task_router_metrics: false
