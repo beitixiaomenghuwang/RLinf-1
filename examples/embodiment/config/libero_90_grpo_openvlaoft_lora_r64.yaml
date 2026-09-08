@@ -1,3 +1,10 @@
+# Plain LoRA rank-64 RL baseline for LIBERO-90, matched to
+# libero_90_grpo_openvlaoft_gse_r64_svd.yaml everywhere except the adapter:
+# same GRPO hyperparameters, same 64x4 training / 32x16 evaluation protocol,
+# same batch shape, same 120 steps, same lr and cosine schedule, same
+# adapter-only checkpointing. The single variable is the residual
+# parameterization -- one always-on LoRA pair per layer instead of eight routed
+# GSE experts sharing the same total rank.
 defaults:
   - env/libero_90@env.train
   - env/libero_90@env.eval
@@ -24,7 +31,9 @@ runner:
   logger:
     log_path: "../results"
     project_name: rlinf
-    experiment_name: "libero90_ortho_hydra_independent_r32_8gpu_seed1234"
+    # Default only: every launcher passes runner.logger.experiment_name
+    # explicitly.
+    experiment_name: "libero90_lora_r64_8gpu_seed1234"
     logger_backends: ["tensorboard"]
 
   max_epochs: 1000
@@ -32,20 +41,20 @@ runner:
 
   only_eval: False
   val_check_interval: 20
-  # Must be divisible by val_check_interval: check_progress in
-  # rlinf/utils/runner_utils.py asserts save_interval % val_check_interval == 0
-  # whenever validation is enabled, and the embodied runner hardcodes
-  # limit_val_batches=1.0 so it always is. save_interval 10 against
-  # val_check_interval 20 crashes at the FIRST eval, not at startup (job
-  # 1471717 died there after 34 minutes).
-  save_interval: 20
+  # Save every 10 steps, validate every 20. check_progress in
+  # rlinf/utils/runner_utils.py requires the two grids to be commensurate, and
+  # this is the val % save == 0 direction: every validation lands on a step that
+  # was already checkpointed, which is what save_best_macro_mean and the
+  # evaluation_complete marker need (the runner saves before it validates). The
+  # opposite pairing -- save 10 against val 20 under the OLD one-directional
+  # assert -- is what killed job 1471717 at its first eval after 34 minutes.
+  save_interval: 10
   save_best_macro_mean: True
-  # No cap: adapter-only checkpoints are ~110 MiB, so keeping the whole
-  # training trajectory costs less than one old 17G full checkpoint and lets
-  # any step be re-evaluated later. Stated explicitly rather than relying on
-  # the key being absent, so adding a cap upstream cannot silently start
-  # pruning these runs. null disables pruning (prune_old_checkpoints returns
-  # early on None).
+  # No cap: adapter-only checkpoints are small, so keeping the whole training
+  # trajectory costs less than one old full checkpoint and lets any step be
+  # re-evaluated later. Stated explicitly rather than relying on the key being
+  # absent, so adding a cap upstream cannot silently start pruning these runs.
+  # null disables pruning (prune_old_checkpoints returns early on None).
   max_checkpoints_to_keep: null
 
   resume_dir: null
@@ -151,44 +160,34 @@ actor:
     attn_implementation: "sdpa"
     unnorm_key: libero_90_no_noops_trajall
     max_prompt_length: 128
-    is_lora: False
-    gse:
-      enabled: False
-    ortho_hydra:
-      enabled: True
-      # PE-RL protocol: freeze the complete vision backbone and adapt only the
-      # multimodal projector and language model.
-      scope: whole_model
-      target_modules: all-linear
-      freeze_vision_backbone: True
-      # Total rank 32: eight independent rank-4 input/output experts.
-      total_rank: 32
-      lora_alpha: 32.0
-      num_experts: 8
-      parameterization: "independent"
-      # Dense softmax uses all experts and fuses RMS-pooled rank-32 hidden
-      # states with the frozen text embedding.
-      semantic_router_scale: 1.0
-      init_seed: 42
-      freeze_base: True
-      train_value_head: False
-      load_balancing_loss_coef: 0.0
-      log_router_metrics: True
-      log_task_router_metrics: True
-      log_layerwise_task_router_metrics: True
-      task_router_num_tasks: 90
-      task_router_informative_nmi_threshold: 0.01
-      log_orthogonality: True
+    # Plain LoRA through RLinf's native PEFT path (rlinf/models/__init__.py
+    # get_model). With lora_path null it builds a FRESH LoraConfig and calls
+    # get_peft_model on the whole policy; it never loads the lora_adapter/
+    # directory shipped with the base model, whose weights are already merged
+    # into the four dense shards. Re-merging that adapter is what drops greedy
+    # LIBERO-90 from ~96% to ~25%.
+    is_lora: True
+    lora_path: null
+    # PEFT sets lora_alpha = lora_rank there, so the LoRA scaling is
+    # alpha / r = 1.0 -- the same residual scaling as the GSE arm's
+    # scaling_mode "total_rank" with lora_alpha == total_rank. Dropout is 0 and
+    # init_lora_weights is "gaussian" (A gaussian, B zero), so the step-0
+    # residual is exactly zero and the initial policy is the SFT policy.
+    lora_rank: 64
+    # The target list is hardcoded in rlinf/models/__init__.py and covers the
+    # vision backbone (proj, qkv, fc1, fc2), the projector (q, kv, fc3,
+    # out_proj), the language model (q/k/v/o/gate/up/down_proj) and lm_head.
+    # get_peft_model freezes every base parameter, so only the LoRA factors
+    # train. This matches the GSE arm now that it also injects into vision.
+    # GRPO has no critic, and the openvla_oft model group leaves
+    # add_value_head False, so there is no value head to train either.
 
   optim:
-    # Whole-model Ortho-Hydra freezes the dense base, so every trainable
-    # policy parameter belongs to the adapter optimizer group below.
-    # actor.optim.lr is deliberately absent. freeze_base + train_value_head:False
-    # leave no parameter outside the adapter/router groups, so build_optimizer
-    # never creates the actor param group that would read it
-    # (fsdp_model_manager.py: `if len(params_actor) > 0`). Adding it back would
-    # look like a real knob while changing nothing.
-    ortho_hydra_lr: 5e-5
+    # Every trainable parameter is a PEFT LoRA factor, and without gse_lr /
+    # ortho_hydra_lr build_optimizer puts them all in the single actor group
+    # that reads this lr. 6e-5 mirrors the GSE arm's gse_lr, which is the
+    # comparable knob because both arms scale their residual by 1.0.
+    lr: 6e-5
     total_training_steps: ${runner.max_steps}
     lr_warmup_steps: 0
     lr_scheduler: "cosine"
@@ -211,15 +210,12 @@ actor:
   fsdp_config:
     # A PEFT checkpoint is dominated by the frozen backbone, re-saved verbatim at
     # every step. Measured on a pi0.5 GSE rank-32 checkpoint (job 1468982 step
-    # 100): 17G total, of which the adapter tensors were 33.8 MiB. The rest was
-    # 7.94 GiB of frozen base inside the DCP shards plus an 8.0 GiB
-    # full_weights.pt copy of the same weights. Every parameter carrying
-    # optimizer state was an adapter/router/value_head tensor, and each base
-    # tensor differing from model.safetensors differed by exactly its bf16
-    # rounding, so the base is frozen and is restored from
-    # actor.model.model_path on resume. Load auto-detects the format from a
-    # marker file, so a run can switch and still resume from older full
-    # checkpoints.
+    # 100): 17G total, of which the adapter tensors were 33.8 MiB. Selection is
+    # by optimizer state plus the name markers in
+    # hybrid_engines/fsdp/strategy/checkpoint.py, one of which is "lora_", so a
+    # PEFT LoRA run is filtered the same way a GSE run is. The frozen base is
+    # restored from actor.model.model_path on resume, and loading auto-detects
+    # the format from a marker file.
     adapter_only_checkpoint: True
     # full_weights.pt is the whole model, so writing it would restore the cost
     # adapter-only saving removes. Standalone eval via runner.ckpt_path needs a

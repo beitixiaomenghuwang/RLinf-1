@@ -7,9 +7,32 @@ defaults:
   - override hydra/job_logging: stdout
   - _self_
 
-# Official GSE expert structure: one always-on generalized expert and seven
-# specialized experts selected by top-k, routed per token as in the upstream
-# VLA-GSE implementation.
+# Main method: one always-on generalized expert and seven specialized experts
+# selected by top-k, routed per token as in the upstream VLA-GSE implementation.
+#
+# INITIALIZATION IS orthogonal_zero, NOT svd, despite the file name. This is the
+# measured result of a head-to-head 8-GPU comparison at matched effective step
+# size (greedy eval macro_mean, both from the hash-verified SFT, both 1g7s /
+# total_rank 64 / top_k 2 / token routing / no router lr override):
+#
+#   | arm                       | @19   | @39   | @59   | @79   | @99   | @119  |
+#   | orthogonal_zero (1475511) | .5987 | .6662 | .6855 | .6578 | .6829 | .6916 |
+#   | svd + preserve (1476347)  | .5885 | .6080 | .5585 |   -   |   -   |   -   |
+#
+# 12.7 pp apart at step 59 and diverging. Rollout mean over steps 30-70: 0.5993
+# vs 0.5288. The cause is subspace lock-in, not step size: svd initializes the
+# joint A to the base weight's top-r right singular vectors, so its overlap with
+# that subspace is 1.0000 at step 0 (orthogonal_zero: 0.2553), and after 40 steps
+# 72% of the learned residual's energy is still inside it (orthogonal_zero: 25%).
+# That overlap is INVARIANT to lr -- 0.254 / 0.254 / 0.255 across a 6x sweep --
+# so it is a property of where the parameterization starts, not of how far it
+# moves. Under RL the useful directions are the ones the SFT policy does NOT
+# already emphasize, so biasing the adapter toward the dominant subspace costs
+# real performance. Upstream VLA-GSE uses svd successfully under SFT, where
+# re-weighting the dominant subspace is the right inductive bias; that does not
+# transfer to on-policy RL.
+#
+# Do not "restore" svd without re-running this comparison.
 
 hydra:
   run:
@@ -33,7 +56,13 @@ runner:
   max_steps: -1
   only_eval: False
   val_check_interval: 20
-  save_interval: 10
+  # Must be divisible by val_check_interval: check_progress in
+  # rlinf/utils/runner_utils.py asserts save_interval % val_check_interval == 0
+  # whenever validation is enabled, and the embodied runner hardcodes
+  # limit_val_batches=1.0 so it always is. save_interval 10 against
+  # val_check_interval 20 crashes at the FIRST eval, not at startup (job
+  # 1471717 died there after 34 minutes).
+  save_interval: 20
   max_checkpoints_to_keep: null
   resume_dir: null
   ckpt_path: null
@@ -117,23 +146,43 @@ actor:
     gse:
       enabled: True
       total_rank: 32
+      # lora_alpha MUST track total_rank so scaling_for_rank returns exactly 1.0
+      # under scaling_mode "total_rank" (it divides by total_rank, not by the
+      # per-expert rank). Leaving it at 64 while total_rank is 32 gives scaling
+      # 2.0 and doubles the effective step: measured 0.01855 vs 0.00928.
       lora_alpha: 32.0
       train_action_adapters: True
-      initialization: "svd"
-      # scaling_mode "gse" makes scaling_for_rank return
-      #   sqrt(3 * gse_eta * in_features / expert_rank)
-      # (rlinf/models/peft/gse/config.py:139-140), so lora_alpha is NEVER READ on
-      # this branch -- setting it anywhere is inert. Two consequences:
-      #   1. The scaling is NOT 1.0. Measured with gse_eta=1.0 and 8 experts:
-      #      27.71 at total_rank 32, 19.60 at 64, 13.86 at 128 (in_features=1024;
-      #      double each for in_features=4096).
-      #   2. It shrinks as 1/sqrt(expert_rank), so a bare total_rank sweep moves
-      #      capacity AND residual magnitude at once. This is the VLA-GSE design:
-      #      rank × scaling² = constant compensates low-rank structural limits.
-      scaling_mode: "gse"
+      # orthogonal_zero, not svd -- see the header comment for the measured
+      # 12.7 pp eval gap and the subspace-lock-in mechanism behind it.
+      # Orthogonal A factors with B = 0, so the step-0 residual is elementwise
+      # zero and the initial policy is exactly the SFT policy.
+      initialization: "orthogonal_zero"
+      # scaling_mode MUST be "total_rank" here, paired with orthogonal_zero.
+      #
+      # "gse" returns sqrt(3 * gse_eta * in_features / expert_rank) -- 27.71 at
+      # total_rank 32 with 8 experts, 39.2 at width 4096 -- and its rank
+      # compensation only cancels out under SVD init, where |A|,|B| scale as
+      # 1/sqrt(scaling) so Adam's relative step is unchanged. Under
+      # orthogonal_zero B starts at exactly 0, Adam's step on B is ~lr
+      # regardless, and the scaling multiplies the residual directly. Measured
+      # at total_rank 64: orthozero + "gse" + lr 2e-5 gives step 0.14642 versus
+      # the reference recipe's 0.01307, i.e. 11.2x. That arm would destabilize.
+      #
+      # Holding scaling at 1.0 also makes rank the only variable across a rank
+      # sweep, and matches the 0.6916-eval 1475511 recipe and the 0.73-eval
+      # gse-formal-seed42 reference.
+      scaling_mode: "total_rank"
+      # gse_eta, svd_rho and preserve_svd_output are all inert on this branch:
+      # gse_eta is read only by scaling_mode "gse", and svd_rho /
+      # preserve_svd_output only by initialization "svd". preserve_svd_output is
+      # additionally an exact no-op under orthogonal_zero (verified: max abs
+      # output difference 0.000e+00 either way, because B = 0 makes the
+      # subtracted branch identically zero, and initial_lora_a is never even
+      # populated). They are stated explicitly so that flipping initialization
+      # back to "svd" cannot silently pick up stale values.
       gse_eta: 1.0
       svd_rho: 10.0
-      preserve_svd_output: True
+      preserve_svd_output: False
       num_experts: 8
       num_generalized_experts: 1
       top_k: 2
@@ -177,7 +226,18 @@ actor:
       num_images_in_input: 1
       value_after_vlm: True
   optim:
-    lr: 5.0e-6
+    # 5e-5, not the old 2e-5. The 2e-5 was calibrated against scaling_mode
+    # "gse" (scaling 27.71); at scaling 1.0 the same lr gives only 0.00379
+    # effective residual step versus the 0.6916-eval 1475511 recipe's 0.01307,
+    # i.e. 0.29x, which would badly undertrain the arm. Measured at total_rank
+    # 32 / scaling 1.0: lr 2e-5 -> 0.00379, 5e-5 -> 0.00928, 7e-5 -> 0.01289.
+    #
+    # 5e-5 is chosen over 7e-5 because it is the value the 0.73-eval
+    # gse-formal-seed42 reference and 1475511 both used, so it keeps this arm on
+    # a validated lr rather than an extrapolated one. The residual step is 0.71x
+    # of 1475511 purely because total_rank is 32 here rather than 64 -- that is
+    # the intended capacity difference, not a scaling mismatch.
+    lr: 5.0e-5
     value_lr: 1.0e-4
     adam_beta1: 0.9
     adam_beta2: 0.95
@@ -196,19 +256,39 @@ actor:
     # regardless of the configured lrs, which silently rescales the floor whenever
     # a group lr changes. min_lr_rate bypasses that division entirely.
     min_lr_rate: 0.1
-    # The router is a single Linear(width, 7) whose gradient arrives only
-    # through the routing weights, so at the shared 5e-6 it barely moves while
-    # the expert factors train. Give it its own param group at 1e-3.
-    gse_router_lr: 1.0e-3
-    # Weight decay on a softmax router shrinks logits toward zero, which is a
-    # pull toward UNIFORM routing -- the same direction as the load-balancing
-    # loss this experiment sets to 0.0. So it cannot be large. But 1e-3 is 200x
-    # the base lr, and an unregularized router can saturate its softmax into
-    # hard routing with dead experts. 0.01 (the global value) shrinks weights
-    # ~3% over 3000 optimizer steps: enough to bound logit growth, far too weak
-    # to force uniformity. Raise only if router logits diverge; do not raise to
-    # "encourage balance", that is what killed specialization before.
-    gse_router_weight_decay: 0.01
+    # gse_router_lr is deliberately UNSET: the router shares the actor lr above,
+    # matching the 0.73-eval gse-formal-seed42 reference, whose resolved config
+    # has no router lr override at all.
+    #
+    # The old value here was 1e-3. Real-run evidence that it is harmful, from
+    # three 8-GPU arms differing only in this key and routing granularity:
+    #   - job 1474867 (router lr 1e-3): router normalized_entropy collapsed
+    #     0.9217 -> 0.4108 by step 19, while layerwise task NMI stayed flat at
+    #     0.037-0.042. Confident routing carrying no task information.
+    #   - jobs 1475510/1475511 (router at the shared 5e-5): entropy held at
+    #     0.9792 -> 0.9729 and 0.9731 -> 0.9689 through step 39.
+    # The reference run itself never specialized its router (entropy 0.9671 ->
+    # 0.9534 over 200 steps) and still reached 0.73 eval, so a hot router buys
+    # nothing and costs the uniform mixing the working recipe had.
+    #
+    # Mechanism: the router gradient is noise-dominated under on-policy RL --
+    # half-split cosine across 8 independent minibatches is ~0.01. Adam
+    # normalizes gradient magnitude, so a larger lr buys a faster RANDOM WALK,
+    # and a random walk still grows logit magnitude, which saturates the
+    # softmax. Displacement budget at the shared lr is ample regardless: the
+    # router has 12288 elements at init norm 1.417, so 200 steps at 5e-5 can
+    # move it by up to 78% of its own norm (5e-6 would be the starved regime,
+    # 7.8%).
+    #
+    # Do NOT justify this with a router-only experiment that freezes the
+    # experts: under orthogonal_zero, frozen experts keep B == 0, which forces
+    # the router gradient to zero by construction, so such a test cannot detect
+    # any lr effect at all. It was that flawed isolation which briefly made
+    # 1e-3 look inert.
+    #
+    # gse_router_weight_decay is also unset: it is read only when building the
+    # router param group (fsdp_model_manager.py:562), so with no router group it
+    # is inert. Its old value equalled the global weight_decay: 0.01 regardless.
   fsdp_config:
     # A PEFT checkpoint is dominated by the frozen backbone, re-saved verbatim at
     # every step. Measured on a pi0.5 GSE rank-32 checkpoint (job 1468982 step

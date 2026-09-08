@@ -24,7 +24,10 @@ runner:
   logger:
     log_path: "../results"
     project_name: rlinf
-    experiment_name: "libero90_gse_frozen_vision_r32_svd_8gpu_seed1234"
+    # Default only: every launcher passes runner.logger.experiment_name
+    # explicitly. Kept in sync with the arm this file now describes -- rank 64,
+    # orthogonal_zero init, scaling 1.0, token routing, vision included.
+    experiment_name: "libero90_gse_r64_orthozero_scal1_token_vision_8gpu_seed1234"
     logger_backends: ["tensorboard"]
 
   max_epochs: 1000
@@ -32,6 +35,12 @@ runner:
 
   only_eval: False
   val_check_interval: 20
+  # Must be divisible by val_check_interval: check_progress in
+  # rlinf/utils/runner_utils.py asserts save_interval % val_check_interval == 0
+  # whenever validation is enabled, and the embodied runner hardcodes
+  # limit_val_batches=1.0 so it always is. save_interval 10 against
+  # val_check_interval 20 crashes at the FIRST eval, not at startup (job
+  # 1471717 died there after 34 minutes).
   save_interval: 10
   save_best_macro_mean: True
   # No cap: adapter-only checkpoints are ~110 MiB, so keeping the whole
@@ -41,6 +50,28 @@ runner:
   # pruning these runs. null disables pruning (prune_old_checkpoints returns
   # early on None).
   max_checkpoints_to_keep: null
+
+  # MEASURED NET LOSS on this arm -- left off deliberately.
+  #
+  # The idea was sound on paper: env bootstrap costs 211 s of a 1850 s step and
+  # the env workers are idle while the actor trains, so prefetching the next
+  # step's bootstrap should have been free wall clock. Measured A/B at the same
+  # batch shape (job 1476720 off, n=6 vs job 1477381 on, n=2, both step>=1):
+  #
+  #             step      rollout    actor
+  #   off       1850 s      576 s    1246 s
+  #   on        1889 s      518 s    1344 s     -> +39 s/step NET LOSS
+  #
+  # rollout did drop by 58 s, but actor training rose by 98 s. The reason is
+  # the same one behind this arm's GPU idling: actor training is already CPU
+  # SATURATED (GPU util ~50%, process 85% in user time with zero voluntary
+  # context switches), so there is no spare CPU in that window to absorb the
+  # bootstrap work -- it just competes with the training loop's own dispatch.
+  #
+  # Re-test it only after the actor phase stops being CPU-bound. Overlap in the
+  # framework's real sense (runner.use_training_pipeline) is unavailable here:
+  # rlinf/config.py:932 asserts adv_type == "gae" and this arm is GRPO.
+  overlap_env_bootstrap: False
 
   resume_dir: null
   ckpt_path: null
@@ -56,6 +87,28 @@ algorithm:
 
   adv_type: grpo
   loss_type: actor
+  # 1: every rollout batch is consumed exactly once, so training stays fully
+  # on-policy. The optimizer-step count is raised purely by data parallelism
+  # (global_batch_size 1024 below), not by replaying data.
+  #
+  # Why the update count had to be raised at all: the MetaWorld GSE arm that
+  # DID learn a specialized router (job 1475511: layerwise Cramer's V
+  # 0.407 -> 0.458 over 210 steps, success 0.414 -> 0.672) had IDENTICAL GSE
+  # settings to this one (rank 64, 8 experts, 1g7s, top_k 2, token routing,
+  # orthogonal_zero, scaling 1.0). The difference was the number of optimizer
+  # steps per global step:
+  #   MetaWorld: 5120 rows / global_batch 1024 x update_epoch 4 = 20 updates
+  #   LIBERO   : 16384 rows / global_batch 16384 x (unset = 1) =  1 update
+  # A 20x gap. The router suffers most: unlike the static LoRA factors it has
+  # to LEARN a routing function, and at one Adam step per rollout its
+  # displacement budget is tiny. Over the same 28-step window MetaWorld's
+  # Cramer's V moved +0.0117 while LIBERO's moved -0.0093 -- no learning.
+  #
+  # An earlier attempt used global_batch 4096 + update_epoch 4 (also 16
+  # updates). That works too, but replaying each batch 4 times makes the actor
+  # phase 4x longer and pushes approx_kl up. Reaching the same 16 updates
+  # through a smaller global batch keeps one pass over the data.
+  update_epoch: 1
   loss_agg_func: "token-mean"
   kl_beta: 0.0
   entropy_bonus: 0
@@ -132,9 +185,37 @@ actor:
   training_backend: "fsdp"
   # Match the official 8-GPU batch configuration used by the formal run.
   micro_batch_size: 32
-  global_batch_size: 16384
+  # 1024, not 16384. A step produces 64 env x 4 epochs x (512/8 chunks) = 16384
+  # rows, so the old value made the whole step ONE optimizer update. At 1024 a
+  # step is 16 global batches, i.e. 16 optimizer updates with update_epoch 1
+  # (MetaWorld's arm gets 20 from 5 batches x 4 epochs). This also matches
+  # MetaWorld's global_batch_size exactly, so the number of samples behind each
+  # Adam step is the same on both arms.
+  #
+  # Constraints, all checked by the launcher before any model loads:
+  # global_batch % (micro_batch x ranks) == 0 -> 1024 % (16x8) = 0, giving 8
+  # accumulation steps; and samples/step % global_batch == 0 -> 16384 % 1024 = 0.
+  # The launcher's ACTOR_GLOBAL_BATCH default is kept in sync, because a CLI
+  # override outranks this file.
+  global_batch_size: 1024
   seed: 1234
   enable_offload: True
+  # Deliberately 1, i.e. collect the GSE diagnostics on every optimizer step.
+  #
+  # The knob samples every Nth GLOBAL batch -- not micro-batch. It cannot be
+  # per-micro-batch: toggling the router bookkeeping inside a
+  # gradient-accumulation window makes the router receive a gradient on some
+  # micro-batches and not others, and FSDP asserts on exactly that
+  # ("All sharded parameters that received a gradient in the post-backward
+  # should use `_saved_grad_shard`", job 1477193, dead at step 0).
+  #
+  # And this config has ONE global batch per step (16384 samples /
+  # global_batch_size 16384), so N>1 would mean "no router metrics at all for
+  # N-1 consecutive steps". Whether the routing metrics move across steps is a
+  # required health signal for this experiment, so that trade is not worth
+  # taking. The per-layer saving from gating _record_routing is unaffected by
+  # this value.
+  adapter_metrics_micro_batch_interval: 1
 
   model:
     model_path: "${oc.env:REPO_PATH}/model/RLinf-OpenVLAOFT-LIBERO-90-Base-Lora/"
@@ -148,31 +229,56 @@ actor:
     is_lora: False
     gse:
       enabled: True
-      # PE-RL protocol: freeze the complete vision backbone and inject GSE only
-      # into the multimodal projector and language model.
+      # Whole-model injection: every nn.Linear of the vision backbone, the
+      # multimodal projector and the language model is wrapped, and all
+      # original weights stay frozen. This is a change from the earlier
+      # frozen-vision protocol (228 layers, 96,772,480 trainable parameters);
+      # with the vision backbone included the injected-layer count and the
+      # activation memory both rise, so the micro-batch and host-memory
+      # budgets measured for the frozen-vision runs no longer bound this one.
+      # Vision-GSE checkpoints are also incompatible with frozen-vision ones.
       scope: whole_model
       target_modules: all-linear
-      freeze_vision_backbone: True
+      freeze_vision_backbone: False
       total_rank: 64
-      lora_alpha: 32.0
+      # lora_alpha == total_rank so scaling_for_rank returns exactly 1.0 under
+      # scaling_mode "total_rank". Keep the two in lockstep if the rank changes.
+      lora_alpha: 64.0
       num_experts: 8
       num_generalized_experts: 1
       # Standard GSE routing uses hidden states without text conditioning.
       semantic_conditioning: False
       # The selected experts are evaluated together by the fused GSE path.
       top_k: 2
-      initialization: "svd"
+      # Orthogonal A factors with zero B: the residual is elementwise zero at
+      # step 0, so the initial policy is exactly the SFT policy. The file name
+      # says "svd" for historical reasons; this arm is orthogonal_zero.
+      #
+      # Note on the earlier justification, which has been retracted: the
+      # "bf16 cancellation in the preserve_svd_output residual" does not exist.
+      # Measured on the forward output (the quantity the model consumes, not an
+      # isolated residual) the bf16 error is 0.29% for preserve=True vs 0.34%
+      # for the folded path -- both at the plain-rounding noise floor. The
+      # phantom router gradient WAS real, but it is now fixed in
+      # rlinf/models/peft/gse/layer.py by using the same non-detached gate on
+      # both branches, so it is no longer a reason to avoid svd.
+      initialization: "orthogonal_zero"
       init_seed: 42
       freeze_base: True
-      # GSE-specific scaling: sqrt(3 * gse_eta * in_features / expert_rank).
-      # This makes lora_alpha ignored and compensates for rank limitations.
-      # Measured with gse_eta=1.0 and 8 experts: 27.71 at total_rank 32,
-      # 19.60 at 64, 13.86 at 128 (in_features=1024). The scaling shrinks as
-      # 1/sqrt(expert_rank), so rank × scaling² = constant (VLA-GSE design).
-      scaling_mode: "gse"
-      gse_eta: 1.0
-      svd_rho: 10.0
-      preserve_svd_output: True
+      # Fixed residual scaling of 1.0 (lora_alpha / total_rank = 64 / 64).
+      # The alternative "gse" mode returns sqrt(3 * gse_eta * in_features /
+      # expert_rank), i.e. 39.2 at the 4096-wide language-model projections,
+      # which folds capacity and step size into one knob. Holding scaling at
+      # 1.0 makes rank the only variable across the rank sweep and matches the
+      # LIBERO r32 arm and the MetaWorld orthogonal_zero reference.
+      scaling_mode: "total_rank"
+      # gse_eta, svd_rho and preserve_svd_output only take effect under
+      # scaling_mode "gse" / initialization "svd". Under orthogonal_zero,
+      # preserve_svd_output is an exact no-op (verified: max abs output
+      # difference 0.000e+00 either way, because B starts at 0 so the
+      # subtracted branch is identically zero). Stated explicitly rather than
+      # omitted so the zero-residual mechanism in use here is unambiguous.
+      preserve_svd_output: False
       # Token-level routing: one routing decision per token, matching the
       # official GSE method. action_sequence_routing is removed.
       routing_mode: "topk"
@@ -212,7 +318,7 @@ actor:
     # never creates the actor param group that would read it
     # (fsdp_model_manager.py: `if len(params_actor) > 0`). Adding it back would
     # look like a real knob while changing nothing.
-    gse_lr: 8e-5
+    gse_lr: 5e-5
     total_training_steps: ${runner.max_steps}
     lr_warmup_steps: 0
     lr_scheduler: "cosine"
@@ -227,24 +333,20 @@ actor:
     # Warm-restart only: preserve Adam state but start a fresh LR schedule.
     reset_lr_scheduler_on_resume: False
     adam_beta1: 0.9
-    adam_beta2: 0.999
+    # 0.95, matching the MetaWorld GSE arm. beta2 sets the second-moment window
+    # at roughly 1/(1-beta2) updates: 0.999 is a 1000-update window, and this
+    # run only performs a few thousand updates in total, so Adam's adaptive
+    # scaling would still be warming up for much of training. 0.95 is a 20-update
+    # window, which is what the arm that actually learned a router used.
+    adam_beta2: 0.95
     adam_eps: 1.0e-08
     weight_decay: 0.01
     clip_grad: 1.0
-    # The router is a single Linear(width, num_experts) whose gradient arrives
-    # only through the routing weights, so at the shared 2e-5 it barely moves
-    # while the expert factors train. Give it its own param group at 1e-3,
-    # matching the MetaWorld GSE configuration.
-    gse_router_lr: 1.0e-3
-    # Weight decay on a softmax router shrinks logits toward zero, which is a
-    # pull toward UNIFORM routing -- the same direction as the load-balancing
-    # loss this experiment sets to 0.0. So it cannot be large. But 1e-3 is 50x
-    # the base lr, and an unregularized router can saturate its softmax into
-    # hard routing with dead experts. 0.01 (the global value) shrinks weights
-    # ~3% over 3000 optimizer steps: enough to bound logit growth, far too weak
-    # to force uniformity. Raise only if router logits diverge; do not raise to
-    # "encourage balance", that is what killed specialization before.
-    gse_router_weight_decay: 0.01
+    # gse_router_lr and gse_router_weight_decay are deliberately UNSET: the
+    # router shares the actor lr above, matching the 0.73-eval MetaWorld
+    # gse-formal-seed42 reference, whose resolved config has no router lr
+    # override. The old 1e-3 was measured to be inert -- see the long note in
+    # metaworld_50_ppo_openpi_pi05_gse_action_r32_svd_1g7s.yaml for the numbers.
 
   fsdp_config:
     # A PEFT checkpoint is dominated by the frozen backbone, re-saved verbatim at
