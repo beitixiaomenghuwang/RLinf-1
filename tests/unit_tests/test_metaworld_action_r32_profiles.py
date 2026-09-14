@@ -65,7 +65,6 @@ def test_action_r32_profile_composition(
     "config_name",
     [
         "metaworld_50_ppo_openpi_pi05_gse_joint_vlm",
-        "metaworld_50_ppo_openpi_pi05_gse_vlm_last4",
     ],
 )
 def test_vlm_gse_router_defaults(

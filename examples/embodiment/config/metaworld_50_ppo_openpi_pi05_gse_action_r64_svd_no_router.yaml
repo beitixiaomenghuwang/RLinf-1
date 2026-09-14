@@ -1,5 +1,5 @@
 defaults:
-  - metaworld_50_ppo_openpi_pi05_gse_action_r32_svd_1g7s
+  - metaworld_50_ppo_openpi_pi05_gse_action_r64_ortho_zero_1g7s
   - _self_
 
 # Ablation A of PAPER_SUMMARY.md 4.4: the multi-expert residual WITHOUT a
@@ -20,7 +20,8 @@ defaults:
 # orthogonal_zero initialization, scaling_mode "total_rank" at scaling exactly
 # 1.0, eight experts, the same 126 action-expert projections, lr 5e-5 with
 # cosine min_lr_rate 0.1 and no router lr override, adapter-only checkpoints,
-# 128 train envs x 2 rollout epochs, and the 512-slot fixed eval reset pool.
+# 128 train envs x 2 rollout epochs, and 64 eval envs x 8 rollout epochs
+# over the 512-slot fixed eval reset pool.
 #
 # routing_mode "uniform" with num_generalized_experts == num_experts is a real
 # no-router build, not a router pinned to uniform. GSEAdapter constructs
@@ -71,15 +72,8 @@ runner:
 actor:
   model:
     gse:
-      # The paper's main method is rank 64: eight experts x rank 8, 29.1 M
-      # trainable parameters (PAPER_SUMMARY 3.3, HANDOFF.md 5.1). The parent
-      # YAML is pinned at 32 and its rank-64 arm is produced by a launcher
-      # override, so this file states 64 explicitly instead of inheriting 32.
-      #
-      # lora_alpha MUST track total_rank. scaling_for_rank divides by
-      # total_rank under scaling_mode "total_rank", so leaving the parent's
-      # 32.0 against rank 64 would give scaling 0.5 and halve the effective
-      # step a second time, on top of the gate-mass factor discussed above.
+      # Match the rank-64 parent: eight experts x rank 8. Keep alpha equal
+      # to total_rank so scaling_for_rank returns 1.0.
       total_rank: 64
       lora_alpha: 64.0
       # All eight experts always active, uniformly averaged, no router.

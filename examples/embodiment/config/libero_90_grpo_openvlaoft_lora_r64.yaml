@@ -1,5 +1,5 @@
 # Plain LoRA rank-64 RL baseline for LIBERO-90, matched to
-# libero_90_grpo_openvlaoft_gse_r64_svd.yaml everywhere except the adapter:
+# libero_90_grpo_openvlaoft_gse_r64_ortho_zero.yaml everywhere except the adapter:
 # same GRPO hyperparameters, same 64x4 training / 32x16 evaluation protocol,
 # same batch shape, same 120 steps, same lr and cosine schedule, same
 # adapter-only checkpointing. The single variable is the residual

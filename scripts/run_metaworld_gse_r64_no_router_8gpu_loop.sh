@@ -22,7 +22,7 @@ set -u
 : "${EXP_NAME:?export EXP_NAME}"
 EMBODIED_PATH=${EMBODIED_PATH:-/workspace/RLinf/examples/embodiment}
 
-CONFIG=${CONFIG:-metaworld_50_ppo_openpi_pi05_gse_action_r32_svd_no_router}
+CONFIG=${CONFIG:-metaworld_50_ppo_openpi_pi05_gse_action_r64_svd_no_router}
 SFT_MODEL=${SFT_MODEL:-/workspace/models/RLinf-Pi05-MetaWorld-SFT}
 
 # Capacity. Override only with a reason, and record it in HANDOFF.md.

@@ -7,22 +7,19 @@ defaults:
   - override hydra/job_logging: stdout
   - _self_
 
-# Main method: joint hidden-state + text-embedding routing.
+# Initialization ablation: SVD factors with a fixed backbone offset.
+# Tests whether SFT-style MoE-LoRA initialization transfers to PPO, relative
+# to the svd_zero main method. Both A0 and B0 contain sqrt(S) magnitudes;
+# svd_rho = 1 applies no additional spectral damping.
 #
-# Differs from official_1g7s in exactly one variable: semantic_conditioning.
-# The router logits become
-#   router(mean-pooled action-expert hidden states)
-#   + semantic_router_scale * semantic_router(frozen pooled prompt embedding)
-# (rlinf/models/peft/gse/layer.py:240-263).
-#
-# This matters on pi0.5 because the action expert's suffix carries only action
-# tokens: language and image tokens live in the prefix and reach the expert only
-# through the KV cache. Mean-pooling action-token hidden states therefore leaves
-# the router almost no task signal, which is why task-router NMI sat at ~6e-4.
-# The semantic branch gives it the instruction directly.
-#
-# semantic_embedding_dim is resolved from the PaliGemma embedding width at
-# injection time; do not set it here.
+# For this 1g7s arm, GSEAdapter._adjust_base_weight_for_svd subtracts once:
+#   C0 = s_g B_g0 A_g0 + (1/7) sum_e s_e B_e0 A_e0
+# The adjusted backbone stays frozen, and each forward evaluates:
+#   y = (W_sft - C0)x + s_g B_g A_g x + sum_e g_e(x) s_e B_e A_e x
+# The sums run over the seven specialized experts; top-k gates sum to one.
+# C0 is independent of the input and subsequent router updates. Outputs can
+# therefore differ from the SFT policy at step 0. Measure that drift and the
+# training dynamics; neither its magnitude nor training failure is assumed.
 
 hydra:
   run:
@@ -40,7 +37,7 @@ runner:
   logger:
     log_path: "../results"
     project_name: rlinf
-    experiment_name: "metaworld_50_pi05_gse_r32_svd_topk_semantic_1g7s"
+    experiment_name: "metaworld_50_pi05_gse_action_r64_svd_fixed_offset_1g7s"
     logger_backends: ["tensorboard", "wandb"]
   max_epochs: 180
   max_steps: -1
@@ -49,14 +46,8 @@ runner:
   # Must be divisible by val_check_interval: check_progress in
   # rlinf/utils/runner_utils.py asserts save_interval % val_check_interval == 0
   # whenever validation is enabled, and the embodied runner hardcodes
-  # limit_val_batches=1.0 so it always is. save_interval 10 against
-  # val_check_interval 20 crashes at the FIRST eval, not at startup (job
-  # 1471717 died there after 34 minutes).
+  # limit_val_batches=1.0 so it always is.
   save_interval: 20
-  # No cap: adapter-only checkpoints are ~110 MiB, so keeping the whole
-  # training trajectory costs less than a single old 17G full checkpoint and
-  # lets any step be re-evaluated later. null disables pruning entirely
-  # (prune_old_checkpoints returns early on None).
   max_checkpoints_to_keep: null
   resume_dir: null
   ckpt_path: null
@@ -98,8 +89,8 @@ env:
     video_cfg:
       save_video: False
   eval:
-    rollout_epoch: 1
-    total_num_envs: 512
+    rollout_epoch: 8
+    total_num_envs: 64
     auto_reset: True
     ignore_terminations: True
     max_episode_steps: 100
@@ -139,20 +130,26 @@ actor:
     is_lora: False
     gse:
       enabled: True
-      total_rank: 32
-      lora_alpha: 32.0
+      total_rank: 64
+      # lora_alpha MUST track total_rank so scaling_for_rank returns exactly 1.0
+      # under scaling_mode "total_rank" (it divides by total_rank, not by the
+      # per-expert rank).
+      lora_alpha: 64.0
       train_action_adapters: True
+      # Spectral initialization: each expert gets disjoint singular
+      # triplets and splits sqrt(S / (scaling * svd_rho)) across A and B, so B0
+      # is nonzero.
       initialization: "svd"
-      scaling_mode: "gse"
+      # Residual scaling is lora_alpha / total_rank = 1.
+      scaling_mode: "total_rank"
+      # gse_eta is inert (read only by scaling_mode "gse"). svd_rho and
+      # preserve_svd_output are BOTH LIVE on this branch -- they are the two keys
+      # that define this arm besides initialization itself.
       gse_eta: 1.0
-      svd_rho: 10.0
-      # preserve_svd_output True keeps the SFT function exactly at step 0
-      # (measured 0.0000% output deviation). The alternative folds a
-      # uniform-router prior into the base weight and is NOT exact (0.7038%).
-      # See metaworld_50_ppo_openpi_pi05_gse_action_r64_ortho_zero_1g7s.yaml for the
-      # full note, including why the "bf16 cancellation" concern was retracted
-      # and where the phantom router gradient was fixed.
-      preserve_svd_output: True
+      svd_rho: 1.0
+      # Fold C0 into the frozen backbone once. No per-forward subtraction of
+      # the initial factors with the current gates; see the formula above.
+      preserve_svd_output: False
       num_experts: 8
       num_generalized_experts: 1
       top_k: 2
@@ -161,17 +158,26 @@ actor:
       routing_granularity: "token"
       sequence_pooling: "mean"
       router_input: "hidden"
+      # Matches the official GSE repo, which never initializes its router and so
+      # keeps nn.Linear's own reset_parameters. router_init_std is deliberately
+      # unset: "default" does not read it.
       router_initialization: "default"
+      # Nonzero dropout disables the fused two-matmul expert path and falls back
+      # to a per-expert Python loop, which roughly doubles actor training time.
       lora_dropout: 0.0
+      # The Switch-style load-balancing term is minimized at uniform routing, so
+      # it opposes task specialization.
       load_balancing_loss_coef: 0.0
-      # Main method difference: semantic_conditioning enabled
-      semantic_conditioning: True
-      semantic_router_scale: 1.0
+      semantic_conditioning: False
+      # Judge router specialization by the layerwise metrics, not the aggregate
+      # ones; the aggregate sums packed statistics over all injected layers, so
+      # layers with opposing task preferences cancel.
       log_task_router_metrics: True
       log_layerwise_task_router_metrics: True
       task_router_num_tasks: 50
       task_router_informative_nmi_threshold: 0.01
       log_router_metrics: True
+      # Track A-factor geometry as the nonzero spectral factors are trained.
       log_orthogonality: True
       orthogonality_loss_coef: 0.0
     openpi:
@@ -179,7 +185,8 @@ actor:
       num_images_in_input: 1
       value_after_vlm: True
   optim:
-    lr: 2.0e-5
+    # Keep the existing learning rate for the fixed-offset initialization arm.
+    lr: 5.0e-5
     value_lr: 1.0e-4
     adam_beta1: 0.9
     adam_beta2: 0.95
@@ -191,34 +198,20 @@ actor:
     lr_warmup_steps: 0
     lr_scheduler: "cosine"
     num_cycles: 0.5
-    # Decay each param group to 10% of its own initial lr. Expressed as a RATE,
-    # not min_lr: transformers computes min_lr_rate = min_lr / optimizer.defaults["lr"],
-    # and build_optimizer sets lr only per param group, so defaults["lr"] stays at
-    # torch AdamW's own 1e-3. An absolute min_lr is therefore divided by 1e-3
-    # regardless of the configured lrs, which silently rescales the floor whenever
-    # a group lr changes. min_lr_rate bypasses that division entirely.
+    # A RATE, not min_lr: transformers computes
+    # min_lr_rate = min_lr / optimizer.defaults["lr"], and build_optimizer sets
+    # lr only per param group, so defaults["lr"] stays at torch AdamW's 1e-3.
     min_lr_rate: 0.1
-    # gse_router_lr and gse_router_weight_decay are deliberately UNSET: the
-    # router shares the actor lr above, matching the 0.73-eval
-    # gse-formal-seed42 reference, whose resolved config has no router lr
-    # override. See metaworld_50_ppo_openpi_pi05_gse_action_r64_ortho_zero_1g7s.yaml.
+    # gse_router_lr is deliberately UNSET: the router shares the actor lr,
+    # matching the 0.73-eval gse-formal-seed42 reference and the main method.
   fsdp_config:
-    # A PEFT checkpoint is dominated by the frozen backbone, re-saved verbatim at
-    # every step. Measured on a pi0.5 GSE rank-32 checkpoint (job 1468982 step
-    # 100): 17G total, of which the adapter tensors were 33.8 MiB. Every
-    # parameter carrying optimizer state was an adapter/router/value_head tensor,
-    # and each base tensor differing from model.safetensors differed by exactly
-    # its bf16 rounding, so the base is frozen and is restored from
-    # actor.model.model_path on resume. Load auto-detects the format from a
-    # marker file, so a run can still resume from older full checkpoints.
     adapter_only_checkpoint: True
-    # full_weights.pt is the whole model, so writing it would restore the cost
-    # adapter-only saving removes. Standalone eval via runner.ckpt_path needs a
-    # materialized file: rebuild it from the base weights plus one adapter
-    # checkpoint instead of re-saving it at every save_interval.
     save_full_model_weights: False
     strategy: "fsdp"
     sharding_strategy: "no_shard"
+    # use_orig_params stays False: True made FSDP validate that every original
+    # parameter still aliases its flat-param slot on each forward, and this actor
+    # path rebinds a 1152x1152 base projection between rollout and training.
     use_orig_params: False
     gradient_checkpointing: False
     mixed_precision:

@@ -5,7 +5,7 @@
 # number).
 #
 #   config     examples/embodiment/config/
-#                metaworld_50_ppo_openpi_pi05_gse_action_r32_svd_no_router.yaml
+#                metaworld_50_ppo_openpi_pi05_gse_action_r64_svd_no_router.yaml
 #   arm        8 experts / rank 64 (rank 8 each) / uniform aggregation / no
 #              router parameters / orthogonal_zero / scaling 1.0 / lr 5e-5
 #   budget     300 steps, save every 10 (adapter only, no retention cap),

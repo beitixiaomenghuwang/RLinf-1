@@ -45,7 +45,7 @@ actor:
       # preserve_svd_output True keeps the SFT function exactly at step 0
       # (measured 0.0000% output deviation). The alternative folds a
       # uniform-router prior into the base weight and is NOT exact (0.7038%).
-      # See metaworld_50_ppo_openpi_pi05_gse_action_r32_svd_1g7s.yaml for the
+      # See metaworld_50_ppo_openpi_pi05_gse_action_r64_ortho_zero_1g7s.yaml for the
       # full note, including why the "bf16 cancellation" concern was retracted
       # and where the phantom router gradient was fixed.
       preserve_svd_output: True

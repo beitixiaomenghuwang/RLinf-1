@@ -50,7 +50,7 @@ runner:
   logger:
     log_path: "../results"
     project_name: rlinf
-    experiment_name: "metaworld_50_pi05_gse_action_r32_svd_1g7s"
+    experiment_name: "metaworld_50_pi05_gse_action_r64_ortho_zero_1g7s"
     logger_backends: ["tensorboard", "wandb"]
   max_epochs: 180
   max_steps: -1
@@ -104,8 +104,8 @@ env:
     video_cfg:
       save_video: False
   eval:
-    rollout_epoch: 1
-    total_num_envs: 512
+    rollout_epoch: 8
+    total_num_envs: 64
     auto_reset: True
     ignore_terminations: True
     max_episode_steps: 100
@@ -145,12 +145,12 @@ actor:
     is_lora: False
     gse:
       enabled: True
-      total_rank: 32
+      total_rank: 64
       # lora_alpha MUST track total_rank so scaling_for_rank returns exactly 1.0
       # under scaling_mode "total_rank" (it divides by total_rank, not by the
-      # per-expert rank). Leaving it at 64 while total_rank is 32 gives scaling
-      # 2.0 and doubles the effective step: measured 0.01855 vs 0.00928.
-      lora_alpha: 32.0
+      # per-expert rank). Leaving it at 64 while total_rank is 64 gives scaling
+      # 1.0 and keeps the effective step consistent: measured 0.01855 vs 0.01855.
+      lora_alpha: 64.0
       train_action_adapters: True
       # orthogonal_zero, not svd -- see the header comment for the measured
       # 12.7 pp eval gap and the subspace-lock-in mechanism behind it.

@@ -31,7 +31,10 @@ runner:
     logger_backends: ["tensorboard"]
 
   max_epochs: 1000
-  max_steps: 120
+  # 300: the launcher passes runner.max_steps=$MAX_STEPS (default 300) and a CLI
+  # override outranks this file, so 120 here was only ever cosmetic. Stated as
+  # 300 so the file agrees with what every run of this arm actually used.
+  max_steps: 300
 
   only_eval: False
   val_check_interval: 20
@@ -292,10 +295,24 @@ actor:
       # Nonzero dropout disables the fused two-matmul expert path and falls
       # back to a per-expert Python loop, roughly doubling actor training time.
       lora_dropout: 0.0
-      # The Switch-style load-balancing term is minimized at uniform routing,
-      # so it opposes task specialization. Measured at coef 0.01-0.02 it
-      # dominated the PPO objective by more than an order of magnitude.
-      load_balancing_loss_coef: 0.0
+      # Damping for the router LR opened below -- the two go together and
+      # neither works alone.
+      #
+      # The earlier claim that this term "opposes task specialization" was
+      # wrong. It is computed on the TOKEN-AVERAGED load (layer.py:450,
+      # counts / num_tokens), so a router that sends token A to expert 1 and
+      # token B to expert 2 is maximally input-dependent AND perfectly
+      # balanced -- the term does not penalize it at all. What it penalizes is
+      # AGGREGATE winner-take-all, which is exactly the observed failure mode
+      # whenever the router is allowed to move: 6/6 archived runs at
+      # gse_router_lr 1e-3 with this coefficient at 0 collapsed to near-one-hot
+      # within 25-70 steps (normalized_entropy -0.36 to -0.71).
+      #
+      # Scale, for reading the logged value: with top_k 2 over 7 specialized
+      # experts the term is 2.0 at uniform and 7.0 at a two-expert monopoly.
+      # This chain measured 2.2246 -> 2.2668 over steps 0-115, i.e. 11-13% off
+      # uniform while the router was effectively frozen.
+      load_balancing_loss_coef: 0.01
       orthogonality_loss_coef: 0.0
       # Match the MetaWorld GSE diagnostic surface: aggregate and layerwise
       # task/router statistics are emitted under train/gse/*.
@@ -321,7 +338,16 @@ actor:
     gse_lr: 5e-5
     total_training_steps: ${runner.max_steps}
     lr_warmup_steps: 0
-    lr_scheduler: "cosine"
+    # constant, not cosine. This arm resumes at step 140 of 300 to test whether
+    # a router that is finally allowed to move can learn a useful partition. A
+    # cosine schedule over total_training_steps would hand the last 160 steps a
+    # decaying LR (and with reset_lr_scheduler_on_resume it would restart the
+    # decay from full LR at step 140, changing the adapter's step size at the
+    # same time as the router's -- two variables at once). With
+    # lr_warmup_steps 0 the constant branch (utils.py:571) returns 1.0 at every
+    # step, so each param group stays at its own configured LR for the whole
+    # resumed segment and the router LR is the only thing that changed.
+    lr_scheduler: "constant"
     num_cycles: 0.5
     # Decay each param group to 10% of its own initial lr. Expressed as a RATE,
     # not min_lr: transformers computes min_lr_rate = min_lr / optimizer.defaults["lr"],
@@ -330,8 +356,25 @@ actor:
     # regardless of the configured lrs, which silently rescales the floor whenever
     # a group lr changes. min_lr_rate bypasses that division entirely.
     min_lr_rate: 0.1
-    # Warm-restart only: preserve Adam state but start a fresh LR schedule.
-    reset_lr_scheduler_on_resume: False
+    # REQUIRED for this arm, and it does two things here.
+    #
+    # 1. Fresh LR schedule instead of the checkpoint's decayed param-group LRs
+    #    (a resume otherwise silently reverts a configured LR).
+    # 2. Together with gse_router_lr being set, it is the trigger that makes
+    #    load_checkpoint() load model tensors ONLY and reinitialize the Adam
+    #    moments (fsdp_model_manager.py). That is necessary because opening a
+    #    router LR adds a param group: the checkpoint at step 140 was written
+    #    with a single adapter group, and set_optimizer_state_dict maps groups
+    #    BY POSITION, so restoring it onto the new [adapter, router] layout
+    #    would either abort or silently write the checkpoint's adapter
+    #    hyper-parameters onto the router group -- i.e. the router LR under
+    #    test would never take effect.
+    #
+    # Fresh moments are also the right choice on their own: the router starts
+    # with zero momentum rather than inheriting the adapter's moment scale.
+    # Step recovery is unaffected -- the runner reads the step from the
+    # directory name (embodied_runner.py:297), not from optimizer state.
+    reset_lr_scheduler_on_resume: True
     adam_beta1: 0.9
     # 0.95, matching the MetaWorld GSE arm. beta2 sets the second-moment window
     # at roughly 1/(1-beta2) updates: 0.999 is a 1000-update window, and this
@@ -342,11 +385,37 @@ actor:
     adam_eps: 1.0e-08
     weight_decay: 0.01
     clip_grad: 1.0
-    # gse_router_lr and gse_router_weight_decay are deliberately UNSET: the
-    # router shares the actor lr above, matching the 0.73-eval MetaWorld
-    # gse-formal-seed42 reference, whose resolved config has no router lr
-    # override. The old 1e-3 was measured to be inert -- see the long note in
-    # metaworld_50_ppo_openpi_pi05_gse_action_r32_svd_1g7s.yaml for the numbers.
+    # 2e-4 = 4x the adapter LR. This is the variable under test.
+    #
+    # Why the router needs its own LR at all: at the shared 5e-5 it does not
+    # move. Measured from this chain's own DCP checkpoints, the router's
+    # per-coordinate displacement over 100 steps is ~1.1e-3 at every width
+    # (1024 through 11008) -- the Adam signature of a fixed step, giving a
+    # gradient coherence of only 1.1e-3 / (100 x 5e-5) = 0.22. Against a
+    # kaiming init std of 1/sqrt(3*d_in), the learned logit component reaches
+    # only N*lr*eta/init_std ~ 0.37 of the random-init one over a full 300-step
+    # run, so the routing that is actually in use stays dominated by the
+    # random initialization. Cross-checked against the per-token entropy: the
+    # logit std moves 0.190 -> 0.212 over steps 0-115, i.e. the learned part is
+    # about half the random part.
+    #
+    # Why 2e-4 and not the 1e-3 tried before: 1e-3 is NOT inert (the earlier
+    # note here was wrong). It is the opposite -- 6/6 archived runs at 1e-3
+    # drove the router to near-one-hot within 25-70 steps and cost up to 8 pp
+    # of eval macro (best 0.6465 vs 0.7269 for the frozen-router arm). Every
+    # one of those runs had load_balancing_loss_coef at 0, so the collapse had
+    # no damping. 2e-4 puts the ratio near 1.5 -- enough to move, with 5x
+    # margin to the known collapse point -- and the balancing term above
+    # supplies the damping that was missing.
+    #
+    # Read-out, in order of decisiveness (train/gse/llm_router/*):
+    #   normalized_entropy in 0.90-0.96 at step 180 = moving and stable;
+    #     >0.963 = still frozen, raise to 5e-4;
+    #     <0.85 or a slope steeper than -0.004/step = collapsing, raise
+    #     load_balancing_loss_coef to 0.03.
+    #   train/gse/task_router/layerwise_nmi_mean must exceed its own step-0
+    #     value of 0.0163 -- that is the actual goal and it has never happened.
+    gse_router_lr: 2.0e-04
 
   fsdp_config:
     # A PEFT checkpoint is dominated by the frozen backbone, re-saved verbatim at
