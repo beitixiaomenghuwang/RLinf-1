@@ -145,6 +145,11 @@ class GSEAdapter(nn.Module):
             scalings=[float(expert.scaling) for expert in experts],
             svd_rho=config.svd_rho,
         )
+        # Only "svd" needs a correction: it is the one initialization that gives
+        # B a nonzero start, so its residual is nonzero at step 0. "svd_zero"
+        # shares the same A subspace but keeps B == 0, which already makes the
+        # residual identically zero, so it takes neither branch -- exactly like
+        # orthogonal_zero.
         if config.initialization == "svd":
             if config.preserve_svd_output:
                 for expert in experts:

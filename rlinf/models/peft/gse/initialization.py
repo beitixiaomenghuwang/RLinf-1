@@ -45,6 +45,30 @@ def _full_svd_factors(
     )
 
 
+def _check_svd_base_weight(
+    base_weight: torch.Tensor | None,
+    *,
+    method: str,
+    in_features: int,
+    out_features: int,
+    total_rank: int,
+) -> torch.Tensor:
+    """Validate the base weight both spectral initializations decompose."""
+    if base_weight is None:
+        raise ValueError(f"{method} initialization requires the wrapped base weight")
+    if base_weight.shape != (out_features, in_features):
+        raise ValueError(
+            "base_weight shape must match the wrapped linear layer, got "
+            f"{tuple(base_weight.shape)} != {(out_features, in_features)}"
+        )
+    if total_rank > min(base_weight.shape):
+        raise ValueError(
+            f"{method} initialization requires total rank no larger than the base "
+            f"weight rank, got {total_rank} > {min(base_weight.shape)}"
+        )
+    return base_weight
+
+
 @torch.no_grad()
 def initialize_expert_factors(
     lora_a_layers: Sequence[nn.Linear],
@@ -61,6 +85,16 @@ def initialize_expert_factors(
 
     ``svd`` follows VLA-GSE's factor geometry: each expert receives disjoint
     singular triplets and splits ``S / (scaling * rho)`` evenly across A and B.
+
+    ``svd_zero`` keeps only the *direction* half of that geometry: the joint A
+    is the base weight's leading right singular vectors, but B stays at zero and
+    no ``sqrt(S)`` magnitude is baked into either factor. It is therefore the
+    spectral counterpart of ``orthogonal_zero`` -- same row-orthonormal A at the
+    same ``orthogonal_gain`` scale, same exactly-zero initial residual, only the
+    choice of subspace differs. See RLPO in "Geometry-Preserving Orthonormal
+    Initialization for Low-Rank Adaptation in RLVR" (arXiv 2606.31813), which
+    reports that the ``sqrt(S)`` magnitudes -- not the principal subspace itself
+    -- are what destabilizes ``svd`` under RL.
     """
     if len(lora_a_layers) != len(lora_b_layers):
         raise ValueError("A and B layer counts must match")
@@ -87,21 +121,29 @@ def initialize_expert_factors(
         bound = 1.0 / math.sqrt(in_features)
         joint_a = torch.empty(total_rank, in_features, dtype=torch.float32)
         joint_a.uniform_(-bound, bound, generator=generator)
+    elif method == "svd_zero":
+        base_weight = _check_svd_base_weight(
+            base_weight,
+            method=method,
+            in_features=in_features,
+            out_features=out_features,
+            total_rank=total_rank,
+        )
+        # Only the right singular vectors are used. They are already
+        # row-orthonormal, so scaling by orthogonal_gain puts this A on exactly
+        # the same norm as orthogonal_zero's QR basis and leaves the subspace as
+        # the single difference between the two arms. joint_b stays None, so the
+        # shared tail below zeroes every B.
+        _, _, right = _full_svd_factors(base_weight, total_rank)
+        joint_a = right.mul_(orthogonal_gain)
     elif method == "svd":
-        if base_weight is None:
-            raise ValueError(
-                f"{method} initialization requires the wrapped base weight"
-            )
-        if base_weight.shape != (out_features, in_features):
-            raise ValueError(
-                "base_weight shape must match the wrapped linear layer, got "
-                f"{tuple(base_weight.shape)} != {(out_features, in_features)}"
-            )
-        if total_rank > min(base_weight.shape):
-            raise ValueError(
-                "svd initialization requires total rank no larger than the base "
-                f"weight rank, got {total_rank} > {min(base_weight.shape)}"
-            )
+        base_weight = _check_svd_base_weight(
+            base_weight,
+            method=method,
+            in_features=in_features,
+            out_features=out_features,
+            total_rank=total_rank,
+        )
         if scalings is None or len(scalings) != len(lora_a_layers):
             raise ValueError("svd initialization requires one scaling per expert")
         if svd_rho <= 0:

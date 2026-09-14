@@ -337,6 +337,7 @@ class FSDPStrategyBase(ABC):
         lr_schedulers: Union[LRScheduler, Iterable[LRScheduler]],
         load_path: str,
         checkpoint_format: str = "dcp",
+        load_optimizer: bool = True,
     ) -> None:
         """
         Load the training state checkpoint.
@@ -353,6 +354,7 @@ class FSDPStrategyBase(ABC):
             lr_schedulers (Union[LRScheduler, Iterable[LRScheduler]]): The learning rate scheduler to load the checkpoint into.
             load_path (str): The path to load the checkpoint from.
             checkpoint_format (str): "dcp" or "local_shard".
+            load_optimizer (bool): Whether to restore optimizer and scheduler state.
         """
         opts = StateDictOptions(full_state_dict=False, cpu_offload=True)
         # Whether the checkpoint holds only adapter tensors is a property of the
@@ -368,6 +370,7 @@ class FSDPStrategyBase(ABC):
             fsdp_version=cls.get_fsdp_version(),
             checkpoint_format=checkpoint_format,
             adapter_only=adapter_only,
+            load_optimizer=load_optimizer,
         )
         try:
             if checkpoint_format == "local_shard":

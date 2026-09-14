@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import logging
+import os
 from datetime import timedelta
 from typing import Optional
 
@@ -132,7 +133,7 @@ class MultiChannelProcessGroup:
 
         self._group_name = group_name
         try:
-            # Set default timeout to 180 minutes
+            # Set default timeout to 180 minutes for NCCL/accel-CCL collectives.
             timeout = int(Cluster.get_sys_env_var(ClusterEnvVar.TIMEOUT, "180"))
             self._logger.debug(
                 f"Setting timeout to {timeout} minutes for group {group_name}"
@@ -141,6 +142,35 @@ class MultiChannelProcessGroup:
         except ValueError:
             raise ValueError(
                 "Invalid TIMEOUT value. It should be an integer representing minutes."
+            )
+
+        try:
+            # Gloo carries cross-node send/recv of trajectory data. Its timeout
+            # bounds how long a receiver waits for a peer, so it must exceed the
+            # peer's SLOWEST legitimate compute, not just connection setup: the
+            # receiver blocks while the sender runs simulator physics.
+            #
+            # Measured on the LIBERO-90 8-GPU arm (job 1488625, 39 steps):
+            #     env bootstrap_step        202-212 s
+            #     env_interact_step         103-124 s
+            #     rollout generate_epoch    482-513 s
+            # A 30 s default was tried and every run died ~7 min in (jobs
+            # 1493308, 1493444): gloo raised IoException from its background
+            # thread, which reaches std::terminate() and SIGABRTs the worker
+            # with no Python traceback. Do not size this against "rendezvous".
+            #
+            # 30 min is ~3.5x the slowest measured operation, while still
+            # surfacing a genuinely dead peer far sooner than the 180-minute
+            # accel-CCL timeout (which once hung a job for 3 h, invisible to
+            # Ray's health checks).
+            gloo_timeout_s = int(os.environ.get("RLINF_GLOO_TIMEOUT_S", "1800"))
+            gloo_timeout = timedelta(seconds=gloo_timeout_s)
+            self._logger.debug(
+                f"Setting gloo timeout to {gloo_timeout_s}s for group {group_name}"
+            )
+        except ValueError:
+            raise ValueError(
+                "Invalid RLINF_GLOO_TIMEOUT_S value. It should be an integer representing seconds."
             )
 
         if not self._no_accel_ccl:
@@ -192,7 +222,7 @@ class MultiChannelProcessGroup:
                         base_group=base_group,
                         backend="gloo",
                         group_name=group_name + f"gloo_send_{i}",
-                        timeout=timeout,
+                        timeout=gloo_timeout,
                     )
                 )
 
@@ -201,7 +231,7 @@ class MultiChannelProcessGroup:
                         base_group=base_group,
                         backend="gloo",
                         group_name=group_name + f"gloo_recv_{i}",
-                        timeout=timeout,
+                        timeout=gloo_timeout,
                     )
                 )
 
@@ -221,7 +251,7 @@ class MultiChannelProcessGroup:
                         base_group=base_group,
                         backend="gloo",
                         group_name=group_name + f"gloo_collective_{i}",
-                        timeout=timeout,
+                        timeout=gloo_timeout,
                     )
                 )
         else:
@@ -233,7 +263,7 @@ class MultiChannelProcessGroup:
                 world_size=world_size,
                 rank=rank,
                 group_name=group_name + "gloo_send_0",
-                timeout=timeout,
+                timeout=gloo_timeout,
             )
             base_store = torch.distributed.distributed_c10d._get_process_group_store(
                 base_group
@@ -247,7 +277,7 @@ class MultiChannelProcessGroup:
                         rank=rank,
                         store=base_store,
                         group_name=group_name + f"gloo_send_{i}",
-                        timeout=timeout,
+                        timeout=gloo_timeout,
                     )
                     if i > 0
                     else base_group
@@ -260,7 +290,7 @@ class MultiChannelProcessGroup:
                         rank=rank,
                         store=base_store,
                         group_name=group_name + f"gloo_recv_{i}",
-                        timeout=timeout,
+                        timeout=gloo_timeout,
                     )
                 )
 
@@ -271,7 +301,7 @@ class MultiChannelProcessGroup:
                         rank=rank,
                         store=base_store,
                         group_name=group_name + f"gloo_collective_{i}",
-                        timeout=timeout,
+                        timeout=gloo_timeout,
                     )
                 )
 
@@ -459,6 +489,13 @@ class MultiChannelProcessGroup:
             pg_name = dist._get_process_group_name(group)
             msg = f"Broadcast failed on ProcessGroup {pg_name} rank {self._cur_rank} with error: {error}. Args - tensor: {tensor}, src: {src}, group: {group}, async_op: {async_op}."
             self._logger.error(msg)
+            # This except block exists only to attach the group name to the log
+            # line; torch's own _exception_logger does the same and re-raises.
+            # Swallowing the error would leave `tensor` holding whatever it held
+            # before the broadcast -- an uninitialized buffer on the recv side --
+            # and the caller would consume that as received data even though the
+            # peer is already dead.
+            raise
 
     @staticmethod
     def _create_process_group(

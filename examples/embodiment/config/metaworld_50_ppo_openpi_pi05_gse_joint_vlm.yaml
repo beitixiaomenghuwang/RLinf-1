@@ -31,7 +31,8 @@ env:
     rollout_epoch: 2
     total_num_envs: 128
   eval:
-    total_num_envs: 512
+    total_num_envs: 64
+    rollout_epoch: 8
 
 actor:
   micro_batch_size: 16

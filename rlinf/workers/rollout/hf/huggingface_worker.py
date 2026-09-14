@@ -37,6 +37,7 @@ from rlinf.models import get_model
 from rlinf.models.embodiment.base_policy import BasePolicy
 from rlinf.models.peft.gse import (
     iter_gse_layers,
+    load_gse_state_dict,
     set_gse_router_stats_enabled,
 )
 from rlinf.scheduler import (
@@ -205,8 +206,23 @@ class MultiStepRolloutWorker(Worker):
             )
 
         if self.cfg.runner.get("ckpt_path", None):
-            model_dict = torch.load(self.cfg.runner.ckpt_path)
-            self.hf_model.load_state_dict(model_dict)
+            # GSE evaluation checkpoints may contain a duplicated full base
+            # model (~15 GB) alongside ~465 MB of adapter weights.  Loading
+            # that state dict eagerly can OOM the rollout worker even though
+            # the base model has already been loaded from ``model_path``.
+            checkpoint_path = self.cfg.runner.ckpt_path
+            model_dict = torch.load(
+                checkpoint_path,
+                map_location="cpu",
+                weights_only=True,
+                mmap=True,
+            )
+            if _gse_layers_present(self.hf_model) and any(
+                ".adapter." in key for key in model_dict
+            ):
+                load_gse_state_dict(self.hf_model, model_dict, strict=False)
+            else:
+                self.hf_model.load_state_dict(model_dict)
 
         rlt_feature_model_config = OmegaConf.select(
             self.cfg, "rollout.rlt_feature_model", default=None

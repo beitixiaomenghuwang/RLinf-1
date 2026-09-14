@@ -127,12 +127,15 @@ def list_of_dict_to_dict_of_list(
     """
     if len(list_of_dict) == 0:
         return {}
-    keys = list_of_dict[0].keys()
+    # Vectorized environments may legitimately omit optional info fields for
+    # one slot (for example while another slot reports an episode result).
+    # Build the union of keys and keep the batch aligned instead of rejecting
+    # the whole step when one environment returns a sparse info dictionary.
+    keys = list(dict.fromkeys(key for data in list_of_dict for key in data))
     output = {key: [] for key in keys}
     for data in list_of_dict:
-        for key, item in data.items():
-            assert key in output
-            output[key].append(item)
+        for key in keys:
+            output[key].append(data.get(key))
     return output
 
 

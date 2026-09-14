@@ -5,7 +5,7 @@ from typing import Literal
 
 RoutingGranularity = Literal["sequence", "token"]
 SequencePooling = Literal["mean", "first", "last"]
-Initialization = Literal["orthogonal_zero", "kaiming_zero", "svd"]
+Initialization = Literal["orthogonal_zero", "kaiming_zero", "svd", "svd_zero"]
 ScalingMode = Literal["total_rank", "expert_rank", "gse"]
 RoutingMode = Literal["topk", "all", "uniform"]
 RouterInput = Literal["hidden", "rank_rms"]
@@ -76,7 +76,7 @@ class GSEConfig:
             "routing_granularity": ({"sequence", "token"}, self.routing_granularity),
             "sequence_pooling": ({"mean", "first", "last"}, self.sequence_pooling),
             "initialization": (
-                {"orthogonal_zero", "kaiming_zero", "svd"},
+                {"orthogonal_zero", "kaiming_zero", "svd", "svd_zero"},
                 self.initialization,
             ),
             "scaling_mode": (
@@ -193,10 +193,11 @@ class GSEConfig:
                 "orthogonal_zero requires total_rank <= in_features, got "
                 f"{self.total_rank} > {in_features}"
             )
-        if self.initialization == "svd" and out_features is not None:
+        if self.initialization in ("svd", "svd_zero") and out_features is not None:
             max_rank = min(in_features, out_features)
             if self.total_rank > max_rank:
                 raise ValueError(
-                    "svd initialization requires total_rank <= min(in_features, "
-                    f"out_features), got {self.total_rank} > {max_rank}"
+                    f"{self.initialization} initialization requires total_rank <= "
+                    f"min(in_features, out_features), got "
+                    f"{self.total_rank} > {max_rank}"
                 )

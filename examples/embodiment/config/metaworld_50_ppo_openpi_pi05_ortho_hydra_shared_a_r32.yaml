@@ -99,8 +99,8 @@ env:
     video_cfg:
       save_video: False
   eval:
-    rollout_epoch: 1
-    total_num_envs: 512
+    rollout_epoch: 8
+    total_num_envs: 64
     auto_reset: True
     ignore_terminations: True
     max_episode_steps: 100

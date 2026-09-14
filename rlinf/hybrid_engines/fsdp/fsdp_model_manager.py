@@ -376,8 +376,25 @@ class FSDPModelManager:
             for group in self.optimizer.param_groups
         ]
 
+        # A newly introduced router LR creates a new optimizer param group. An
+        # older DCP checkpoint cannot satisfy that group's hyperparameters, so
+        # load the adapter/router model tensors and start fresh moments while
+        # retaining the explicitly requested warm-start scheduler reset.
+        load_optimizer = not (
+            reset_lr_scheduler
+            and self._cfg.optim.get("gse_router_lr", None) is not None
+        )
+        if not load_optimizer:
+            self._logger.warning(
+                "[FSDP] Router LR changed the optimizer param-group layout; "
+                "loading model state only and reinitializing optimizer moments."
+            )
         self._strategy.load_checkpoint(
-            self.model, self.optimizer, self.lr_scheduler, load_path
+            self.model,
+            self.optimizer,
+            self.lr_scheduler,
+            load_path,
+            load_optimizer=load_optimizer,
         )
 
         if len(configured_hparams) == len(self.optimizer.param_groups):
@@ -404,13 +421,22 @@ class FSDPModelManager:
             ):
                 param_group["lr"] = initial_lr
                 param_group["initial_lr"] = initial_lr
+            # Infer the resume step from the checkpoint path so that a cosine
+            # (or any other step-dependent) scheduler starts from the right
+            # position in the curve rather than from step 0.
+            # load_path ends in "…/global_step_N/actor"; strip "actor" first.
+            import re as _re
+
+            _m = _re.search(r"global_step_(\d+)", load_path)
+            _last_epoch = int(_m.group(1)) if _m else -1
             self.lr_scheduler = self.build_lr_scheduler(
                 optimizer=self.optimizer,
                 optim_config=self._cfg.optim,
+                last_epoch=_last_epoch,
             )
             self._logger.info(
                 "[FSDP] Reset LR scheduler after checkpoint resume with "
-                f"configured initial LRs: {initial_lrs}"
+                f"configured initial LRs: {initial_lrs}, last_epoch={_last_epoch}"
             )
 
     def save_checkpoint(self, save_path: str, step: int = 0) -> None:

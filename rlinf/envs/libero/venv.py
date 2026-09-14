@@ -14,6 +14,7 @@
 
 import gc
 import multiprocessing
+import os
 import warnings
 from multiprocessing import connection
 from typing import Any, Callable, Optional, Union
@@ -77,6 +78,9 @@ warnings.simplefilter("once", DeprecationWarning)
 
 _ENV_START_TIMEOUT_SECONDS = 180
 _ENV_CLOSE_TIMEOUT_SECONDS = 30
+_ENV_OPERATION_TIMEOUT_SECONDS = float(
+    os.environ.get("RLINF_LIBERO_ENV_OPERATION_TIMEOUT_SECONDS", "120")
+)
 
 
 def _worker(
@@ -202,11 +206,35 @@ class ReconfigureSubprocEnvWorker(SubprocEnvWorker):
         self._wait_until_ready()
         EnvWorker.__init__(self, env_fn)
 
+    def _recv_with_timeout(self, operation: str):
+        """Receive one environment response without allowing an IPC hang."""
+        if not self.parent_remote.poll(_ENV_OPERATION_TIMEOUT_SECONDS):
+            self._abort_process()
+            raise TimeoutError(
+                "LIBERO environment subprocess timed out during "
+                f"{operation} after {_ENV_OPERATION_TIMEOUT_SECONDS:g}s"
+            )
+        try:
+            return self.parent_remote.recv()
+        except (EOFError, OSError) as exc:
+            self._abort_process()
+            raise RuntimeError(
+                f"LIBERO environment subprocess exited during {operation}"
+            ) from exc
+
+    def _abort_process(self) -> None:
+        """Stop a child that no longer responds to its control pipe."""
+        if self.process.is_alive():
+            self.process.terminate()
+            self.process.join(10)
+        if self.process.is_alive():
+            self.process.kill()
+            self.process.join(10)
+
     def _wait_until_ready(self) -> None:
         """Wait until the child has created its simulator and EGL context."""
         if not self.parent_remote.poll(_ENV_START_TIMEOUT_SECONDS):
-            self.process.terminate()
-            self.process.join(10)
+            self._abort_process()
             raise TimeoutError(
                 "LIBERO environment initialization timed out after "
                 f"{_ENV_START_TIMEOUT_SECONDS}s; check the NVIDIA driver and EGL logs"
@@ -214,7 +242,7 @@ class ReconfigureSubprocEnvWorker(SubprocEnvWorker):
         try:
             message = self.parent_remote.recv()
         except EOFError as exc:
-            self.process.join(10)
+            self._abort_process()
             raise RuntimeError(
                 "LIBERO environment subprocess exited while creating its EGL context"
             ) from exc
@@ -257,11 +285,37 @@ class ReconfigureSubprocEnvWorker(SubprocEnvWorker):
         self._close_process()
         self.parent_remote.close()
 
-        def env_fn(param=param):
-            import os
+        # The parent process may start with LIBERO_TYPE=standard while the
+        # custom Plus suite selects the Plus package inside the initial env
+        # closure.  Reconfigured workers are fresh spawn processes, so they
+        # must repeat that package selection instead of importing the standard
+        # LIBERO environment by default.
+        env_variant = os.environ.get("LIBERO_TYPE", get_libero_type()).lower()
 
-            os.environ.setdefault("LIBERO_TYPE", get_libero_type())
-            from libero.libero.envs import OffScreenRenderEnv
+        def env_fn(param=param, _variant=env_variant):
+            import importlib
+            import os
+            import sys
+
+            os.environ["LIBERO_TYPE"] = _variant
+            if _variant in ("pro", "plus"):
+                package = f"libero{_variant}"
+                try:
+                    real_pkg = importlib.import_module(package)
+                    real_core = importlib.import_module(f"{package}.{package}")
+                    real_envs = importlib.import_module(f"{package}.{package}.envs")
+                except ImportError:
+                    if _variant != "plus":
+                        raise
+                    real_pkg = importlib.import_module("libero")
+                    real_core = importlib.import_module("libero.libero")
+                    real_envs = importlib.import_module("libero.libero.envs")
+                sys.modules["libero"] = real_pkg
+                sys.modules["libero.libero"] = real_core
+                sys.modules["libero.libero.envs"] = real_envs
+                OffScreenRenderEnv = real_envs.OffScreenRenderEnv
+            else:
+                from libero.libero.envs import OffScreenRenderEnv
 
             seed = param.pop("seed")
             env = OffScreenRenderEnv(**param)
@@ -282,6 +336,48 @@ class ReconfigureSubprocEnvWorker(SubprocEnvWorker):
         self._wait_until_ready()
         return None
 
+    def recv(self):
+        return self._recv_with_timeout("step")
+
+    def get_env_attr(self, key: str) -> Any:
+        self.parent_remote.send(["getattr", key])
+        return self._recv_with_timeout("getattr")
+
+    def render(self, **kwargs: Any) -> Any:
+        self.parent_remote.send(["render", kwargs])
+        return self._recv_with_timeout("render")
+
+    def reset(self, **kwargs: Any):
+        if "seed" in kwargs:
+            super().seed(kwargs["seed"])
+        self.parent_remote.send(["reset", kwargs])
+        result = self._recv_with_timeout("reset")
+        if isinstance(result, tuple):
+            obs, info = result
+            return obs, info
+        return result
+
+    def seed(self, seed: Optional[int] = None):
+        super().seed(seed)
+        self.parent_remote.send(["seed", seed])
+        return self._recv_with_timeout("seed")
+
+    def set_init_state(self, init_state):
+        self.parent_remote.send(["set_init_state", init_state])
+        return self._recv_with_timeout("set_init_state")
+
+    def check_success(self):
+        self.parent_remote.send(["check_success", None])
+        return self._recv_with_timeout("check_success")
+
+    def get_segmentation_of_interest(self, segmentation_image):
+        self.parent_remote.send(["get_segmentation_of_interest", segmentation_image])
+        return self._recv_with_timeout("get_segmentation_of_interest")
+
+    def get_sim_state(self):
+        self.parent_remote.send(["get_sim_state", None])
+        return self._recv_with_timeout("get_sim_state")
+
 
 class ReconfigureSubprocEnv(SubprocVectorEnv):
     def __init__(self, env_fns: list[Callable[[], gym.Env]], **kwargs: Any) -> None:
@@ -289,6 +385,35 @@ class ReconfigureSubprocEnv(SubprocVectorEnv):
             return ReconfigureSubprocEnvWorker(fn, share_memory=False)
 
         BaseVectorEnv.__init__(self, env_fns, worker_fn, **kwargs)
+        self.last_timed_out_ids: list[int] = []
+
+    def step(self, action: np.ndarray, id=None):
+        """Step workers while converting a stuck child into a failed episode."""
+        self._assert_is_not_closed()
+        ids = self._wrap_id(id)
+        self.last_timed_out_ids = []
+        if self.is_async:
+            return super().step(action, id)
+        assert len(action) == len(ids)
+        result = []
+        for env_id, env_action in zip(ids, action):
+            worker = self.workers[env_id]
+            try:
+                worker.send(env_action)
+                env_return = worker.recv()
+            except (TimeoutError, RuntimeError, OSError):
+                self.last_timed_out_ids.append(int(env_id))
+                env_return = (None, 0.0, True, False, {})
+            env_return[-1]["env_id"] = env_id
+            result.append(env_return)
+        return_lists = tuple(zip(*result))
+        obs_list = return_lists[0]
+        try:
+            obs_stack = np.stack(obs_list)
+        except (ValueError, TypeError):
+            obs_stack = np.asarray(obs_list, dtype=object)
+        other_stacks = map(np.stack, return_lists[1:])
+        return (obs_stack, *other_stacks)
 
     def reconfigure_env_fns(self, env_fns, id=None):
         self._assert_is_not_closed()

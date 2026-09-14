@@ -50,6 +50,7 @@ class Checkpoint(Stateful):
         fsdp_version: FSDPVersion,
         checkpoint_format: str = "dcp",
         adapter_only: bool = False,
+        load_optimizer: bool = True,
     ):
         self.model = model
         self.optimizers = optimizers
@@ -62,6 +63,7 @@ class Checkpoint(Stateful):
         self.fsdp_version = fsdp_version
         self.checkpoint_format = checkpoint_format
         self.adapter_only = adapter_only
+        self.load_optimizer = load_optimizer
 
     @staticmethod
     def _trainable_fqns(optim_state_dicts) -> set[str]:
@@ -136,26 +138,36 @@ class Checkpoint(Stateful):
                 else value
                 for key, value in model_sd.items()
             }
-            optim_sd = self._get_local_optim_state_dicts()
+            optim_sd = self._get_local_optim_state_dicts() if self.load_optimizer else []
         else:
-            model_sd, optim_sd = get_state_dict(
-                model=self.model,
-                optimizers=self.optimizers,
-                options=self.opts,
-            )
+            if self.load_optimizer:
+                model_sd, optim_sd = get_state_dict(
+                    model=self.model,
+                    optimizers=self.optimizers,
+                    options=self.opts,
+                )
+            else:
+                model_sd, _ = get_state_dict(
+                    model=self.model,
+                    optimizers=(),
+                    options=self.opts,
+                )
+                optim_sd = []
 
         if self.adapter_only:
             model_sd = self._select_adapter_tensors(model_sd, optim_sd)
 
         lr_sched_sd = [lr.state_dict() for lr in self.lr_schedulers]
 
-        return {
+        state = {
             "model": model_sd,
-            "optimizers": optim_sd,
-            "lr_schedulers": lr_sched_sd,
             "fsdp_version": self.fsdp_version.value,
             "rng": get_rng_state(),
         }
+        if self.load_optimizer:
+            state["optimizers"] = optim_sd
+            state["lr_schedulers"] = lr_sched_sd
+        return state
 
     def load_state_dict(self, state):
         assert "fsdp_version" in state, "Checkpoint is missing FSDP version info."
@@ -172,20 +184,21 @@ class Checkpoint(Stateful):
                 state["model"], strict=not self.adapter_only
             )
 
-            self._load_local_optim_state_dicts(state["optimizers"])
+            if self.load_optimizer:
+                self._load_local_optim_state_dicts(state["optimizers"])
 
         else:
             opts = replace(self.opts, strict=False) if self.adapter_only else self.opts
             set_state_dict(
                 model=self.model,
-                optimizers=self.optimizers,
+                optimizers=self.optimizers if self.load_optimizer else (),
                 model_state_dict=state["model"],
                 optim_state_dict=state.get("optimizers", state.get("optim")),
                 options=opts,
             )
 
         # lr schedulers
-        if "lr_schedulers" in state:
+        if self.load_optimizer and "lr_schedulers" in state:
             for lr, lr_sd in zip(self.lr_schedulers, state["lr_schedulers"]):
                 lr.load_state_dict(lr_sd)
 

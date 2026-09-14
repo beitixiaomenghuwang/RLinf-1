@@ -184,7 +184,23 @@ class CollectiveWorkQueue:
                     f"Async {'send' if self._type == CollectiveWorkQueue.SEND else 'recv'} ID {comm_id} begins"
                 )
 
-                work(None)
+                try:
+                    work(None)
+                except Exception as e:
+                    # A communication failure (gloo TCP disconnect, store timeout,
+                    # NCCL error) in this background thread is unrecoverable: the
+                    # peer is dead, and every future send/recv on this process group
+                    # will also fail. Silently dying here leaves the actor process
+                    # alive with a dead thread, so the driver blocks forever on a
+                    # future that will never be set.
+                    # Kill the entire actor process so Ray detects the death
+                    # immediately and raises ActorDiedError in the driver.
+                    import os as _os
+                    self._logger.error(
+                        f"Fatal communication error in {'send' if self._type == CollectiveWorkQueue.SEND else 'recv'} "
+                        f"queue (comm_id={comm_id}): {e!r}. Calling os._exit(1) to let Ray surface the failure."
+                    )
+                    _os._exit(1)
                 work = None  # The reference to work is released here to avoid potential memory leak
 
                 self._logger.debug(

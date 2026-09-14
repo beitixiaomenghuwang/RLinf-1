@@ -213,6 +213,10 @@ class LiberoEnv(gym.Env):
             and current_type_val == "standard"
         ):
             current_type_val = self.cfg.get("libero_variant", "plus")
+        # Reconfigured workers are spawned later and inherit the parent
+        # environment.  Keep the selected package visible there as well; the
+        # initial worker closure alone cannot configure a fresh subprocess.
+        os.environ["LIBERO_TYPE"] = current_type_val
 
         for env_fn_param in env_fn_params:
 
@@ -840,6 +844,10 @@ class LiberoEnv(gym.Env):
         )
         if active_mask.all():
             raw_obs, _reward, terminations, info_lists = self.env.step(actions)
+            timed_out_ids = getattr(self.env, "last_timed_out_ids", [])
+            for env_id in timed_out_ids:
+                raw_obs[env_id] = self.current_raw_obs[env_id]
+                terminations[env_id] = True
             self.current_raw_obs = raw_obs
             infos = list_of_dict_to_dict_of_list(info_lists)
         elif not active_mask.any():
@@ -852,12 +860,16 @@ class LiberoEnv(gym.Env):
             active_obs, _reward, active_terminations, active_info_lists = (
                 self.env.step(actions[active_mask], id=active_env_idx)
             )
+            timed_out_ids = getattr(self.env, "last_timed_out_ids", [])
             raw_obs = list(self.current_raw_obs)
             for i, env_idx in enumerate(active_env_idx):
-                raw_obs[env_idx] = active_obs[i]
+                if active_obs[i] is not None:
+                    raw_obs[env_idx] = active_obs[i]
             self.current_raw_obs = raw_obs
             terminations = np.zeros(self.num_envs, dtype=bool)
             terminations[active_mask] = active_terminations
+            for env_id in timed_out_ids:
+                terminations[env_id] = True
             info_lists = [{} for _ in range(self.num_envs)]
             for i, env_idx in enumerate(active_env_idx):
                 info_lists[env_idx] = active_info_lists[i]
@@ -976,16 +988,48 @@ class LiberoEnv(gym.Env):
         valid_mask = new_reset_state_ids >= 0
         env_to_reset = env_idx[valid_mask]
         self._eval_exhausted[env_idx[~valid_mask]] = True
-        if len(env_to_reset) > 0:
-            self.reset_state_ids[env_to_reset] = new_reset_state_ids[valid_mask]
-            self._eval_exhausted[env_to_reset] = False
-            obs, infos = self.reset(
-                env_idx=env_to_reset,
-                reset_state_ids=self.reset_state_ids[env_to_reset],
-            )
-        else:
-            obs = _final_obs
-            infos = {}
+        obs = _final_obs
+        infos = {}
+        # Reset one subprocess at a time so a broken task cannot block the
+        # other evaluation slot. If a task cannot reset, consume the next
+        # ordered task for that slot so one bad variant does not truncate the
+        # full manifest evaluation.
+        for env_id, reset_state_id in zip(env_to_reset, new_reset_state_ids[valid_mask]):
+            while reset_state_id >= 0:
+                self.reset_state_ids[env_id] = reset_state_id
+                try:
+                    obs, reset_infos = self.reset(
+                        env_idx=[int(env_id)], reset_state_ids=[int(reset_state_id)]
+                    )
+                    self._eval_exhausted[env_id] = False
+                    if reset_infos:
+                        infos.update(reset_infos)
+                    break
+                except (TimeoutError, RuntimeError, OSError) as exc:
+                    task_id = int(self.task_ids[env_id])
+                    trial_id = int(self.trial_ids[env_id])
+                    trial_key = (task_id, trial_id)
+                    if trial_key not in self._eval_seen_trials:
+                        self._eval_seen_trials.add(trial_key)
+                        stats = self._task_success_stats.setdefault(
+                            task_id, {"success": 0, "total": 0}
+                        )
+                        stats["total"] += 1
+                        logger.info(
+                            "[libero eval] task_id=%s, trial_id=%s, success=False "
+                            "reset_failure",
+                            task_id,
+                            trial_id,
+                        )
+                    logger.warning(
+                        "LIBERO evaluation task %s failed during reset; trying "
+                        "the next task: %s",
+                        task_id,
+                        exc,
+                    )
+                    reset_state_id = int(self._get_ordered_reset_state_ids(1)[0])
+            else:
+                self._eval_exhausted[env_id] = True
 
         infos["final_observation"] = final_obs
         infos["final_info"] = final_info

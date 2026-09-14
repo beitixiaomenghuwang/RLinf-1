@@ -23,3 +23,8 @@ PKG-INFO
 *.egg-info/
 .claude/settings.json
 .claude/settings.local.json
+
+# Local scripts, tests, and handoff notes.
+/scripts/
+/tests/
+/HANDOFF.md
