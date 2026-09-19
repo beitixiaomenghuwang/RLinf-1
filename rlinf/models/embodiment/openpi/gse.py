@@ -56,6 +56,8 @@ _INTEGRATION_FIELDS = {
     "task_router_num_tasks",
     "task_router_informative_nmi_threshold",
     "log_orthogonality",
+    "log_gradient_spectrum",
+    "gradient_spectrum_top_k",
     "vlm",
 }
 _GSE_CONFIG_FIELDS = {field.name for field in fields(GSEConfig)}
