@@ -55,6 +55,9 @@ actor:
       log_layerwise_task_router_metrics: True
       task_router_num_tasks: 50
       task_router_informative_nmi_threshold: 0.01
+      # In-training gradient spectrum logging for §5.3.1 evidence.
+      log_gradient_spectrum: True
+      gradient_spectrum_top_k: 8
   optim:
     # Keep the OpenPI default actor/value learning rates; experiment launchers
     # must not override them for this comparison.

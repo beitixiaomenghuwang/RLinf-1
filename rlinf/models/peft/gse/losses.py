@@ -739,3 +739,52 @@ def set_gse_router_stats_enabled(model: nn.Module, enabled: bool) -> None:
     """
     for _, layer in iter_gse_layers(model):
         layer.adapter._stats_enabled = bool(enabled)
+
+
+def collect_gse_gradient_spectrum(
+    model: nn.Module, *, top_k: int = 8
+) -> dict[str, float]:
+    """Compute per-layer gradient singular spectrum for GSE lora_b weights.
+
+    Returns a dict with keys `gse/grad_spectrum/L{idx}_E{expert}/sv{i}` (i=0..top_k-1)
+    and `gse/grad_spectrum/L{idx}_E{expert}/frob_norm`, one set per (layer, expert).
+    Call after backward and gradient sync (last micro-batch), before optimizer.step().
+
+    Args:
+        model: The GSE-injected model with populated .grad tensors.
+        top_k: Number of leading singular values to record per layer.
+
+    Returns:
+        Metrics dict suitable for all-reduce and logging.
+    """
+    import torch
+    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+    from .injector import iter_gse_layers
+
+    metrics = {}
+    for layer_idx, (layer_name, gse_layer) in enumerate(iter_gse_layers(model)):
+        # Gradients may be sharded under FSDP; summon full params with grads.
+        # The context unshards, gives us the full gradient, then re-shards on exit.
+        with FSDP.summon_full_params(
+            gse_layer, recurse=False, writeback=False, with_grads=True
+        ):
+            for expert_idx, expert in enumerate(gse_layer.all_experts):
+                grad = expert.lora_b.weight.grad
+                if grad is None:
+                    continue  # Expert received no gradient this step
+
+                # Compute singular values (descending order) and Frobenius norm.
+                # svdvals is faster than full SVD when we only need the spectrum.
+                # Cast to float32 for numerical stability; bf16/fp16 SVD can be noisy.
+                grad_f32 = grad.detach().float()
+                singular_values = torch.linalg.svdvals(grad_f32)
+                frob_norm = float(torch.linalg.norm(grad_f32, ord="fro").item())
+
+                # Record top-k singular values and the Frobenius norm.
+                prefix = f"gse/grad_spectrum/L{layer_idx:02d}_E{expert_idx}"
+                for i in range(min(top_k, singular_values.numel())):
+                    metrics[f"{prefix}/sv{i}"] = float(singular_values[i].item())
+                metrics[f"{prefix}/frob_norm"] = frob_norm
+
+    return metrics

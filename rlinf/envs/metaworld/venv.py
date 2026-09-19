@@ -58,6 +58,7 @@ def _worker(
 
     parent.close()
     env = env_fn_wrapper.data()
+    latest_info = {}
     try:
         while True:
             try:
@@ -67,12 +68,14 @@ def _worker(
                 break
             if cmd == "step":
                 env_return = env.step(data)
+                latest_info = env_return[-1]
                 if obs_bufs is not None:
                     _encode_obs(env_return[0], obs_bufs)
                     env_return = (None, *env_return[1:])
                 p.send(env_return)
             elif cmd == "reset":
                 retval = env.reset(**data)
+                latest_info = {}
                 reset_returns_info = (
                     isinstance(retval, (tuple, list))
                     and len(retval) == 2
@@ -105,19 +108,45 @@ def _worker(
                 p.send(getattr(env, data) if hasattr(env, data) else None)
             elif cmd == "setattr":
                 setattr(env.unwrapped, data["key"], data["value"])
+            elif cmd == "get_sim_diagnostics":
+                from theory_validation.simulator_diagnostics import (
+                    collect_metaworld_diagnostics,
+                    collect_metaworld_reset_state,
+                )
+
+                try:
+                    diagnostics = collect_metaworld_diagnostics(env, latest_info)
+                    if data["reset"]:
+                        diagnostics["reset_state_audit"] = (
+                            collect_metaworld_reset_state(env)
+                        )
+                    if data.get("control_state"):
+                        from theory_validation.state_certification import (
+                            capture_metaworld_control_state,
+                        )
+
+                        diagnostics["control_state"] = capture_metaworld_control_state(
+                            env, reset=bool(data["reset"])
+                        )
+                    p.send(diagnostics)
+                except Exception as exc:
+                    p.send({"diagnostics_error": f"{type(exc).__name__}: {exc}"})
             elif cmd == "reconfigure":
                 # metaworld reconfigure
                 env.close()
                 env_name = data.pop("env_name")
+                simulator_seed = data.pop("simulator_seed", None)
                 env = gym.make(
                     "Meta-World/MT1",
                     env_name=env_name,
                     render_mode="rgb_array",
                     camera_id=2,
                     disable_env_checker=True,
+                    **({"seed": simulator_seed} if simulator_seed is not None else {}),
                 )
                 # Set camera position to align with sft
                 env.env.env.env.env.env.env.model.cam_pos[2] = [0.75, 0.075, 0.7]
+                latest_info = {}
                 p.send(None)
             else:
                 p.close()
@@ -152,6 +181,15 @@ class ReconfigureSubprocEnvWorker(SubprocEnvWorker):
         self.parent_remote.send(["reconfigure", env_fn_param])
         return self.parent_remote.recv()
 
+    def get_sim_diagnostics(self, *, reset=False, control_state=False):
+        self.parent_remote.send(
+            ["get_sim_diagnostics", {"reset": reset, "control_state": control_state}]
+        )
+        diagnostics = self.parent_remote.recv()
+        if "diagnostics_error" in diagnostics:
+            raise ValueError(diagnostics["diagnostics_error"])
+        return diagnostics
+
 
 class ReconfigureSubprocEnv(SubprocVectorEnv):
     def __init__(self, env_fns: list[Callable[[], gym.Env]], **kwargs: Any) -> None:
@@ -159,6 +197,15 @@ class ReconfigureSubprocEnv(SubprocVectorEnv):
             return ReconfigureSubprocEnvWorker(fn, share_memory=False)
 
         BaseVectorEnv.__init__(self, env_fns, worker_fn, **kwargs)
+
+    def get_sim_diagnostics(self, id=None, *, reset=False, control_state=False):
+        self._assert_is_not_closed()
+        return [
+            self.workers[index].get_sim_diagnostics(
+                reset=reset, control_state=control_state
+            )
+            for index in self._wrap_id(id)
+        ]
 
     def reconfigure_env_fns(self, env_fns, id=None):
         self._assert_is_not_closed()

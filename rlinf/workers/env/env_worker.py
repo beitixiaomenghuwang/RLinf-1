@@ -930,6 +930,7 @@ class EnvWorker(Worker):
         data = {
             "obs": env_batch["obs"],
             "final_obs": env_batch["final_obs"],
+            "eval_done": env_batch.get("eval_done", False),
         }
         if self.enable_rlt:
             data["rlt_switch_flags"] = env_batch.get("rlt_switch_flags", None)
@@ -1325,6 +1326,14 @@ class EnvWorker(Worker):
                     for key, value in env_info.items():
                         eval_metrics[key].append(value)
 
+                    eval_done = bool(
+                        getattr(
+                            self.eval_env_list[stage_id],
+                            "_eval_exhausted",
+                            np.array([False]),
+                        ).all()
+                    )
+
                     if self.cfg.env.eval.auto_reset:
                         if (
                             eval_rollout_epoch == self.eval_rollout_epoch - 1
@@ -1335,6 +1344,7 @@ class EnvWorker(Worker):
                         if eval_step == self.n_eval_chunk_steps - 1:
                             continue
                     env_batch = env_output.to_dict()
+                    env_batch["eval_done"] = eval_done
                     self.send_to(
                         group_name=self.cfg.rollout.group_name,
                         channel=rollout_channel,
@@ -1344,6 +1354,11 @@ class EnvWorker(Worker):
                         route_key=stage_id if not self.env_decoupled_mode else None,
                         decoupled_mode=self.env_decoupled_mode,
                     )
+                    if eval_done:
+                        break
+
+                if eval_done:
+                    break
 
             self.finish_rollout(mode="eval")
         for stage_id in range(self.stage_num):

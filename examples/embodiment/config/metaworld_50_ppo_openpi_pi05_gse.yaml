@@ -160,6 +160,9 @@ actor:
       log_task_router_metrics: True
       task_router_num_tasks: 50
       log_orthogonality: True
+      # In-training gradient spectrum logging for §5.3.1 evidence.
+      log_gradient_spectrum: True
+      gradient_spectrum_top_k: 8
     openpi:
       config_name: "pi05_metaworld"
       num_images_in_input: 1

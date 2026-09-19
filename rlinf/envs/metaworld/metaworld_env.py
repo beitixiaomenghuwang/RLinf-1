@@ -90,6 +90,13 @@ class MetaWorldEnv(gym.Env):
         self._elapsed_steps = np.zeros(self.num_envs, dtype=np.int32)
 
         self.video_cfg = cfg.video_cfg
+        self._sim_recorder = None
+        if os.environ.get("RLINF_SIM_TRACE_DIR"):
+            from theory_validation.simulator_recorder import make_simulator_recorder
+
+            self._sim_recorder = make_simulator_recorder(
+                "metaworld", seed_offset, num_envs
+            )
 
     def _init_env(self):
         # metaworld task and prompt description
@@ -117,6 +124,11 @@ class MetaWorldEnv(gym.Env):
                     render_mode="rgb_array",
                     camera_id=2,
                     disable_env_checker=True,
+                    **(
+                        {"seed": param["simulator_seed"]}
+                        if "simulator_seed" in param
+                        else {}
+                    ),
                 )
                 # Set camera position to align with sft
                 env.env.env.env.env.env.env.model.cam_pos[2] = [0.75, 0.075, 0.7]
@@ -137,11 +149,16 @@ class MetaWorldEnv(gym.Env):
             env_name = self.env_names_all[self.task_ids[env_id]]
             task_description = self.task_descriptions_all[self.task_ids[env_id]]
 
-            env_fn_params.append(
-                {
-                    "env_name": env_name,
-                }
-            )
+            param = {"env_name": env_name}
+            if os.environ.get("RLINF_SIM_TRACE_DIR"):
+                # MT1 samples its task catalogue during construction, and its
+                # reset(seed=...) ignores the seed. Seed both construction paths.
+                param["simulator_seed"] = int(
+                    self.cfg.seed
+                    + self.task_ids[env_id] * self.task_num_trials
+                    + self.trial_ids[env_id]
+                )
+            env_fn_params.append(param)
             task_descriptions.append(task_description)
         self.task_descriptions = task_descriptions
         return env_fn_params
@@ -317,13 +334,98 @@ class MetaWorldEnv(gym.Env):
         }
         return obs
 
+    def _persist_simulator_trace(
+        self,
+        obs,
+        env_idx,
+        *,
+        reset=False,
+        actions=None,
+        rewards=None,
+        raw_rewards=None,
+        terminations=None,
+        truncations=None,
+        info_lists=None,
+    ):
+        if self._sim_recorder is None:
+            return
+        if self.use_async_vector_env:
+            raise RuntimeError(
+                "Simulator recording requires MetaWorld ReconfigureSubprocEnv"
+            )
+        from theory_validation.simulator_recorder import (
+            attach_control_state,
+            control_state_requested,
+        )
+
+        diagnostics = self.env.get_sim_diagnostics(
+            id=env_idx, reset=reset, control_state=control_state_requested()
+        )
+        for slot, diagnostic in zip(env_idx, diagnostics):
+            slot = int(slot)
+            attach_control_state(
+                diagnostic,
+                {
+                    "elapsed_steps": int(self._elapsed_steps[slot]),
+                    "prev_step_reward": float(self.prev_step_reward[slot]),
+                    "success_once": bool(self.success_once[slot]),
+                    "fail_once": bool(self.fail_once[slot]),
+                    "returns": float(self.returns[slot]),
+                    "task_id": int(self.task_ids[slot]),
+                    "trial_id": int(self.trial_ids[slot]),
+                },
+            )
+            if reset:
+                self._sim_recorder.begin_episode(
+                    slot,
+                    int(self.task_ids[slot]),
+                    int(self.trial_ids[slot]),
+                    diagnostic,
+                    {
+                        "env_seed": int(self.seed),
+                        "simulator_seed": int(
+                            self.cfg.seed
+                            + self.task_ids[slot] * self.task_num_trials
+                            + self.trial_ids[slot]
+                        ),
+                        "simulator_seed_scope": "cfg.seed + task_id * task_num_trials + trial_id; fresh MT1 task catalogue and native environment per traced reset",
+                        "env_name": self.env_names_all[self.task_ids[slot]],
+                        "task_description": self.task_descriptions[slot],
+                        "reset_settle_steps": self.RESET_STEP + 1,
+                        "camera_views": ["front"],
+                        "wrist_camera_status": "unavailable: configured MetaWorld camera is front only",
+                    },
+                )
+            self._sim_recorder.write_step(
+                slot,
+                int(self.elapsed_steps[slot]),
+                diagnostic,
+                {"front": obs["main_images"][slot]},
+                action=None if reset else actions[slot],
+                reward=0.0 if reset else float(rewards[slot]),
+                raw_reward=None if reset else float(raw_rewards[slot]),
+                terminated=False if reset else bool(terminations[slot]),
+                truncated=False if reset else bool(truncations[slot]),
+                info=None if reset else info_lists[slot],
+            )
+        obs["trace_ids"] = torch.from_numpy(self._sim_recorder.trace_ids.copy())
+        obs["trace_events"] = torch.from_numpy(self._sim_recorder.trace_events.copy())
+        obs["trace_event_counts"] = torch.from_numpy(
+            self._sim_recorder.trace_event_counts.copy()
+        )
+        obs["sim_state_digest"] = torch.from_numpy(
+            self._sim_recorder.control_state_digests.copy()
+        )
+
     def _reconfigure(self, reset_state_ids, env_idx):
         reconfig_env_idx = []
         task_ids, trial_ids = self._get_task_and_trial_ids_from_reset_state_ids(
             reset_state_ids
         )
         for j, env_id in enumerate(env_idx):
-            if self.task_ids[env_id] != task_ids[j]:
+            if self.task_ids[env_id] != task_ids[j] or os.environ.get(
+                "RLINF_SIM_TRACE_DIR"
+            ):
                 reconfig_env_idx.append(env_id)
             self.task_ids[env_id] = task_ids[j]
             self.trial_ids[env_id] = trial_ids[j]
@@ -345,6 +447,12 @@ class MetaWorldEnv(gym.Env):
         if env_idx is None:
             env_idx = np.arange(self.num_envs)
 
+        if self._sim_recorder is not None and len(env_idx) != self.num_envs:
+            raise RuntimeError(
+                "MetaWorld simulator tracing requires synchronous full-batch resets: "
+                "the existing partial-reset path also steps non-reset slots"
+            )
+
         reset_state_ids = self._resolve_reset_state_ids(env_idx, reset_state_ids)
 
         self._reconfigure(reset_state_ids, env_idx)
@@ -360,11 +468,12 @@ class MetaWorldEnv(gym.Env):
             all_actions = np.zeros((self.num_envs, 4))
             raw_obs, _reward, _, _, _ = self.env.step(all_actions)
 
-        obs = self._wrap_obs(raw_obs)
         if env_idx is not None:
             self._reset_metrics(env_idx)
         else:
             self._reset_metrics()
+        obs = self._wrap_obs(raw_obs)
+        self._persist_simulator_trace(obs, env_idx, reset=True)
         infos = {}
         return obs, infos
 
@@ -389,6 +498,17 @@ class MetaWorldEnv(gym.Env):
         if self.ignore_terminations:
             infos["episode"]["success_at_end"] = to_tensor(terminations)
             terminations[:] = False
+
+        self._persist_simulator_trace(
+            obs,
+            np.arange(self.num_envs),
+            actions=actions,
+            rewards=step_reward,
+            raw_rewards=_reward,
+            terminations=terminations,
+            truncations=truncations,
+            info_lists=info_lists if not self.use_async_vector_env else None,
+        )
 
         dones = terminations | truncations
         _auto_reset = auto_reset and self.auto_reset

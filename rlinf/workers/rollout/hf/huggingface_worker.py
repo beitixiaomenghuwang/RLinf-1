@@ -221,6 +221,12 @@ class MultiStepRolloutWorker(Worker):
                 ".adapter." in key for key in model_dict
             ):
                 load_gse_state_dict(self.hf_model, model_dict, strict=False)
+            elif any(
+                ".lora_A." in key or ".lora_B." in key for key in model_dict
+            ):
+                # Plain PEFT LoRA checkpoints intentionally omit the frozen
+                # base tensors; the base model was loaded above.
+                self.hf_model.load_state_dict(model_dict, strict=False)
             else:
                 self.hf_model.load_state_dict(model_dict)
 
@@ -928,6 +934,7 @@ class MultiStepRolloutWorker(Worker):
                             merge_fn=self._merge_obs_batches,
                             infer_batch_size_fn=self._infer_env_batch_size,
                         ).async_wait()
+                        eval_done = bool(env_output.get("eval_done", False))
                         actions, _ = self._predict_rollout_actions(
                             env_output["obs"],
                             mode="eval",
@@ -946,6 +953,10 @@ class MultiStepRolloutWorker(Worker):
                             async_op=True,
                             batch_size=self.eval_batch_size,
                         )
+                        if eval_done:
+                            break
+                    if eval_done:
+                        break
 
             if self.enable_offload:
                 self.offload_model()
@@ -1045,6 +1056,7 @@ class MultiStepRolloutWorker(Worker):
         return {
             "obs": merged_obs,
             "final_obs": merged_final_obs,
+            "eval_done": any(bool(batch.get("eval_done", False)) for batch in obs_batches),
             "rlt_switch_flags": self._merge_optional_flag_tensors(
                 obs_dicts, rlt_switch_flags_list
             ),

@@ -161,6 +161,26 @@ def _worker(
                 p.send(env.get_segmentation_of_interest(data))
             elif cmd == "get_sim_state":
                 p.send(env.get_sim_state())
+            elif cmd == "get_sim_diagnostics":
+                from theory_validation.simulator_diagnostics import (
+                    collect_simulator_diagnostics,
+                )
+
+                try:
+                    diagnostics = collect_simulator_diagnostics(env)
+                    if isinstance(data, dict) and data.get("control_state"):
+                        from theory_validation.state_certification import (
+                            capture_libero_control_state,
+                        )
+
+                        diagnostics["control_state"] = capture_libero_control_state(
+                            env, reset=bool(data.get("reset", False))
+                        )
+                    p.send(diagnostics)
+                except Exception as exc:
+                    # Report an unavailable diagnostic immediately; a dead child
+                    # would otherwise turn it into an unrelated step timeout.
+                    p.send({"diagnostics_error": f"{type(exc).__name__}: {exc}"})
             elif cmd == "set_init_state":
                 obs = env.set_init_state(data)
                 p.send(obs)
@@ -378,6 +398,15 @@ class ReconfigureSubprocEnvWorker(SubprocEnvWorker):
         self.parent_remote.send(["get_sim_state", None])
         return self._recv_with_timeout("get_sim_state")
 
+    def get_sim_diagnostics(self, *, reset=False, control_state=False):
+        self.parent_remote.send(
+            ["get_sim_diagnostics", {"reset": reset, "control_state": control_state}]
+        )
+        diagnostics = self._recv_with_timeout("get_sim_diagnostics")
+        if "diagnostics_error" in diagnostics:
+            raise ValueError(diagnostics["diagnostics_error"])
+        return diagnostics
+
 
 class ReconfigureSubprocEnv(SubprocVectorEnv):
     def __init__(self, env_fns: list[Callable[[], gym.Env]], **kwargs: Any) -> None:
@@ -423,6 +452,16 @@ class ReconfigureSubprocEnv(SubprocVectorEnv):
 
         for j, i in enumerate(id):
             self.workers[i].reconfigure_env_fn(env_fns[j])
+
+    def get_sim_diagnostics(self, id=None, *, reset=False, control_state=False):
+        """Read named physical contacts and state before reset in each process."""
+        self._assert_is_not_closed()
+        return [
+            self.workers[index].get_sim_diagnostics(
+                reset=reset, control_state=control_state
+            )
+            for index in self._wrap_id(id)
+        ]
 
     def seed(self, seed=None, id=None):
         """Seed only the selected subprocess environments.

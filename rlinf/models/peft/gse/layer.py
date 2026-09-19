@@ -1,5 +1,6 @@
 """Core GSE residual linear layer."""
 
+import os
 from typing import Any
 
 import torch
@@ -81,6 +82,7 @@ class GSEAdapter(nn.Module):
         self.out_features = out_features
         self._load_balancing_loss: torch.Tensor | None = None
         self._router_stats: dict[str, torch.Tensor] = {}
+        self._trace_history: list[dict[str, torch.Tensor]] = []
         # Per-micro-batch gate for the routing bookkeeping. The diagnostics are
         # averaged over a step anyway, so a caller that logs once per step does
         # not need them recomputed on all of its micro-batches; see
@@ -90,6 +92,16 @@ class GSEAdapter(nn.Module):
         self._cached_semantic_embeddings: torch.Tensor | None = None
         self._cached_action_token_mask: torch.Tensor | None = None
         self._cached_sequence_mask: torch.Tensor | None = None
+        # The complete routing tracer enables this lazily.  Keeping it behind
+        # an environment flag avoids changing normal training/evaluation cost.
+        self._trace_full_residual = (
+            os.environ.get("RLINF_TRACE_FULL_RESIDUAL", "0") == "1"
+        )
+        self._trace_compact_residual = (
+            os.environ.get("RLINF_TRACE_COMPACT_RESIDUAL", "0") == "1"
+        )
+        self._trace_store_full = False
+        self._trace_low_rank = os.environ.get("RLINF_TRACE_LOW_RANK", "0") == "1"
 
         ranks = config.expert_ranks
         experts = [
@@ -228,10 +240,16 @@ class GSEAdapter(nn.Module):
         """Return detached routing diagnostics from the latest forward pass."""
         return dict(self._router_stats)
 
+    @property
+    def trace_history(self) -> list[dict[str, torch.Tensor]]:
+        """Return every traced call in the current policy prediction."""
+        return list(self._trace_history)
+
     def reset_auxiliary_state(self) -> None:
         """Discard losses and diagnostics saved by the latest forward pass."""
         self._load_balancing_loss = None
         self._router_stats = {}
+        self._trace_history = []
         self._cached_semantic_embeddings = None
         self._cached_action_token_mask = None
         self._cached_sequence_mask = None
@@ -277,6 +295,8 @@ class GSEAdapter(nn.Module):
                     logits.shape[0] // semantic_logits.shape[0], dim=0
                 )
             logits = logits + self.config.semantic_router_scale * semantic_logits
+        if self._trace_low_rank:
+            self._trace_logits = logits.detach()
         return F.softmax(logits.float(), dim=-1)
 
     def _routing_inputs_for_tokens(self, inputs: torch.Tensor) -> torch.Tensor:
@@ -342,7 +362,150 @@ class GSEAdapter(nn.Module):
             if self.config.normalize_topk:
                 weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(1e-12)
         self._record_routing(probabilities, indices)
+        if (
+            self._trace_full_residual
+            or self._trace_compact_residual
+            or self._trace_low_rank
+        ):
+            self._router_stats["trace_probabilities"] = probabilities.detach()
+            self._router_stats["trace_weights"] = weights.detach()
+            self._router_stats["trace_indices"] = indices.detach()
+            if self._trace_low_rank:
+                self._router_stats["trace_logits"] = self._trace_logits
         return weights, indices
+
+    @torch.no_grad()
+    def _record_full_residuals(
+        self,
+        inputs: torch.Tensor,
+        residual: torch.Tensor,
+    ) -> None:
+        """Save every expert residual for the external routing audit.
+
+        This is intentionally opt-in because it evaluates each expert once
+        more and retains the resulting tensors until the next layer call.
+        The tracer moves them to CPU after the model forward and writes a
+        binary shard, so the model's numerical path is unchanged.
+        """
+        if (
+            not (
+                self._trace_full_residual
+                or self._trace_compact_residual
+                or self._trace_low_rank
+            )
+            or not self._stats_enabled
+        ):
+            return
+        if self.training:
+            raise RuntimeError("Residual tracing requires evaluation mode")
+        if self._trace_low_rank:
+            # The B factors and scales are stored once by the external tracer.
+            # Keep the native activation dtype: this compresses the representation
+            # without quantizing the per-token expert responses.
+            experts = self.all_experts
+            context = get_gse_routing_context()
+            if context is not None:
+                self._cached_action_token_mask = context.action_token_mask
+                self._cached_sequence_mask = context.sequence_mask
+            factors = torch.cat([expert.lora_a.weight for expert in experts], dim=0)
+            projected_inputs = inputs.to(factors.dtype)
+            if self.config.routing_granularity == "token":
+                projected_inputs = projected_inputs.reshape(-1, self.in_features)
+            rank_hidden = F.linear(projected_inputs, factors).reshape(
+                *inputs.shape[:-1], self.config.total_rank
+            )
+            call = {
+                key: value.detach().cpu()
+                for key, value in self._router_stats.items()
+                if key.startswith("trace_") and isinstance(value, torch.Tensor)
+            }
+            call["trace_rank_hidden"] = rank_hidden.detach().cpu()
+            call["trace_input_shape"] = torch.tensor(inputs.shape, dtype=torch.int64)
+            call["trace_actual_residual_norm"] = residual.float().norm(dim=-1).cpu()
+            if getattr(self, "_trace_save_samples", False):
+                flat_residual = residual.reshape(-1, self.out_features)
+                sample_indices = (
+                    torch.linspace(
+                        0,
+                        flat_residual.shape[0] - 1,
+                        min(16, flat_residual.shape[0]),
+                        device=inputs.device,
+                    )
+                    .long()
+                    .unique()
+                )
+                call["trace_sample_indices"] = sample_indices.cpu()
+                call["trace_actual_residual_samples"] = flat_residual[
+                    sample_indices
+                ].cpu()
+            if experts[0].initial_lora_a is not None:
+                initial_a = torch.cat(
+                    [expert.initial_lora_a for expert in experts], dim=0
+                )
+                call["trace_initial_rank_hidden"] = (
+                    F.linear(projected_inputs.to(initial_a.dtype), initial_a)
+                    .reshape(*inputs.shape[:-1], self.config.total_rank)
+                    .cpu()
+                )
+            for name, mask in (
+                ("action", self._cached_action_token_mask),
+                ("sequence", self._cached_sequence_mask),
+            ):
+                if mask is not None and tuple(mask.shape) == tuple(inputs.shape[:-1]):
+                    call[f"trace_{name}_mask"] = mask.detach().cpu().bool()
+            # Micro-batch identity is explicit; no division by the rollout batch
+            # size can safely identify environments in every model call.
+            call.update(getattr(self, "_trace_call_context", {}))
+            transform = getattr(self, "_trace_transform_call", None)
+            if transform is not None:
+                call = transform(self, call, rank_hidden, residual)
+            self._trace_history.append(call)
+            return
+        flat_inputs = inputs.reshape(-1, self.in_features)
+        outputs = [expert(flat_inputs) for expert in self.all_experts]
+        expert_residuals = torch.stack(outputs, dim=1).reshape(
+            *inputs.shape[:-1], len(outputs), self.out_features
+        )
+        generalized = (
+            expert_residuals[..., : len(self.generalized_experts), :].mean(-2)
+            if self.generalized_experts
+            else torch.zeros_like(residual)
+        )
+        flat = expert_residuals.float().reshape(-1, len(outputs), self.out_features)
+        norms = flat.norm(dim=-1)
+        normalized = torch.where(
+            norms.unsqueeze(-1) > 0,
+            flat
+            / torch.where(
+                norms.unsqueeze(-1) > 0,
+                norms.unsqueeze(-1),
+                torch.ones_like(norms.unsqueeze(-1)),
+            ),
+            torch.zeros_like(flat),
+        )
+        cosines = torch.bmm(normalized, normalized.transpose(1, 2))
+        self._router_stats["trace_expert_norms"] = norms.detach()
+        self._router_stats["trace_expert_cosines"] = cosines.detach()
+        self._router_stats["trace_generalized_norm"] = (
+            generalized.float().norm(dim=-1).detach()
+        )
+        self._router_stats["trace_weighted_residual_norm"] = (
+            residual.float().norm(dim=-1).detach()
+        )
+        self._router_stats["trace_input_shape"] = torch.as_tensor(
+            inputs.shape, dtype=torch.int64, device=inputs.device
+        )
+        if self._trace_store_full:
+            self._router_stats["trace_expert_residuals"] = expert_residuals.detach()
+            self._router_stats["trace_generalized_residual"] = generalized.detach()
+            self._router_stats["trace_weighted_residual"] = residual.detach()
+        self._trace_history.append(
+            {
+                key: value.detach().cpu()
+                for key, value in self._router_stats.items()
+                if key.startswith("trace_") and isinstance(value, torch.Tensor)
+            }
+        )
 
     def _can_fuse_experts(self, experts: Any) -> bool:
         return bool(experts) and self.config.lora_dropout == 0
@@ -572,12 +735,19 @@ class GSEAdapter(nn.Module):
         wrapped module; keeping this loss solely as module state leaves its
         router-parameter branch outside that boundary.
         """
+        if (
+            self._trace_full_residual
+            or self._trace_compact_residual
+            or self._trace_low_rank
+        ):
+            self._trace_input_shape = tuple(inputs.shape)
         if self.config.routing_mode == "uniform":
             residual = self._uniform_residual(inputs)
         elif self.config.routing_granularity == "token":
             residual = self._token_routed_residual(inputs)
         else:
             residual = self._sequence_routed_residual(inputs)
+        self._record_full_residuals(inputs, residual)
         return residual.to(inputs.dtype), self._load_balancing_loss
 
 

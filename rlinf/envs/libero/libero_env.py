@@ -175,6 +175,13 @@ class LiberoEnv(gym.Env):
 
         self.video_cfg = cfg.video_cfg
         self.current_raw_obs = None
+        self._sim_recorder = None
+        if os.environ.get("RLINF_SIM_TRACE_DIR"):
+            from theory_validation.simulator_recorder import make_simulator_recorder
+
+            self._sim_recorder = make_simulator_recorder(
+                "libero", seed_offset, num_envs
+            )
 
     def _log_evaluation_mode(self):
         """Log the LIBERO evaluation mode banner (rank 0 env worker only)."""
@@ -762,6 +769,79 @@ class LiberoEnv(gym.Env):
         }
         return obs
 
+    def _persist_simulator_trace(
+        self,
+        obs,
+        env_idx,
+        *,
+        reset=False,
+        actions=None,
+        rewards=None,
+        raw_rewards=None,
+        terminations=None,
+        truncations=None,
+        info_lists=None,
+    ):
+        if self._sim_recorder is None:
+            return
+        from theory_validation.simulator_recorder import (
+            attach_control_state,
+            control_state_requested,
+        )
+
+        diagnostics = self.env.get_sim_diagnostics(
+            id=env_idx, reset=reset, control_state=control_state_requested()
+        )
+        for slot, diagnostic in zip(env_idx, diagnostics):
+            slot = int(slot)
+            attach_control_state(
+                diagnostic,
+                {
+                    "elapsed_steps": int(self._elapsed_steps[slot]),
+                    "prev_step_reward": float(self.prev_step_reward[slot]),
+                    "success_once": bool(self.success_once[slot]),
+                    "fail_once": bool(self.fail_once[slot]),
+                    "returns": float(self.returns[slot]),
+                    "success_episode_len": int(self.success_episode_len[slot]),
+                    "eval_exhausted": bool(self._eval_exhausted[slot]),
+                    "task_id": int(self.task_ids[slot]),
+                    "trial_id": int(self.trial_ids[slot]),
+                },
+            )
+            if reset:
+                self._sim_recorder.begin_episode(
+                    slot,
+                    int(self.task_ids[slot]),
+                    int(self.trial_ids[slot]),
+                    diagnostic,
+                    {
+                        "simulator_seed": self._get_simulator_seeds([slot])[0],
+                        "task_description": self.task_descriptions[slot],
+                        "reset_settle_steps": int(self.cfg.get("num_steps_wait", 15)),
+                        "camera_views": ["front", "wrist"],
+                    },
+                )
+            self._sim_recorder.write_step(
+                slot,
+                int(self.elapsed_steps[slot]),
+                diagnostic,
+                {"front": obs["main_images"][slot], "wrist": obs["wrist_images"][slot]},
+                action=None if reset else actions[slot],
+                reward=0.0 if reset else float(rewards[slot]),
+                raw_reward=None if reset else float(raw_rewards[slot]),
+                terminated=False if reset else bool(terminations[slot]),
+                truncated=False if reset else bool(truncations[slot]),
+                info=None if reset else info_lists[slot],
+            )
+        obs["trace_ids"] = torch.from_numpy(self._sim_recorder.trace_ids.copy())
+        obs["trace_events"] = torch.from_numpy(self._sim_recorder.trace_events.copy())
+        obs["trace_event_counts"] = torch.from_numpy(
+            self._sim_recorder.trace_event_counts.copy()
+        )
+        obs["sim_state_digest"] = torch.from_numpy(
+            self._sim_recorder.control_state_digests.copy()
+        )
+
     def _reconfigure(self, reset_state_ids, env_idx):
         reconfig_env_idx = []
         task_ids, trial_ids = self._get_task_and_trial_ids_from_reset_state_ids(
@@ -828,8 +908,9 @@ class LiberoEnv(gym.Env):
         for i, idx in enumerate(env_idx):
             self.current_raw_obs[idx] = raw_obs[i]
 
-        obs = self._wrap_obs(self.current_raw_obs)
         self._reset_metrics(env_idx)
+        obs = self._wrap_obs(self.current_raw_obs)
+        self._persist_simulator_trace(obs, env_idx, reset=True)
         infos = {}
         return obs, infos
 
@@ -838,12 +919,16 @@ class LiberoEnv(gym.Env):
         if isinstance(actions, torch.Tensor):
             actions = actions.detach().cpu().numpy()
 
-        self._elapsed_steps += 1
-        active_mask = ~self._eval_exhausted if self.is_eval else np.ones(
-            self.num_envs, dtype=bool
+        active_mask = (
+            ~self._eval_exhausted
+            if self.is_eval
+            else np.ones(self.num_envs, dtype=bool)
         )
+        self._elapsed_steps[active_mask] += 1
+        raw_rewards = np.zeros(self.num_envs, dtype=np.float64)
         if active_mask.all():
             raw_obs, _reward, terminations, info_lists = self.env.step(actions)
+            raw_rewards[:] = _reward
             timed_out_ids = getattr(self.env, "last_timed_out_ids", [])
             for env_id in timed_out_ids:
                 raw_obs[env_id] = self.current_raw_obs[env_id]
@@ -857,9 +942,10 @@ class LiberoEnv(gym.Env):
             infos = list_of_dict_to_dict_of_list(info_lists)
         else:
             active_env_idx = np.flatnonzero(active_mask)
-            active_obs, _reward, active_terminations, active_info_lists = (
-                self.env.step(actions[active_mask], id=active_env_idx)
+            active_obs, _reward, active_terminations, active_info_lists = self.env.step(
+                actions[active_mask], id=active_env_idx
             )
+            raw_rewards[active_mask] = _reward
             timed_out_ids = getattr(self.env, "last_timed_out_ids", [])
             raw_obs = list(self.current_raw_obs)
             for i, env_idx in enumerate(active_env_idx):
@@ -883,6 +969,17 @@ class LiberoEnv(gym.Env):
         if self.ignore_terminations:
             infos["episode"]["success_at_end"] = to_tensor(terminations)
             terminations[:] = False
+
+        self._persist_simulator_trace(
+            obs,
+            np.flatnonzero(active_mask),
+            actions=actions,
+            rewards=step_reward,
+            raw_rewards=raw_rewards,
+            terminations=terminations,
+            truncations=truncations,
+            info_lists=info_lists,
+        )
 
         dones = terminations | truncations
         _auto_reset = auto_reset and self.auto_reset

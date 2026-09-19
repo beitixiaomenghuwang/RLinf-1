@@ -50,6 +50,7 @@ from rlinf.hybrid_engines.weight_syncer import WeightSyncer
 from rlinf.models import get_model
 from rlinf.models.embodiment.base_policy import ForwardType
 from rlinf.models.peft.gse import (
+    collect_gse_gradient_spectrum,
     gse_auxiliary_loss,
     gse_layerwise_task_router_metrics,
     gse_layerwise_task_router_statistics,
@@ -1090,6 +1091,9 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 "actor.adapter_metrics_micro_batch_interval must be >= 1, got "
                 f"{self.adapter_metrics_micro_batch_interval}"
             )
+        self.log_gradient_spectrum = bool(
+            self.gse_cfg.get("log_gradient_spectrum", False) if self.gse_enabled else False
+        )
         self.advantage_normalization = resolve_advantage_normalization_config(
             cfg.algorithm
         )
@@ -1886,6 +1890,19 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         loss /= self.gradient_accumulation
         with backward_ctx:
             self.grad_scaler.scale(loss).backward()
+
+        # Collect gradient spectrum after backward and gradient sync, before optimizer step.
+        # Only on the last micro-batch (gradients are fully accumulated and synced) and only
+        # when sampled (controlled by collect_adapter_metrics, same as router stats).
+        if is_last and self.gse_enabled and self.log_gradient_spectrum and collect_adapter_metrics:
+            try:
+                spectrum_metrics = collect_gse_gradient_spectrum(
+                    self.model, top_k=int(self.gse_cfg.get("gradient_spectrum_top_k", 8))
+                )
+                for key, value in spectrum_metrics.items():
+                    metrics_data[key] = value
+            except Exception as e:
+                self.log_warning(f"Failed to collect gradient spectrum: {e}")
 
         metrics_data["actor/total_loss"] = loss.detach().item()
         append_to_dict(metrics, metrics_data)

@@ -126,6 +126,14 @@ class EnvOutput:
             "states": states,
             "task_descriptions": task_descriptions,
             "task_ids": task_ids,
+            # Diagnostic payloads stay on disk; these tensors align simulator
+            # frames with policy forwards through normal split/cat operations.
+            "full_states": obs.get("full_states"),
+            "env_features": obs.get("env_features"),
+            "trace_ids": obs.get("trace_ids"),
+            "trace_events": obs.get("trace_events"),
+            "trace_event_counts": obs.get("trace_event_counts"),
+            "sim_state_digest": obs.get("sim_state_digest"),
         }
 
     @staticmethod

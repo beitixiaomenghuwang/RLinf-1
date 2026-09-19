@@ -54,6 +54,9 @@ actor:
         top_k: 2
         routing_granularity: token
         init_seed: 4200
+        # In-training gradient spectrum logging for §5.3.1 evidence.
+        log_gradient_spectrum: True
+        gradient_spectrum_top_k: 8
   optim:
     # Decay over the complete global-step horizon so the final checkpoints can
     # converge. Add warmup only as a separate early-stability ablation.

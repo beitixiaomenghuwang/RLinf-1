@@ -15,6 +15,7 @@ from .injector import (
 )
 from .layer import GSEAdapter, GSEExpert, GSELinear
 from .losses import (
+    collect_gse_gradient_spectrum,
     gse_auxiliary_loss,
     gse_layerwise_task_router_metrics,
     gse_layerwise_task_router_statistics,
@@ -35,6 +36,7 @@ __all__ = [
     "GSEExpert",
     "GSEInjectionReport",
     "GSELinear",
+    "collect_gse_gradient_spectrum",
     "gse_auxiliary_loss",
     "gse_layerwise_task_router_metrics",
     "gse_layerwise_task_router_statistics",
