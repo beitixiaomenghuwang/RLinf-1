@@ -157,6 +157,18 @@ class GSEAdapter(nn.Module):
             scalings=[float(expert.scaling) for expert in experts],
             svd_rho=config.svd_rho,
         )
+        if config.share_lora_a:
+            # Alias the Parameter rather than the nn.Linear so every expert
+            # keeps its own module: the per-expert fallback path, the state
+            # dict and the FSDP flattening all still see the structure they
+            # expect, and both nn.Module.parameters() and FSDP's flat-param
+            # builder deduplicate a shared Parameter, so it is counted,
+            # flattened and optimized exactly once. Module._apply assigns
+            # param.data in place, so .to(device/dtype) below preserves the
+            # aliasing.
+            shared_lora_a_weight = experts[0].lora_a.weight
+            for expert in experts[1:]:
+                expert.lora_a.weight = shared_lora_a_weight
         # Only "svd" needs a correction: it is the one initialization that gives
         # B a nonzero start, so its residual is nonzero at step 0. "svd_zero"
         # shares the same A subspace but keeps B == 0, which already makes the
@@ -254,9 +266,30 @@ class GSEAdapter(nn.Module):
         self._cached_action_token_mask = None
         self._cached_sequence_mask = None
 
+    def _joint_rank_hidden(
+        self, inputs: torch.Tensor, experts: tuple["GSEExpert", ...]
+    ) -> torch.Tensor:
+        """Project the input onto every expert's rank slots in one matmul."""
+        if self.config.share_lora_a:
+            # Concatenating the factors would tile one projection num_experts
+            # times, so compute it once and tile the result instead. This is
+            # exactly F.linear(x, cat([A, ..., A])), which is what
+            # _rank_expert_indices is built against.
+            shared_lora_a = experts[0].lora_a.weight
+            hidden = F.linear(inputs.to(shared_lora_a.dtype), shared_lora_a)
+            return hidden.repeat(*(1,) * (hidden.ndim - 1), len(experts))
+        lora_a = torch.cat([expert.lora_a.weight for expert in experts], dim=0)
+        return F.linear(inputs.to(lora_a.dtype), lora_a)
+
     def orthogonality_loss(self) -> torch.Tensor:
         """Penalize correlation between rows of all expert A factors."""
-        weights = torch.cat([expert.lora_a.weight for expert in self.all_experts])
+        if self.config.share_lora_a:
+            # One A serves every expert, so a concatenated Gram would report a
+            # constant off-diagonal of 1.0. The only meaningful quantity left
+            # is the shared factor's own row orthogonality.
+            weights = self.all_experts[0].lora_a.weight
+        else:
+            weights = torch.cat([expert.lora_a.weight for expert in self.all_experts])
         normalized = F.normalize(weights.float(), p=2, dim=1)
         gram = normalized @ normalized.mT
         identity = torch.eye(gram.shape[0], device=gram.device, dtype=gram.dtype)
@@ -407,11 +440,10 @@ class GSEAdapter(nn.Module):
             if context is not None:
                 self._cached_action_token_mask = context.action_token_mask
                 self._cached_sequence_mask = context.sequence_mask
-            factors = torch.cat([expert.lora_a.weight for expert in experts], dim=0)
-            projected_inputs = inputs.to(factors.dtype)
+            projected_inputs = inputs.to(experts[0].lora_a.weight.dtype)
             if self.config.routing_granularity == "token":
                 projected_inputs = projected_inputs.reshape(-1, self.in_features)
-            rank_hidden = F.linear(projected_inputs, factors).reshape(
+            rank_hidden = self._joint_rank_hidden(projected_inputs, experts).reshape(
                 *inputs.shape[:-1], self.config.total_rank
             )
             call = {
@@ -521,8 +553,7 @@ class GSEAdapter(nn.Module):
         """Evaluate weighted experts with two fused low-rank projections."""
         lora_b = torch.cat([expert.lora_b.weight for expert in experts], dim=1)
         if rank_hidden is None:
-            lora_a = torch.cat([expert.lora_a.weight for expert in experts], dim=0)
-            rank_hidden = F.linear(inputs.to(lora_a.dtype), lora_a)
+            rank_hidden = self._joint_rank_hidden(inputs, experts)
 
         rank_weights = expert_weights.to(rank_hidden.dtype).index_select(
             -1, rank_expert_indices
@@ -672,8 +703,7 @@ class GSEAdapter(nn.Module):
         return sequences.mean(dim=1)
 
     def _rank_space_hidden(self, inputs: torch.Tensor) -> torch.Tensor:
-        lora_a = torch.cat([expert.lora_a.weight for expert in self.all_experts], dim=0)
-        return F.linear(inputs.to(lora_a.dtype), lora_a)
+        return self._joint_rank_hidden(inputs, self.all_experts)
 
     def _rank_space_rms_context(self, rank_hidden: torch.Tensor) -> torch.Tensor:
         """RMS-pool concatenated expert rank projections per sequence."""

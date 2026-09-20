@@ -31,6 +31,14 @@ class GSEConfig:
     # 14x4 specialized). The layer and the SVD initializer already work off each
     # expert's own rank, so only the split itself needs to be told about this.
     generalized_expert_rank: int | None = None
+    # HydraLoRA's asymmetry: one down-projection A is shared by every expert and
+    # only the up-projections B stay separate. ``total_rank`` keeps its GSE
+    # meaning -- the sum of the experts' B ranks -- so the shared A has the rank
+    # of a SINGLE expert. Every expert then reads the input through the same
+    # rank-r projection: sum_e g_e * s * B_e A x = (sum_e g_e * s * B_e) A x, so
+    # at any fixed gate vector the residual is a rank-<=r update, however many
+    # experts are active. Only the output side is mixed.
+    share_lora_a: bool = False
     top_k: int = 2
     lora_dropout: float = 0.0
     routing_granularity: RoutingGranularity = "sequence"
@@ -118,6 +126,21 @@ class GSEConfig:
                     "generalized_expert_rank leaves too little of total_rank for "
                     f"the specialized experts: {specialized_total} remaining for "
                     f"{self.num_specialized_experts} experts"
+                )
+        if self.share_lora_a:
+            if self.initialization not in ("orthogonal_zero", "kaiming_zero"):
+                raise ValueError(
+                    "share_lora_a requires an initialization that builds A "
+                    "independently of the expert split; the spectral ones give "
+                    "each expert its own slice of a joint basis, so sharing "
+                    "would silently discard all but the first slice. Got "
+                    f"{self.initialization!r}"
+                )
+            if len(set(self.expert_ranks)) != 1:
+                raise ValueError(
+                    "share_lora_a requires one common expert rank, so "
+                    "total_rank must divide evenly across num_experts, got "
+                    f"ranks {self.expert_ranks}"
                 )
         if self.routing_mode == "topk" and not (
             1 <= self.top_k <= self.num_specialized_experts
