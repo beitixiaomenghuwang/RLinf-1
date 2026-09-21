@@ -3,7 +3,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus=4
-#SBATCH --exclude=paraai-n32-h-01-agent-92,paraai-n32-h-01-agent-4,paraai-n32-h-01-agent-87,paraai-n32-h-01-agent-153,paraai-n32-h-01-agent-74,paraai-n32-h-01-agent-75
+#SBATCH --exclude=paraai-n32-h-01-agent-92,paraai-n32-h-01-agent-4,paraai-n32-h-01-agent-87,paraai-n32-h-01-agent-153,paraai-n32-h-01-agent-74,paraai-n32-h-01-agent-75,paraai-n32-h-01-agent-186
 #SBATCH --cpus-per-task=64
 #SBATCH --time=04:00:00
 #SBATCH --output=slurm-theory-sft-highk-4gpu-%j.out
